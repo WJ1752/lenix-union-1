@@ -1,0 +1,35 @@
+"""拍 5 个页面的干净截图（鼠标停在顶栏空白处，避免物品弹窗挡住画面）"""
+import asyncio, sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from playwright.async_api import async_playwright
+BASE='http://127.0.0.1:8907'
+SHOT=os.path.join(os.path.dirname(os.path.abspath(__file__)),'shots')
+async def main():
+    async with async_playwright() as pw:
+        try: br = await pw.chromium.launch(channel='msedge')
+        except Exception: br = await pw.chromium.launch()
+        pg = await br.new_page(viewport={'width':1680,'height':950})
+        await pg.goto(BASE+'/dim', wait_until='domcontentloaded')
+        await pg.wait_for_selector('.item', timeout=30000); await pg.wait_for_timeout(2500)
+        await pg.mouse.move(900, 12); await pg.wait_for_timeout(500)
+        await pg.screenshot(path=os.path.join(SHOT,'v_inv.png'))
+        await pg.goto(BASE+'/dim/loadouts', wait_until='domcontentloaded')
+        await pg.wait_for_selector('.inld-hd', timeout=30000); await pg.wait_for_timeout(2500)
+        await pg.mouse.move(900, 12); await pg.wait_for_timeout(400)
+        await pg.screenshot(path=os.path.join(SHOT,'v_load.png'))
+        await pg.goto(BASE+'/dim/loadouts', wait_until='domcontentloaded')
+        await pg.wait_for_selector('[data-a=save-cur]', timeout=30000); await pg.wait_for_timeout(2000)
+        await pg.click('[data-a=save-cur]'); await pg.wait_for_timeout(500)
+        await pg.locator('#editor .slot[data-pick]').nth(3).click(); await pg.wait_for_timeout(900)
+        await pg.screenshot(path=os.path.join(SHOT,'v_editor.png'))
+        await pg.goto(BASE+'/dim/optimizer', wait_until='domcontentloaded')
+        await pg.wait_for_selector('.prio', timeout=30000); await pg.wait_for_timeout(1500)
+        await pg.click('[data-a=run]'); await pg.wait_for_timeout(2500)
+        await pg.mouse.move(900, 12); await pg.wait_for_timeout(400)
+        await pg.screenshot(path=os.path.join(SHOT,'v_opt.png'))
+        await pg.goto(BASE+'/dim/manage', wait_until='domcontentloaded')
+        await pg.wait_for_selector('.mtab tr', timeout=30000); await pg.wait_for_timeout(2000)
+        await pg.mouse.move(900, 12); await pg.wait_for_timeout(400)
+        await pg.screenshot(path=os.path.join(SHOT,'v_mng.png'))
+        await br.close()
+asyncio.run(main())

@@ -1,0 +1,69 @@
+# ===== 凭据（绝对不要提交）=====
+.env
+.env.local
+bungie_token.json
+*.pfx
+# localhost 自签证书是 Bungie OAuth 回跳的必需件（Bungie 只认 https），
+# 且不含机密（仅对 127.0.0.1 生效），所以随源码走；其它 pem/key 一律排除。
+*.pem
+*.key
+!certs/localhost.pem
+!certs/localhost-key.pem
+
+# ===== 运行期状态（每个部署实例各自生成，不入库）=====
+bot_config.json
+user_bindings.json
+dim_user.json
+*_cache.json
+*cache.json
+
+# ===== 虚拟环境 / 打包产物 =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+dist_build/
+*.exe
+*.bak-*
+*.zip
+
+# ===== 大数据索引 / 第三方程序（由构建脚本生成或另行下载）=====
+manifest_index/
+napcat_shell/
+node_modules/
+
+# ===== 日志 =====
+*.log
+
+# ===== 调试临时产物（根目录下的散落 html / json 转储）=====
+/a.html
+/dd.html
+/g.html
+/h.html
+/ht.html
+/pg.html
+/pg2.html
+/pt.html
+/r.html
+/rg.html
+/t.html
+/w.html
+/wd.html
+/wl.html
+/wp.html
+/pk.html
+acts.json
+sp.json
+pgcr.json
+shot_*.png
+_scratch/
+
+# ===== 测试截图 / 日志 / 页面转储（脚本本身保留）=====
+_rtest/**/*.png
+_rtest/**/*.log
+_rtest/js/
+_rtest/*.html
+_rtest/dimtree.json
+_rtest/_page.js

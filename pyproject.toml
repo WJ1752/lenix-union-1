@@ -1,0 +1,5 @@
+[tool.nonebot]
+plugins = ["nonebot_plugins.destiny2"]
+
+[tool.nonebot.adapters]
+description = { onebot_v11 = "OneBot V11 协议适配" }

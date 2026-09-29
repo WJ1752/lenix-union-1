@@ -1,0 +1,13 @@
+# 运行依赖（Python 3.10 / 3.11）
+nonebot2==2.5.0
+nonebot-adapter-onebot==2.4.6
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+python-dotenv==1.2.3
+playwright==1.63.0
+pywebview==6.2.1
+pythonnet==3.1.0
+
+# 打包（可选，仅 build_exe.bat 需要）
+pyinstaller==6.22.3
