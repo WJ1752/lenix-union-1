@@ -4,6 +4,18 @@
 
 > 这些「实测踩出来的」结论是改代码前必读的约束，不要按直觉改。
 
+## 2026-09-30 内置官方 DIM（替换自研 DIM 板块）
+
+- 不再自己重写 DIM：官方开源版 DIM（DestinyItemManager/DIM v8.144.0）源码构建后挂到 webui 的 `/dim` 路径，顶部导航「DIM背包」直达。
+- 源码在 `F:\智谱Zcode数据存储\DIM_src`（浅克隆，勿删，重构建要用）；构建命令：
+  `cd DIM_src && MSYS2_ENV_CONV_EXCL=PUBLIC_PATH 设置 WEB_API_KEY/WEB_OAUTH_CLIENT_ID/WEB_OAUTH_CLIENT_SECRET（取自 BOT/.env） PUBLIC_PATH=/dim/ && corepack pnpm -s bundle --env=release --node-env=production`
+  产物 dist/ 去掉 *.map *.br 后拷到 `BOT/dim_app/`（部署脚本会同步到 `dist\D2Query\dim_app`，exe 外置，不打进 exe）。
+- **大坑**：Git Bash 会把环境变量 `PUBLIC_PATH=/dim/` 自动转换成 `C:/Program Files/Git/dim/` 写进产物，构建必须带 `MSYS2_ENV_CONV_EXCL=PUBLIC_PATH`。
+- OAuth：DIM 用浏览器自己的授权（localStorage 存 token），与服务器端 bungie_auth.py 互不影响；构建时嵌入了 .env 里的 BUNGIE_API_KEY / CLIENT_ID / SECRET。**用户需在 Bungie 应用管理页新增回调地址 `http://localhost:8900/dim/index.html`**（Bungie 要求 http 仅限 localhost）。
+- 隐藏功能栏：`.env` 的 `DIM_HIDE_NAV`（逗号分隔：inventory,progress,vendors,records,loadouts,organizer），启动时注入 CSS 到 dim_app/index.html；About/What's New 默认隐藏。改过值要删掉 dim_app/index.html 里的 `<style id="dim-hide-nav">` 重新注入（或重拷产物）。
+- 登录页建议关掉 DIM Sync（我们没配 DIM 官方 API key，同步会失败；标签/配装存在浏览器本地 IndexedDB，和官方 DIM 本地模式一致）。
+- 旧自研 DIM 代码（dim_web.py 等）保留未删；dim_app 不存在时自动回退到旧板块。
+
 
 
 # D2 查询 QQ 机器人（本地版）

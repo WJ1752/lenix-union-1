@@ -37,4 +37,13 @@ foreach ($f in $ext) {
   if (Test-Path $s) { Copy-Item $s $d -Force; Write-Output "sync $f" }
 }
 
+# 3.5) sync the bundled DIM build (dim_app lives outside the exe, ~100MB static site)
+$dimSrc = Join-Path $root "dim_app"
+$dimDst = Join-Path $dst "dim_app"
+if (Test-Path (Join-Path $dimSrc "index.html")) {
+  if (-not (Test-Path $dimDst)) { New-Item -ItemType Directory -Path $dimDst | Out-Null }
+  Copy-Item (Join-Path $dimSrc "*") $dimDst -Recurse -Force
+  Write-Output "sync dim_app"
+}
+
 Write-Output "deployed. launch: $dst\D2Query.exe (cwd must be $dst)"

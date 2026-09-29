@@ -16,8 +16,13 @@ import napcat_runtime
 import bungie_auth
 import weapon_filter
 import dim_web
+import dim_host
+from pathlib import Path
 
 app = FastAPI()
+# 内置官方 DIM：构建产物 dim_app/ 挂到 /dim。须先于 dim_web 注册，
+# /dim/* 由 DIM 静态站接管；未找到 dim_app 时不启用，旧自研板块照常。
+dim_host.mount_dim(app, Path(__file__).parent)
 # DIM 板块（背包仓库/成就/配装）是独立模块，只在这里挂上它的路由，现有页面不受影响
 app.include_router(dim_web.router)
 
