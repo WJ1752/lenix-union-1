@@ -251,6 +251,7 @@ try:
     _perk_ci = json.load(open(_idx_file("perk_ci.json"), encoding="utf-8"))
 except Exception:  # noqa: BLE001
     _perk_ci = {}
+_armor_sets = json.load(open(_idx_file("armor_sets.json"), encoding="utf-8"))
 _activities = json.load(open(_idx_file("activities.json"), encoding="utf-8"))
 _records = json.load(open(_idx_file("records.json"), encoding="utf-8"))
 _pnodes = json.load(open(_idx_file("presentation_nodes.json"), encoding="utf-8"))
@@ -362,6 +363,59 @@ def search_perks(q: str, limit: int = 20) -> list[dict]:
             if pc.get("stats"):
                 p["stats"] = pc["stats"]
     return out
+
+
+def all_armor_sets() -> list[dict]:
+    return _armor_sets
+
+
+def _norm_set(q: str) -> str:
+    """套装搜索归一化：小写、去空格、去掉结尾的 套/套装"""
+    q = re.sub(r"\s+", "", q).lower()
+    return re.sub(r"(套装|套)$", "", q)
+
+
+def _edit_dist(a: str, b: str) -> int:
+    """编辑距离（套装别名模糊兜底用，词都很短，O(mn) 足够）"""
+    if abs(len(a) - len(b)) > 2:
+        return 99
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def search_armor_sets(q: str) -> list[dict]:
+    """护甲套装检索：套装名 / 别名精确命中 → 包含命中 → 模糊兜底（容 1-2 个字符的手滑，
+    如 vog 打成 vod）；全命中为空才走模糊，避免正常搜索被带偏"""
+    q = _norm_set(q)
+    if not q:
+        return []
+    out = []
+    for s in _armor_sets:
+        names = {_norm_set(s["name"])} | {_norm_set(a) for a in s.get("aliases", [])}
+        src = _norm_set(s.get("source") or "")
+        if q in names or (src and q == src):   # 来源（副本名）也可精确搜
+            out.insert(0, s)
+        elif any(q in n for n in names):
+            out.append(s)
+    if out:
+        return out
+    fuzzy: list[tuple[int, int, dict]] = []  # (距离, 名字长度, 套装)
+    for s in _armor_sets:
+        for n in {_norm_set(s["name"])} | {_norm_set(a) for a in s.get("aliases", [])}:
+            if not n:
+                continue
+            d = _edit_dist(q, n)
+            # 容错随词长放宽：2-5 字符容 1 个，6+ 容 2 个（只在全空时兜底）
+            if d <= (1 if len(n) >= 2 else 0) + (1 if len(n) >= 6 else 0):
+                fuzzy.append((d, len(n), s))
+    fuzzy.sort(key=lambda x: (x[0], x[1]))
+    return [s for _, _, s in fuzzy[:3]]
 
 
 def activity_name(ref_id) -> dict:

@@ -32,6 +32,7 @@ app.include_router(dim_web.router)
 # 各页面统一挂同一排导航，任意页面都能一步直达其他页面。
 _NAV_ITEMS = (("/", "玩家查询"), ("/catalog", "武器图鉴"),
               ("/perks", "Perk查询"), ("/eververse", "光尘商店"), ("/rotation", "本周轮换"),
+              ("/armorsets", "护甲套装"),
               ("/dim", "DIM背包"), ("/panel", "Bot面板"))
 
 
@@ -40,9 +41,9 @@ def navbar(active: str = "") -> str:
         f"<a class='nv{' on' if href == active else ''}' href='{href}'>{txt}</a>"
         for href, txt in _NAV_ITEMS)
     return (
-        "<style>.d2nav{display:flex;gap:8px;justify-content:center;margin:0 0 16px}"
+        "<style>.d2nav{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:0 0 16px}"
         ".d2nav .nv{color:#cfd8e3;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;"
-        "padding:9px 20px;font-size:14px;text-decoration:none}"
+        "padding:9px 12px;font-size:14px;text-decoration:none;white-space:nowrap}"
         ".d2nav .nv:hover{border-color:#5ea8ff;color:#fff}"
         ".d2nav .nv.on{background:#2f6edb;border-color:#2f6edb;color:#fff;font-weight:bold}"
         "</style>"
@@ -794,14 +795,14 @@ async def perks_page(q: str = ""):
     return HTMLResponse(PERKS_PAGE.replace("__NAV__", navbar("/perks")).replace("__RESULTS__", cards).replace("__Q__", q))
 
 
-def card_page(html: str, active: str) -> HTMLResponse:
+def card_page(html: str, active: str, extra: str = "") -> HTMLResponse:
     """把 bot_cards 的卡片 HTML 当网页来用：卡片是按 760px 定宽出图的（body{width:760px}），
     直接打开会贴在左上角、导航挤成两行。这里补一层网页外壳——顶部导航 + 居中定宽内容列，
-    与其余页面保持一致。"""
+    与其余页面保持一致。extra 插在导航之后、卡片之前（如套装页的搜索框/分类筛选）。"""
     shell = ("<style>body{width:auto;max-width:800px;margin:0 auto;padding:24px 20px}"
              "</style>")
     html = html.replace("</head>", shell + "</head>", 1)
-    return HTMLResponse(html.replace('<div class="card">', navbar(active) + '<div class="card">', 1))
+    return HTMLResponse(html.replace('<div class="card">', navbar(active) + extra + '<div class="card">', 1))
 
 
 @app.get("/eververse", response_class=HTMLResponse)
@@ -828,6 +829,43 @@ async def rotation_page(force: int = 0):
                         "读取 Bungie 里程碑接口失败，稍后刷新重试。<br>"
                         f"<span style='color:#8fa3bd'>{d2.esc_err(exc)}</span>")
     return card_page(bot_cards.rotation_card(rot), "/rotation")
+
+
+_ARMOR_CATS = ("目的地", "先锋行动", "熔炉竞技场行动", "智谋行动", "突袭", "地牢", "活动")
+
+
+@app.get("/armorsets", response_class=HTMLResponse)
+async def armorsets_page(q: str = "", cat: str = ""):
+    """护甲套装效果页：与 QQ 卡片同一份排版（bot_cards.armor_*_card），顶部补一行导航。
+    默认出全量详情页（56 套 2/4 件效果全文，照搬 Starside）+ 搜索框 + 分类筛选；
+    带 q（套装名或别名）出单套全文 / 候选索引；带 cat 只看该类别。"""
+    if q.strip():
+        res = d2.search_armor_sets(q)
+        if not res:
+            return card_page(bot_cards.notice(
+                "没找到套装",
+                [f"没有匹配「{bot_cards.esc(q)}」的套装；可以用别名，如 一愿、vog、kf"],
+                kind="warn"), "/armorsets")
+        if len(res) == 1:
+            html = bot_cards.armor_set_card(res[0])
+        else:
+            html = bot_cards.armor_sets_card(res, q)
+        form = ("<form class='as-search' method='get' action='/armorsets'>"
+                "<input name='q' placeholder='搜套装名或别名：炽天使套 / 一愿 / vog / kf …'></form>")
+        return card_page(html, "/armorsets", extra=form)
+    sets = d2.all_armor_sets()
+    if cat.strip() and cat in _ARMOR_CATS:
+        sets = [s for s in sets if s["category"] == cat]
+    html = bot_cards.armor_sets_full_card(sets)
+    # 搜索框 + 分类筛选链（当前类别高亮），插在导航之后、内容之前
+    chips = "".join(
+        (f"<a class='as-cat{' on' if not cat else ''}' href='/armorsets'>全部</a>" if c == ""
+         else f"<a class='as-cat{' on' if cat == c else ''}' href='/armorsets?cat={c}'>{c}</a>")
+        for c in ("",) + _ARMOR_CATS)
+    form = ("<form class='as-search' method='get' action='/armorsets'>"
+            "<input name='q' placeholder='搜套装名或别名：炽天使套 / 一愿 / vog / kf …'></form>"
+            f"<div class='as-cats'>{chips}</div>")
+    return card_page(html, "/armorsets", extra=form)
 
 
 # ---------- Bungie 账号授权（读实时商店等需要登录的接口） ----------

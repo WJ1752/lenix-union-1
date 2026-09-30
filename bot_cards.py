@@ -142,6 +142,35 @@ section{background:rgba(255,255,255,.03);border-radius:8px;padding:4px 8px 10px}
 .wftxt span.fr{color:#5ea8ff}
 .wfmeta{color:#8fa3bd;font-size:12.5px;margin:-6px 0 10px}
 .wfmeta em{color:#ffd76e;font-style:normal}
+.as-tag{display:inline-block;background:#223047;color:#9fc1e8;border-radius:9px;
+        padding:1px 8px;font-size:11px;margin-left:6px;vertical-align:2px}
+.as-bonus{background:#161e2c;border:1px solid #24344d;border-radius:10px;
+          padding:10px 12px;margin:10px 0}
+.as-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:15px}
+.as-piece{background:#2b5f9e;color:#fff;border-radius:8px;padding:2px 8px;
+          font-size:12px;white-space:nowrap}
+.as-text{font-size:13.5px;line-height:1.75;color:#c9d6e8;white-space:pre-wrap}
+.as-text b{color:#ffd76e}
+.as-row{background:#161e2c;border:1px solid #24344d;border-radius:8px;
+        padding:7px 10px;margin:6px 0;font-size:13.5px}
+.as-row b{color:#e8f0fb}
+.as-src{color:#8fa3bd;font-size:12px;margin-left:6px}
+.as-bn{color:#8fa3bd;font-size:12px;margin-top:2px}
+.as-rowtop{display:flex;align-items:center;min-width:0}
+.as-tags{margin-left:auto;padding-left:10px;white-space:nowrap;overflow:hidden}
+.as-tags .as-tag{margin-left:4px;margin-right:0}
+.as-set{margin:18px 0 6px}
+.as-set h2{font-size:19px;margin:0 0 4px;color:#e8f0fb}
+.as-meta{color:#8fa3bd;font-size:12.5px;margin-bottom:8px}
+.as-search{display:flex;justify-content:center;margin:0 0 14px}
+.as-search input{background:#141c2e;border:1px solid #2c3a52;border-radius:8px;
+                 color:#e8f0fb;font-size:14px;padding:9px 14px;width:320px;outline:none}
+.as-search input:focus{border-color:#5ea8ff}
+.as-cats{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:0 0 14px}
+.as-cat{color:#cfd8e3;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;
+        padding:5px 12px;font-size:13px;text-decoration:none;white-space:nowrap}
+.as-cat:hover{border-color:#5ea8ff;color:#fff}
+.as-cat.on{background:#2f6edb;border-color:#2f6edb;color:#fff;font-weight:bold}
 </style></head><body><div class="card">
 __BODY__
 </div></body></html>"""
@@ -507,6 +536,80 @@ def perk_card(perks: list[dict], q: str = "") -> str:
     title = f"Perk「{esc(q)}」" if q else "Perk 查询"
     body = (f"<h1>{title}</h1><div class='sub'>官方说明 + 中文精确数值</div>{blocks}"
             f"<div class='foot'>数据来自 Bungie.net / Starside / Clarity</div>")
+    return _page(body)
+
+
+# ---------- /护甲套装（Starside 中文套装效果） ----------
+
+def _hl_nums(text: str) -> str:
+    """把套装效果里的数值/百分比加粗（先转义再匹配，数字不受转义影响）"""
+    return re.sub(r"([+\-]?\d[\d.?]*[%×]?|\[\?\])", r"<b>\1</b>", esc(text))
+
+
+def armor_set_card(s: dict) -> str:
+    """单个套装：2 件 / 4 件效果全文 + 数值"""
+    tags = "".join(f"<span class='as-tag'>{esc(t)}</span>" for t in s.get("tags", []))
+    src = esc(s.get("source") or "")
+    body = (f"<h1>{esc(s['name'])}</h1>"
+            f"<div class='sub'>{esc(s['category'])}"
+            + (f" · 来源 {src}" if src else "") + f"　{tags}</div>")
+    for b in s["bonuses"]:
+        body += (f"<div class='as-bonus'><div class='as-head'>"
+                 f"<span class='as-piece'>{esc(b['piece'])}</span>"
+                 f"<b>{esc(b['name'])}</b></div>"
+                 f"<div class='as-text'>{_hl_nums(b['text'])}</div></div>")
+    body += "<div class='foot'>数据来自 Starside 中文护甲套装资料 · [?] 为待核实 / 方括号为 PvP 数值</div>"
+    return _page(body)
+
+
+def armor_sets_card(sets: list[dict], q: str = "") -> str:
+    """多套 / 全部套装：按类别分组的索引（每套列出 2 件、4 件效果名）"""
+    title = f"护甲套装「{esc(q)}」" if q else "护甲套装效果一览"
+    body = (f"<h1>{title}</h1>"
+            f"<div class='sub'>共 {len(sets)} 套 · 发 <code>/护甲套装 套装名</code> 看单套完整数值"
+            "（支持别名：炽天使套 / 一愿 / vog / kf …）</div>")
+    cats: dict[str, list[dict]] = {}
+    for s in sets:
+        cats.setdefault(s["category"], []).append(s)
+    for cat, items in cats.items():
+        body += f"<div class='evhead'>{esc(cat)}<span>{len(items)} 套</span></div>"
+        for s in items:
+            bn = "　".join(f"{b['piece']} {b['name']}" for b in s["bonuses"][:2])
+            src = esc(s.get("source") or "")
+            tags = "".join(f"<span class='as-tag'>{esc(t)}</span>"
+                           for t in s.get("tags", [])[:4])
+            body += ("<div class='as-row'><div class='as-rowtop'>"
+                     f"<b>{esc(s['name'])}</b>"
+                     + (f"<span class='as-src'>· {src}</span>" if src else "")
+                     + f"<span class='as-tags'>{tags}</span></div>"
+                     f"<div class='as-bn'>{esc(bn)}</div></div>")
+    body += "<div class='foot'>数据来自 Starside 中文护甲套装资料</div>"
+    return _page(body)
+
+
+def armor_sets_full_card(sets: list[dict]) -> str:
+    """网页端全量详情版：所有套装的 2/4 件效果全文照搬 Starside（页面可长，QQ 卡片仍用索引版）"""
+    body = ("<h1>护甲套装效果一览</h1>"
+            f"<div class='sub'>共 {len(sets)} 套 · 2/4 件效果全文与数值，照搬 Starside 中文资料"
+            "　[?] 为待核实 / 方括号为 PvP 数值</div>")
+    cats: dict[str, list[dict]] = {}
+    for s in sets:
+        cats.setdefault(s["category"], []).append(s)
+    for cat, items in cats.items():
+        body += f"<div class='evhead'>{esc(cat)}<span>{len(items)} 套</span></div>"
+        for s in items:
+            tags = "".join(f"<span class='as-tag'>{esc(t)}</span>" for t in s.get("tags", []))
+            src = esc(s.get("source") or "")
+            body += (f"<div class='as-set'><h2>{esc(s['name'])}</h2>"
+                     f"<div class='as-meta'>{esc(cat)}"
+                     + (f" · 来源 {src}" if src else "") + f"　{tags}</div>")
+            for b in s["bonuses"]:
+                body += (f"<div class='as-bonus'><div class='as-head'>"
+                         f"<span class='as-piece'>{esc(b['piece'])}</span>"
+                         f"<b>{esc(b['name'])}</b></div>"
+                         f"<div class='as-text'>{_hl_nums(b['text'])}</div></div>")
+            body += "</div>"
+    body += "<div class='foot'>数据来自 Starside 中文护甲套装资料</div>"
     return _page(body)
 
 

@@ -23,6 +23,9 @@
                          范围可写 s27 / 赛季27 / 全生涯，例：/pvp生涯武器 s27
   /武器查询 <名称>     → 武器 perk 池（特性/枪管/弹匣/枪托）别名 d2武器
   /perk查询 <名称>     → perk 官方说明 + 中文精确数值       别名 d2perk、d2特性
+  /护甲套装 [套装名]   → 护甲套装 2/4 件效果（Starside 中文数值）别名 套装效果、d2套装、套装
+                         不带名字出全部套装索引；带名字/别名出单套全文
+                         （别名：炽天使套 / 一愿 / 遗愿 / 梦魇 / vog / kf / vow / ce …）
   @机器人 <名称>       → 群里直接 @ 机器人接武器名/perk名，自动出对应卡片（小日向式）
   /帮助                → 指令一览                          别名 help、菜单
 
@@ -419,6 +422,8 @@ weapon_query = on_command("武器查询", aliases={"d2武器"}, priority=8, bloc
                           force_whitespace=True)
 perk_query = on_command("perk查询", aliases={"特性查询", "d2perk", "d2特性"}, priority=8,
                         block=True, force_whitespace=True)
+armor_query = on_command("护甲套装", aliases={"套装效果", "d2套装", "套装"}, priority=8,
+                         block=True, force_whitespace=True)
 dust_query = on_command("每日光尘", aliases={"光尘商店", "d2光尘", "eververse", "光尘"},
                         priority=8, block=True, force_whitespace=True)
 rot_query = on_command("轮换", aliases={"本周轮换", "d2轮换", "突袭轮换", "raid轮换"},
@@ -495,6 +500,31 @@ async def _(event: Event, args: Message = CommandArg()):
                       kind="warn", fallback=f"没找到 perk「{q}」")
     await _send_card(perk_query, event, bot_cards.perk_card(res, q),
                      f"Perk 卡片 {q}", f"perk 查询：{q}")
+
+
+@armor_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    q = args.extract_plain_text().strip()
+    if not q:  # 不带名字 → 全部套装索引（56 套全文一张图放不下，列 2/4 件效果名）
+        await _send_card(armor_query, event, bot_cards.armor_sets_card(d2.all_armor_sets()),
+                         "护甲套装一览",
+                         "护甲套装效果一览（发 /护甲套装 套装名 看单套完整数值）")
+        return
+    res = d2.search_armor_sets(q)
+    if not res:
+        await _notice(armor_query, event, "没找到套装",
+                      [f"没有匹配「{q}」的套装；可以用别名，如 <code>一愿</code>、<code>vog</code>、<code>kf</code>"],
+                      kind="warn", fallback=f"没找到套装「{q}」")
+        return
+    if len(res) == 1:
+        await _send_card(armor_query, event, bot_cards.armor_set_card(res[0]),
+                         f"套装卡片 {res[0]['name']}", f"护甲套装：{res[0]['name']}")
+        return
+    # 多个候选 → 先给索引（含各候选 2/4 件效果名），让用户再挑一个
+    await _send_card(armor_query, event, bot_cards.armor_sets_card(res, q),
+                     f"套装候选 {q}", f"护甲套装「{q}」命中 {len(res)} 套")
 
 
 @dust_query.handle()
@@ -870,6 +900,8 @@ HELP_LINES = [
     "<b>生涯武器范围</b>：PVP 默认全生涯，PVE 默认当前赛季；想只看某赛季在末尾加 "
     "<code>s27</code> / <code>赛季27</code>，例：<code>/pve生涯武器 Wj#8984 s27</code>",
     "<b>资料</b>：<code>/武器查询 武器名</code> <code>/perk查询 perk名</code> "
+    "<code>/护甲套装 [套装名]</code>（别名 <code>/套装效果</code>；"
+    "支持触发词：炽天使套 / 一愿 / 梦魇 / vog / kf …）"
     "<code>/每日光尘</code>（光尘商店，别名 <code>/光尘商店</code>）"
     "<code>/轮换</code>（本周突袭与地牢）；"
     "群里也可以直接 <b>@机器人 武器名/perk名</b>",
@@ -886,7 +918,7 @@ HELP_LINES = [
     "一个个排队统计；跟在别人后面时会提示你排第几位",
 ]
 HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /称号 /锻造 "
-              "/生涯武器 /pve生涯武器 /武器查询 /perk查询 /每日光尘 /轮换 /绑定 /我的 /解绑")
+              "/生涯武器 /pve生涯武器 /武器查询 /perk查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
 
 
 @help_query.handle()
