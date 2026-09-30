@@ -2,6 +2,26 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-09-30 修 DIM 登录链路 + 面板授权回跳 + 二维码卡死自愈
+
+- **DIM 构建产物路径烘焙错误（登录全挂的根因）**：打包 DIM 时 PUBLIC_PATH 被 MSYS 路径转换污染，
+  React basename / publicPath / service-worker scope / authReturn 兜底路径全被烘焙成
+  `C:/Program Files/Git/dim/`。已在 dim_app 四个 js 里替换为 `/dim/`（main-469a81dc /
+  main-8a2dbe3b / runtime-d08515a3 / lo-worker-e99b7bc4 / authReturn-*）。
+- **DIM 授权回跳打通**：dim_app 里补上了构建漏掉的 `authReturn.html`（手写壳 + 自带 runtime +
+  authReturn chunk，chunk 自执行入口依赖 794/827/966）；DIM 的 authorize 请求注入
+  `redirect_uri=https://127.0.0.1:8902/bungie/callback`（走我们已有的 TLS 口，不再撞
+  `https://127.0.0.1:8900` 的 http 口报 ERR_SSL_PROTOCOL_ERROR）；DIM 的 state 强制
+  `dimauth-` 前缀，`/bungie/callback` 见到该前缀就 302 到 `/dim/authReturn.html`，
+  由 DIM 自己（烘焙的 client_secret）换 token，与面板授权互不干扰。
+- **面板授权回跳有返回了**：/bungie/callback 成功页 2.5 秒自动回 /panel，失败页加
+  「← 返回面板」链接（原生窗口没有后退键）。面板/接口里过时的
+  「Redirect URL 填 8900」提示文案改成 8902。
+- **二维码卡死自愈**：NapCat RefreshQRcode 一直 restarting/回旧码时（登录服务卡死），
+  同一张码挂超 110 秒且续期失败 → 自动重启 NapCat 重新出码（10 分钟限一次、已登录绝不动、
+  不受 5 分钟启动冷却限制）；`_qr_url` 全部改走不抛错版本，接口挂了不再把面板二维码打 500。
+- 注意：DIM 的 service-worker 会缓存旧 bundle，用户首次打开如果还是旧行为，刷新一两次即可。
+
 > 这些「实测踩出来的」结论是改代码前必读的约束，不要按直觉改。
 
 ## 2026-09-30 套装别名全面复核 + 模糊搜索兜底

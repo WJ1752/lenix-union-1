@@ -324,7 +324,7 @@ async function refreshBungie(){
     box.innerHTML = '<span class="off">● 未配置 Bungie 应用</span>'
       + '<div class="dim" style="margin-top:6px">在 .env 里补 <code>BUNGIE_CLIENT_ID</code> / '
       + '<code>BUNGIE_CLIENT_SECRET</code>（Bungie 应用里「开放授权客户端类型」要选<b>机密</b>），'
-      + 'Redirect URL 填 <code>https://127.0.0.1:8900/bungie/callback</code>，重启后再授权。</div>';
+      + 'Redirect URL 填 <code>https://127.0.0.1:8902/bungie/callback</code>，重启后再授权。</div>';
     return;
   }
   if(s.authorized){
@@ -889,7 +889,7 @@ def bungie_authorize():
             "<h2 style='color:#e8eef7'>还没配置 Bungie 应用</h2>"
             "在项目 <code>.env</code> 里补上：<br><br>"
             "<code>BUNGIE_CLIENT_ID=...</code><br><code>BUNGIE_CLIENT_SECRET=...</code><br>"
-            "<code>BUNGIE_REDIRECT_URI=https://127.0.0.1:8900/bungie/callback</code><br><br>"
+            "<code>BUNGIE_REDIRECT_URI=https://127.0.0.1:8902/bungie/callback</code><br><br>"
             "到 <a style='color:#5ea8ff' href='https://www.bungie.net/zh-chs/Application' "
             "target='_blank'>bungie.net/zh-chs/Application</a> 打开你的应用（有 API Key 的那个）："
             "「开放授权客户端类型」选 <b>机密</b>，Redirect URL 填上面那行（Bungie 只收 https，"
@@ -917,17 +917,26 @@ async def bungie_manual(request: dict):
 
 @app.get("/bungie/callback", response_class=HTMLResponse)
 async def bungie_callback(code: str = "", state: str = "", error: str = ""):
+    # DIM 板块的授权回跳（state 固定为 dimauth- 前缀）：原样转交 DIM 的 authReturn 页，
+    # 由 DIM 自己（构建时烘焙的 client_secret）完成 code 换 token，与面板授权互不干扰
+    if state.startswith("dimauth-") and code and not error:
+        from starlette.responses import RedirectResponse
+        from urllib.parse import quote
+        return RedirectResponse(f"/dim/authReturn.html?code={quote(code)}&state={quote(state)}")
+    back = ("<div style='margin-top:14px'><a href='/panel' "
+            "style='color:#5ea8ff;font:14px sans-serif'>← 返回面板</a></div>")
     if error or not code:
-        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>")
+        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>{back}")
     if not bungie_auth.check_state(state):
-        return HTMLResponse("<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>")
+        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>{back}")
     try:
         await bungie_auth.exchange(code)
     except Exception as exc:  # noqa: BLE001
-        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>")
+        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}")
     return HTMLResponse("<h2 style='color:#7dff9c;font-family:sans-serif'>授权成功</h2>"
                         "<div style='font:14px sans-serif;color:#cfd8e3'>可以关闭本页，回到面板或直接发 "
-                        "<code>/每日光尘</code>。</div>")
+                        "<code>/每日光尘</code>。</div>"
+                        "<script>setTimeout(function(){location.href='/panel'},2500)</script>" + back)
 
 
 @app.post("/api/bungie/logout")

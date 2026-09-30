@@ -7,7 +7,7 @@
 
     A. 公开客户端（推荐）
        Bungie 应用里「开放授权客户端类型」选 **公开**，Redirect URL 填
-       https://127.0.0.1:8900/bungie/callback
+       https://127.0.0.1:8902/bungie/callback
        .env 只需要：BUNGIE_CLIENT_ID=你的 Client ID
        （公开客户端走 PKCE，代码里自动生成 code_challenge/code_verifier）
 

@@ -271,16 +271,49 @@ def refresh_qr(force: bool = False, timeout: float = 20.0) -> str:
     deadline = now + (timeout if restarting or not old else 6.0)
     while time.time() < deadline:
         time.sleep(1.0)
-        cur = _qr_url()
+        cur = _qr_url_safe()
         if cur and cur != old:
             _qr_seen.update(url=cur, since=now)
             return _render_qr(cur)
     # 仍没变化：至少刷新时间戳并重新出图，前端不会一直显示"过期"
-    cur = _qr_url() or old
+    cur = _qr_url_safe() or old
     if cur:
         _qr_seen.update(url=cur, since=now)
         return _render_qr(cur)
     return ""
+
+
+def _qr_url_safe() -> str:
+    """_qr_url 的不抛错版本（登录服务重启中接口会连不上，不该把面板二维码接口打挂）"""
+    try:
+        return _qr_url()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_qr_restart_at = 0.0  # 上次"码卡死自动重启登录服务"的时间（10 分钟内只来一次，防风控）
+
+
+def _restart_login_for_qr():
+    """二维码长时间不更新（RefreshQRcode 一直 restarting/回旧码）时，
+    重启 NapCat 让登录服务重新出码。这是唯一能真正换新码的办法；
+    限 10 分钟一次，且已登录时绝不动。"""
+    global _last_start, _qr_restart_at
+    if time.time() - _qr_restart_at < 600:
+        return False
+    if login_status().get("isLogin"):
+        return False
+    _qr_restart_at = time.time()
+    try:
+        with _lock:
+            if _proc and _proc.poll() is None:
+                _proc.kill()
+            _proc = None
+            _last_start = 0.0  # 卡死重启不受 5 分钟冷却限制（这不是用户反复登录）
+        start()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def qr_data_url() -> str:
@@ -290,7 +323,7 @@ def qr_data_url() -> str:
     直接读文件会一直显示过期码。所以改为用 WebUI API 拿实时 URL 后本地出图
     （NapCat 的 /QQLogin/GetQQLoginQrcode 只返回 URL，不出图）。
     """
-    raw = _qr_url()
+    raw = _qr_url_safe()
     if raw.startswith("data:image"):  # 某些 NapCat 版本直接返回图片
         return raw
     if raw:
@@ -301,7 +334,14 @@ def qr_data_url() -> str:
             fresh = refresh_qr()
             if fresh:
                 return fresh
-            _qr_seen.update(url=raw, since=now)
+            # 续期拿不到新码：登录服务多半卡死了，重启它重新出码
+            if _restart_login_for_qr():
+                time.sleep(6.0)  # 等登录服务起来
+                raw = _qr_url_safe()
+                if raw and raw != _qr_seen["url"]:
+                    _qr_seen.update(url=raw, since=time.time())
+                    return _render_qr(raw)
+            _qr_seen.update(url=_qr_seen["url"], since=now)
         return _render_qr(raw)
     # 兜底：旧版 NapCat 落盘的图片
     p = os.path.join(NAPCAT_DIR, "cache", "qrcode.png")
