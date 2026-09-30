@@ -56,6 +56,7 @@ import bot_cards
 import bot_log
 import card_render
 import destiny_data as d2
+import raid_loot
 import weapon_filter as wf
 
 
@@ -439,18 +440,45 @@ async def _(event: Event, args: Message = CommandArg()):
     q = args.extract_plain_text().strip()
     if not q:
         await _notice(weapon_query, event, "武器查询",
-                      ["用法：<code>/武器查询 武器名</code>（例如 <code>/武器查询 秋风</code>）"],
+                      ["用法：<code>/武器查询 武器名</code>（例如 <code>/武器查询 秋风</code>）",
+                       "同名武器多版本：<code>/武器查询 暗夜魅影 2</code> 查第 2 版（不带序号默认最新）"],
                       fallback="用法：/武器查询 武器名")
+    # 结尾序号 = 同名多版本的版本号（1=最旧），不带序号默认最新版本
+    ver_num = None
+    m = re.search(r"\s+(\d+)$", q)
+    if m:
+        ver_num = int(m.group(1))
+        q = q[:m.start()].strip()
     res = d2.search_weapons_full(q, 12)
     if not res:
         await _notice(weapon_query, event, "没找到武器", [f"没有匹配「{q}」的武器"],
                       kind="warn", fallback=f"没找到武器「{q}」")
     top = res[0]
+    # 同名多版本：按赛季从旧到新排，默认取最新；带序号取对应版本
+    vers = d2.weapon_versions_by_name(top["name"])
+    ver_tags, ver_cur = [], 0
+    if len(vers) > 1:
+        if ver_num is not None:
+            if not 1 <= ver_num <= len(vers):
+                rng = f"1~{len(vers)}"
+                await _notice(weapon_query, event, "版本序号超出范围",
+                              [f"「{top['name']}」共 {len(vers)} 个版本，序号范围 {rng}",
+                               "版本 1 最旧，序号越大越新"],
+                              kind="warn", fallback=f"版本序号 {ver_num} 超出范围 {rng}")
+            top = dict(d2.weapon_detail(vers[ver_num - 1]["hash"]), hash=vers[ver_num - 1]["hash"])
+            ver_cur = ver_num
+        else:
+            ver_cur = len(vers)
+            top = dict(d2.weapon_detail(vers[-1]["hash"]), hash=vers[-1]["hash"])
+        ver_tags = [d2.season_tag(v["season"]) + ("·活动" if v["event"] else "") for v in vers]
+        ver_names = [d2.season_name(v["season"]) for v in vers]
+    else:
+        ver_names = []
     # 命中够准（唯一/前缀命中）出详情卡，否则给候选列表
     strong = len(res) == 1 or top["name"].lower().startswith(q.lower()) or top["name"].lower() == q.lower()
     if strong:
         others = [w["name"] for w in res[1:4]]
-        html = bot_cards.weapon_card(top, others)
+        html = bot_cards.weapon_card(top, others, ver_tags, ver_cur, ver_names)
         label = f"武器卡片 {top['name']}"
     else:
         html = bot_cards.weapons_list_card(res, q)
@@ -561,6 +589,56 @@ async def _(event: Event):
                      "本周轮换", "本周轮换数据获取失败")
 
 
+# ---------- 掉落表：/掉落 克洛塔、/ron掉落、/ce掉落 …（Saya 掉落图） ----------
+drop_query = on_command("掉落", aliases={"d2掉落", "掉落表", "loot", *raid_loot.command_names()},
+                        priority=8, block=True, force_whitespace=True)
+
+
+@drop_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    # 组合词（/ron掉落）时 CommandArg 为空，从整条消息里剥出关键词
+    token = args.extract_plain_text().strip() or \
+        str(event.get_message()).lstrip("/").strip()
+    if not raid_loot.resolve(token) and not raid_loot.missing_name(token):
+        token = re.sub(r"掉落", "", token).strip()
+    def _chart_list() -> list[str]:
+        """可查副本列表：名字 + 常用触发词"""
+        out = []
+        for k, (name, aliases, _) in raid_loot.CHARTS.items():
+            short = [a for a in aliases if len(a) <= 4][:3]
+            out.append(f"<b>{name}</b>：<code>/{k}掉落</code> 或 <code>/{'/'.join(short)}掉落</code>")
+        return out
+
+    missing = raid_loot.missing_name(token)
+    if missing:
+        await _notice(drop_query, event, f"{missing}暂无掉落图",
+                      [f"Sayalarry 还没做过「{missing}」的掉落表图，当前可查："] + _chart_list(),
+                      kind="warn", fallback=f"{missing}暂无掉落图")
+    key = raid_loot.resolve(token)
+    if not key:
+        await _notice(drop_query, event, "掉落表查询",
+                      ["用法：<code>/掉落 副本名</code>，也支持 <code>/ce掉落</code>、<code>/ron掉落</code> 这类缩写。",
+                       "当前可查的副本："] + _chart_list(),
+                      fallback="用法：/掉落 副本名（如 /掉落 克洛塔）")
+    files = raid_loot.segments(key)
+    if not files:
+        await _notice(drop_query, event, "掉落图缺失",
+                      [f"「{raid_loot.chart_display(key)}」的图片没有随包分发，检查 raid_images_proc 目录。"],
+                      kind="err", fallback="掉落图缺失")
+    _log_out(event, f"[图片] 掉落表 {raid_loot.chart_display(key)} ×{len(files)}")
+    segs = [MessageSegment.image("base64://" + base64.b64encode(open(f, "rb").read()).decode())
+            for f in files]
+    try:
+        await drop_query.finish(_at_sender(event, Message(segs)))
+    except FinishedException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log_out(event, f"[发送失败] 掉落表 {key}：{exc}")
+        raise
+
+
 # ---------- 群里 @机器人 + 名字 = 直接查武器 / perk（小日向式） ----------
 # 小日向不用打指令，@ 一下接名字就出卡片；这里对齐：@机器人 秋风 → 武器卡，
 # @机器人 热力四射 → perk 卡。**只认真 @**：仅仅"引用/回复机器人的消息"不算。
@@ -600,7 +678,15 @@ async def _(event: MessageEvent):
                   or top["name"].lower() == q.lower())
         if strong:
             others = [w["name"] for w in res[1:4]]
-            await _send_card(at_lookup, event, bot_cards.weapon_card(top, others),
+            # 同名多版本：@ 直查也默认最新版本，卡片带版本列表
+            vers = d2.weapon_versions_by_name(top["name"])
+            ver_tags, ver_names = [], []
+            if len(vers) > 1:
+                top = dict(d2.weapon_detail(vers[-1]["hash"]), hash=vers[-1]["hash"])
+                ver_tags = [d2.season_tag(v["season"]) + ("·活动" if v["event"] else "") for v in vers]
+                ver_names = [d2.season_name(v["season"]) for v in vers]
+            await _send_card(at_lookup, event,
+                             bot_cards.weapon_card(top, others, ver_tags, len(ver_tags) or 0, ver_names),
                              f"武器卡片 {top['name']}", f"武器：{top['name']}")
         else:
             await _send_card(at_lookup, event, bot_cards.weapons_list_card(res, q),
@@ -905,6 +991,8 @@ HELP_LINES = [
     "<code>/每日光尘</code>（光尘商店，别名 <code>/光尘商店</code>）"
     "<code>/轮换</code>（本周突袭与地牢）；"
     "群里也可以直接 <b>@机器人 武器名/perk名</b>",
+    "<b>掉落表</b>：<code>/掉落 副本名</code>，裸指令也行：<code>/二象性掉落</code>、<code>/ron掉落</code>、"
+    "<code>/ce掉落</code>…（全副本可查，发 <code>/掉落</code> 看列表）",
     "<b>武器筛选</b>：<code>/武器筛选 关键词…</code>（空格分隔，多词同时满足），"
     "例 <code>/武器筛选 主手 锻造 微冲 900</code>、<code>/武器筛选 电 重弹 腹背受敌</code>；"
     "词可以是 类型/弹药/槽位(动能·能量·威能)/元素/射速/框架/特性名/"

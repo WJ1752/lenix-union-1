@@ -47,6 +47,12 @@ section{background:rgba(255,255,255,.03);border-radius:8px;padding:4px 8px 10px}
 .wicon img.wm{z-index:2}
 .winfo{flex:1;min-width:0}
 .flavor{color:#a8b8cc;font-size:13px;line-height:1.6;margin:8px 0 0}
+/* 同名多版本条 */
+.vers{margin-top:10px;padding:8px 12px;border:1px solid #2c3b52;border-radius:8px;font-size:13px;color:#cfe0f2;line-height:1.9}
+.vers em{font-style:normal;color:#ffd166;font-weight:700;margin:0 2px}
+.vers b{color:#9db4cc;font-weight:600;margin-left:6px}
+.vers b.on{color:#ffd166;text-shadow:0 0 6px rgba(255,209,102,.35)}
+.vers span{display:block;color:#7f93aa;font-size:12px;margin-top:2px}
 /* 属性条 */
 .stat{display:flex;align-items:center;gap:10px;font-size:13px;margin:5px 0}
 .stat>span{width:92px;color:#a8b8cc;flex-shrink:0}
@@ -367,7 +373,9 @@ def _plugs_cols(pl: dict) -> list[dict]:
     return out
 
 
-def weapon_card(w: dict, others: list[str] | None = None) -> str:
+def weapon_card(w: dict, others: list[str] | None = None,
+                vers: list[str] | None = None, ver_cur: int = 0,
+                ver_names: list[str] | None = None) -> str:
     pl = w.get("plugs", {})
     wm = f"<img class='wm' src='{esc(w['watermark'])}'>" if w.get("watermark") else ""
     frame = ((pl.get("intrinsic") or [{}])[0]).get("n", "")   # 框架：游戏里就在武器名旁边
@@ -381,6 +389,17 @@ def weapon_card(w: dict, others: list[str] | None = None) -> str:
             + "</div></div>")
 
     body = head
+    if vers and len(vers) > 1:
+        cur_tags = "".join(
+            f"<b class='on'>{i}</b>·{esc(tag)}" if i == ver_cur else f"<b>{i}</b>·{esc(tag)}"
+            for i, tag in enumerate(vers, 1))
+        names = ver_names or [""] * len(vers)
+        detail = "　".join(f"{i}·{tag}" + (f" {esc(nm)}" if nm else "")
+                           for i, (tag, nm) in enumerate(zip(vers, names), 1))
+        body += ("<div class='vers'>同名版本 <em>%d</em> 个（1 最旧，默认最新）：%s"
+                 "<span>%s</span>"
+                 "<span>其它版本：<code>/武器查询 %s 序号</code></span></div>"
+                 % (len(vers), cur_tags, detail, esc(w["name"])))
     stats = _stat_sorted(w.get("stats") or [])
     if stats:
         plain = [s for s in stats if s["n"] in PLAIN_STATS]

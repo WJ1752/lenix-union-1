@@ -13,13 +13,18 @@ _MI_SKIP = {'raw_items.json', 'raw_plugsets.json'}
 mi_datas = [(p, 'manifest_index') for p in sorted(glob.glob('manifest_index/*.json'))
             if os.path.basename(p) not in _MI_SKIP]
 
+# Saya 掉落表切块长图（raid_images/ 是原图构建中间产物，不进包）
+# 注意必须逐子目录指定 dest，否则 PyInstaller 会把所有 seg_*.jpg 打平到一个目录里
+loot_datas = [(p, 'raid_images_proc' + '/' + os.path.basename(os.path.dirname(p)))
+              for p in sorted(glob.glob('raid_images_proc/*/*.jpg'))]
+
 
 a = Analysis(
     ['d2query_launcher.py'],
     pathex=[],
     binaries=pw_binaries,
-    datas=[*mi_datas, ('certs/localhost.pem', 'certs'), ('certs/localhost-key.pem', 'certs')] + pw_datas,
-    hiddenimports=['card_render', 'bot_cards', 'weapon_filter', 'dim_data', 'dim_web', 'dim_ui', 'dim_user', 'dim_opt', 'greenlet', 'pyee', 'qr_png', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.http', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11'] + pw_hidden,
+    datas=[*mi_datas, *loot_datas, ('certs/localhost.pem', 'certs'), ('certs/localhost-key.pem', 'certs')] + pw_datas,
+    hiddenimports=['card_render', 'bot_cards', 'weapon_filter', 'raid_loot', 'dim_data', 'dim_web', 'dim_ui', 'dim_user', 'dim_opt', 'greenlet', 'pyee', 'qr_png', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.http', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11'] + pw_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

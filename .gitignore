@@ -68,3 +68,8 @@ _rtest/*.html
 _rtest/dimtree.json
 _rtest/_page.js
 dim_app/
+
+# ===== 临时/中间产物 =====
+_*.png
+ss_test.html
+raid_images/

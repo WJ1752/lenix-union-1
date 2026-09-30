@@ -322,6 +322,39 @@ def suggest_weapons(q: str, limit: int = 8) -> list[dict]:
     return out[:limit]
 
 
+try:  # 武器版本表（build_weapon_versions.py 生成）：hash → {season, event}；同名多版本用
+    _weapon_versions = json.load(open(_idx_file("weapon_versions.json"), encoding="utf-8"))
+except Exception:  # noqa: BLE001
+    _weapon_versions = {}
+try:  # 赛季号 → 官方英文名（Bungie 已不再出中文赛季定义）
+    _season_names = json.load(open(_idx_file("season_names.json"), encoding="utf-8"))
+except Exception:  # noqa: BLE001
+    _season_names = {}
+
+
+def season_tag(n: int) -> str:
+    """赛季显示标签：0=首发，正数=S 号（官方英文名太长，卡片里用 S 号）"""
+    return "首发" if n <= 0 else f"S{n}"
+
+
+def season_name(n: int) -> str:
+    """赛季官方英文名（无则空串）"""
+    return (_season_names.get(str(n)) or {}).get("name", "")
+
+
+def weapon_versions_by_name(name: str) -> list[dict]:
+    """同名武器的全部版本，按赛季从旧到新排（同赛季按 hash 稳定排序）
+    返回 [{'hash', 'season', 'event'}]，下标 0 = 版本 1"""
+    items = [(h, w) for h, w in _weapons_full.items() if w["name"] == name]
+    if not items:
+        return []
+    items.sort(key=lambda x: (_weapon_versions.get(x[0], {}).get("season", 0), x[0]))
+    return [{"hash": h,
+             "season": _weapon_versions.get(h, {}).get("season", 0),
+             "event": _weapon_versions.get(h, {}).get("event", False)}
+            for h, _ in items]
+
+
 def search_weapons_full(q: str, limit: int = 24) -> list[dict]:
     q = q.lower().strip()
     out = [dict(w, hash=h) for h, w in _weapons_full.items() if q in w["name"].lower()]
