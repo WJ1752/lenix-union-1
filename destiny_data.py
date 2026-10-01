@@ -2128,6 +2128,57 @@ async def rotation_week(force: bool = False) -> dict:
     return data
 
 
+# ---------- 扭曲星球轮换（每小时换目的地，7 小时一轮） ----------
+# 数据来源同 rotation_pairs.json 里的 distortion 段（scrape_starside_rotation.py 抓）。
+# 口径与 starside 轮换页一致：页面按访问者本机时钟高亮，表以「本机周一 00:00」为
+# 起点，目的地 = cycle[slots[周几(周一=0)][小时]]；周期 7 小时、一周 168 时段，
+# 因此每周的表相同。bot 跑在用户机器上（UTC+8），直接用本机时间即可。
+# 对齐自检：Bungie 周复位 = UTC 周二 17:00 = 北京周三 01:00，距周一 00:00 恰
+# 49h = 7 整循环，复位点自动回到 cycle[0]，无需单独对齐。
+_DIST = None
+
+
+def _distortion() -> dict:
+    global _DIST
+    if _DIST is None:
+        try:
+            _DIST = (json.load(open(_idx_file("rotation_pairs.json"), encoding="utf-8"))
+                     .get("distortion") or {})
+        except Exception:  # noqa: BLE001
+            _DIST = {}
+    return _DIST
+
+
+def distortion_now(dt_: datetime.datetime | None = None) -> dict:
+    """扭曲星球当前时段。dt_ 缺省取本机当前时间（bot 所在机器的本地时区）。
+
+    返回 {"ok": True, dest 当前目的地, range 时段文字, start/end 时段起止,
+          next_dest 下一个目的地, next_at 切换时刻, next_hm 切换时刻(HH:MM),
+          next_in_sec 距切换秒数, today 今日剩余各时段(含当前, current 标记)}。
+    数据缺失时返回 {"ok": False}，调用方按「无此板块」处理。
+    """
+    d = _distortion()
+    cyc, slots = d.get("cycle") or [], d.get("slots") or []
+    now = dt_ or datetime.datetime.now()
+    if not cyc or not slots:
+        return {"ok": False}
+    try:
+        idx = slots[now.weekday()][now.hour]
+    except Exception:  # noqa: BLE001
+        return {"ok": False}
+    start = now.replace(minute=0, second=0, microsecond=0)
+    end = start + datetime.timedelta(hours=1)
+    nxt = (idx + 1) % len(cyc)
+    today = [{"hour": h, "range": f"{h:02d}:00-{(h + 1) % 24:02d}:00",
+              "dest": cyc[slots[now.weekday()][h]], "current": h == now.hour}
+             for h in range(now.hour, 24)]
+    return {"ok": True, "dest": cyc[idx],
+            "range": f"{now.hour:02d}:00-{end:%H}:00", "start": start, "end": end,
+            "next_dest": cyc[nxt], "next_at": end, "next_hm": f"{end:%H:%M}",
+            "next_in_sec": max(int((end - now).total_seconds()), 0),
+            "today": today}
+
+
 def _rot_cache_path() -> str:
     base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))

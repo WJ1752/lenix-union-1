@@ -23,10 +23,11 @@
                          范围可写 s27 / 赛季27 / 全生涯，例：/pvp生涯武器 s27
   /武器查询 <名称>     → 武器 perk 池（特性/枪管/弹匣/枪托）别名 d2武器
   /perk查询 <名称>     → perk 官方说明 + 中文精确数值       别名 d2perk、d2特性
+  /护甲查询 <名称>     → 异域护甲特性卡（职业金显示全部特性组合）别名 d2护甲
   /护甲套装 [套装名]   → 护甲套装 2/4 件效果（Starside 中文数值）别名 套装效果、d2套装、套装
                          不带名字出全部套装索引；带名字/别名出单套全文
                          （别名：炽天使套 / 一愿 / 遗愿 / 梦魇 / vog / kf / vow / ce …）
-  @机器人 <名称>       → 群里直接 @ 机器人接武器名/perk名，自动出对应卡片（小日向式）
+  @机器人 <名称>       → 群里直接 @ 机器人接武器名/护甲名/perk名，自动出对应卡片（小日向式）
   /帮助                → 指令一览                          别名 help、菜单
 
 玩家类指令（/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /锻造 /称号
@@ -55,6 +56,11 @@ from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
 import bot_cards
+
+try:
+    import weapon_usage
+except Exception:  # noqa: BLE001
+    weapon_usage = None
 import bot_log
 import card_render
 import destiny_data as d2
@@ -489,35 +495,33 @@ filter_query = on_command("武器筛选", aliases={"d2武器筛选", "d2筛选",
                           priority=8, block=True, force_whitespace=True)
 
 
-@weapon_query.handle()
-async def _(event: Event, args: Message = CommandArg()):
-    if not _allowed_group(event):
-        return
-    q = args.extract_plain_text().strip()
-    if not q:
-        await _notice(weapon_query, event, "武器查询",
-                      ["用法：<code>/武器查询 武器名</code>（例如 <code>/武器查询 秋风</code>）",
-                       "同名武器多版本：<code>/武器查询 暗夜魅影 2</code> 查第 2 版（不带序号默认最新）"],
-                      fallback="用法：/武器查询 武器名")
-    # 结尾序号 = 同名多版本的版本号（1=最旧），不带序号默认最新版本
-    ver_num = None
+def _split_ver(q: str) -> tuple[str, int | None]:
+    """拆结尾版本序号 = 同名多版本的版本号（1=最旧）：「暗夜魅影 2」→ ("暗夜魅影", 2)"""
     m = re.search(r"\s+(\d+)$", q)
     if m:
-        ver_num = int(m.group(1))
-        q = q[:m.start()].strip()
-    res = d2.search_weapons_full(q, 12)
+        return q[:m.start()].strip(), int(m.group(1))
+    return q, None
+
+
+async def _weapon_reply(matcher, event: Event, q: str, ver_num: int | None = None,
+                        source: str = "武器查询", res: list[dict] | None = None):
+    """武器查询主体（/武器查询 与 @机器人 直查共用）：没找到/序号超范围时
+    _notice 会 finish 结束；命中够准（唯一/前缀）出详情卡，否则给候选列表；
+    同名多版本按结尾序号选，不带序号默认最新版本。"""
+    if res is None:
+        res = d2.search_weapons_full(q, 12)
     if not res:
-        await _notice(weapon_query, event, "没找到武器", [f"没有匹配「{q}」的武器"],
+        await _notice(matcher, event, "没找到武器", [f"没有匹配「{q}」的武器"],
                       kind="warn", fallback=f"没找到武器「{q}」")
     top = res[0]
     # 同名多版本：按赛季从旧到新排，默认取最新；带序号取对应版本
     vers = d2.weapon_versions_by_name(top["name"])
-    ver_tags, ver_cur = [], 0
+    ver_tags, ver_cur, ver_names = [], 0, []
     if len(vers) > 1:
         if ver_num is not None:
             if not 1 <= ver_num <= len(vers):
                 rng = f"1~{len(vers)}"
-                await _notice(weapon_query, event, "版本序号超出范围",
+                await _notice(matcher, event, "版本序号超出范围",
                               [f"「{top['name']}」共 {len(vers)} 个版本，序号范围 {rng}",
                                "版本 1 最旧，序号越大越新"],
                               kind="warn", fallback=f"版本序号 {ver_num} 超出范围 {rng}")
@@ -528,18 +532,45 @@ async def _(event: Event, args: Message = CommandArg()):
             top = dict(d2.weapon_detail(vers[-1]["hash"]), hash=vers[-1]["hash"])
         ver_tags = [d2.season_tag(v["season"]) + ("·活动" if v["event"] else "") for v in vers]
         ver_names = [d2.season_name(v["season"]) for v in vers]
-    else:
-        ver_names = []
-    # 命中够准（唯一/前缀命中）出详情卡，否则给候选列表
     strong = len(res) == 1 or top["name"].lower().startswith(q.lower()) or top["name"].lower() == q.lower()
     if strong:
         others = [w["name"] for w in res[1:4]]
-        html = bot_cards.weapon_card(top, others, ver_tags, ver_cur, ver_names)
+        usage = None
+        if weapon_usage is not None:
+            try:
+                usage = await weapon_usage.get_usage(int(top["hash"]))
+            except Exception:  # noqa: BLE001
+                usage = None
+        html = bot_cards.weapon_card(top, others, ver_tags, ver_cur, ver_names, usage=usage)
         label = f"武器卡片 {top['name']}"
     else:
         html = bot_cards.weapons_list_card(res, q)
         label = f"武器候选列表 {q}"
-    await _send_card(weapon_query, event, html, label, f"武器查询：{q}")
+    await _send_card(matcher, event, html, label, f"{source}：{q}")
+
+
+async def _perk_reply(matcher, event: Event, q: str):
+    """perk 查询主体（/perk查询 与 @bot perk xxx 显式前缀共用）"""
+    res = d2.search_perks(q, 3)
+    if not res:
+        await _notice(matcher, event, "没找到 perk", [f"没有匹配「{q}」的 perk"],
+                      kind="warn", fallback=f"没找到 perk「{q}」")
+    await _send_card(matcher, event, bot_cards.perk_card(res, q),
+                     f"Perk 卡片 {q}", f"perk 查询：{q}")
+
+
+@weapon_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    q = args.extract_plain_text().strip()
+    if not q:
+        await _notice(weapon_query, event, "武器查询",
+                      ["用法：<code>/武器查询 武器名</code>（例如 <code>/武器查询 秋风</code>）",
+                       "同名武器多版本：<code>/武器查询 暗夜魅影 2</code> 查第 2 版（不带序号默认最新）"],
+                      fallback="用法：/武器查询 武器名")
+    name, ver_num = _split_ver(q)
+    await _weapon_reply(weapon_query, event, name, ver_num)
 
 
 FILTER_HINT = [
@@ -578,12 +609,7 @@ async def _(event: Event, args: Message = CommandArg()):
         await _notice(perk_query, event, "Perk 查询",
                       ["用法：<code>/perk查询 perk名</code>（例如 <code>/perk查询 热力四射</code>）"],
                       fallback="用法：/perk查询 perk名")
-    res = d2.search_perks(q, 3)
-    if not res:
-        await _notice(perk_query, event, "没找到 perk", [f"没有匹配「{q}」的 perk"],
-                      kind="warn", fallback=f"没找到 perk「{q}」")
-    await _send_card(perk_query, event, bot_cards.perk_card(res, q),
-                     f"Perk 卡片 {q}", f"perk 查询：{q}")
+    await _perk_reply(perk_query, event, q)
 
 
 @armor_query.handle()
@@ -609,6 +635,94 @@ async def _(event: Event, args: Message = CommandArg()):
     # 多个候选 → 先给索引（含各候选 2/4 件效果名），让用户再挑一个
     await _send_card(armor_query, event, bot_cards.armor_sets_card(res, q),
                      f"套装候选 {q}", f"护甲套装「{q}」命中 {len(res)} 套")
+
+
+# ---------- 异域护甲查询（数据：manifest_index/exotic_armor.json，懒加载） ----------
+# 索引由独立数据脚本生成，机器人侧只读：文件缺失/损坏一律当「未构建」提示，
+# 不抛异常不拖挂其它指令。命中规则：名字/英文名/别名精确命中出详情卡；
+# 只有模糊命中且不止一件时出候选列表卡。
+armor_lookup = on_command("护甲查询", aliases={"d2护甲"}, priority=8, block=True,
+                          force_whitespace=True)
+
+_ARMOR_CACHE: list[dict] | None = None
+_ARMOR_TRIED = False
+
+
+def _armor_data() -> list[dict] | None:
+    """读异域护甲索引（只加载一次；None = 文件缺失或损坏）"""
+    global _ARMOR_CACHE, _ARMOR_TRIED
+    if not _ARMOR_TRIED:
+        _ARMOR_TRIED = True
+        try:
+            # d2._idx_file 兼容源码目录 / PyInstaller 打包资源 / 当前目录三种定位
+            data = json.load(open(d2._idx_file("exotic_armor.json"), encoding="utf-8"))
+            items = [it for it in (data.get("items") or []) if isinstance(it, dict)]
+            for it in items:  # 构建时间戳下放到条目，卡片页脚可显示
+                it.setdefault("updated", data.get("updated") or "")
+            _ARMOR_CACHE = items or None
+        except Exception:  # noqa: BLE001  缺文件 / JSON 损坏统一当「未构建」
+            _ARMOR_CACHE = None
+    return _ARMOR_CACHE
+
+
+def _armor_match(items: list[dict], q: str) -> tuple[list[dict], list[dict]]:
+    """按 名字/英文名/别名 匹配异域护甲：返回 (精确命中, 模糊命中)"""
+    q_low = (q or "").strip().lower()
+    exact, fuzzy, seen = [], [], set()
+    for it in items:
+        names = {str(it.get("name") or ""), str(it.get("en") or "")}
+        names |= {str(a) for a in (it.get("aliases") or [])}
+        names = {n.strip().lower() for n in names if n.strip()}
+        if q_low in names:
+            exact.append(it)
+        elif any(q_low in n or n in q_low for n in names):
+            h = it.get("hash")
+            if h in seen:  # 同一件护甲多个名字都命中时只留一条
+                continue
+            seen.add(h)
+            fuzzy.append(it)
+    return exact, fuzzy
+
+
+async def _armor_reply(matcher, event: Event, q: str, source: str = "护甲查询"):
+    """异域护甲查询主体（/护甲查询 与 @机器人 直查共用）"""
+    items = _armor_data()
+    if items is None:
+        await _notice(matcher, event, "护甲数据未构建",
+                      ["异域护甲索引还没生成（manifest_index/exotic_armor.json）",
+                       "先在机器人目录跑一次数据构建，再来查"],
+                      kind="warn", fallback="护甲数据未构建：manifest_index/exotic_armor.json 缺失")
+        return
+    exact, fuzzy = _armor_match(items, q)
+    hits = exact or fuzzy
+    if len(hits) == 1:
+        top = hits[0]
+        await _send_card(matcher, event, bot_cards.armor_card(top),
+                         f"护甲卡片 {top.get('name') or q}", f"{source}：{q}")
+        return
+    if hits:
+        await _send_card(matcher, event, bot_cards.armor_card(q, hits),
+                         f"护甲候选 {q}", f"{source}「{q}」命中 {len(hits)} 件")
+        return
+    await _notice(matcher, event, "没找到护甲",
+                  [f"没有匹配「{q}」的异域护甲",
+                   "用法：<code>/护甲查询 护甲名</code>，支持外号/英文名"
+                   "（如 <code>/护甲查询 星夜鹰</code>）"],
+                  kind="warn", fallback=f"没找到护甲「{q}」")
+
+
+@armor_lookup.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    q = args.extract_plain_text().strip()
+    if not q:
+        await _notice(armor_lookup, event, "护甲查询",
+                      ["用法：<code>/护甲查询 护甲名</code>（例如 <code>/护甲查询 星夜鹰</code>）",
+                       "支持外号与英文名：<code>/护甲查询 金头鹰</code>、<code>/护甲查询 celestine</code>"],
+                      fallback="用法：/护甲查询 护甲名")
+        return
+    await _armor_reply(armor_lookup, event, q)
 
 
 @dust_query.handle()
@@ -641,7 +755,7 @@ async def _(event: Event):
         await _notice(rot_query, event, "本周轮换获取失败",
                       [f"Bungie 里程碑接口暂时不可用：{_exc_msg(exc)}"],
                       kind="err", fallback=f"本周轮换获取失败：{_exc_msg(exc)}")
-    await _send_card(rot_query, event, bot_cards.rotation_card(rot),
+    await _send_card(rot_query, event, bot_cards.rotation_card(rot, d2.distortion_now()),
                      "本周轮换", "本周轮换数据获取失败")
 
 
@@ -720,43 +834,63 @@ async def _at_me_only(event: Event) -> bool:
 at_lookup = on_message(rule=Rule(_at_me_only), priority=12, block=False)
 
 
+# 显式路由前缀：@bot 后先认指令词（顺带吃掉不带斜杠的指令别名，如「@bot d2武器 秋风」）
+_AT_PERK_PREFIX = re.compile(r"^(?:d2)?(?:perk查询|特性查询|perk|特性)[\s:：]+(.+?)\s*$", re.I)
+_AT_WEAPON_PREFIX = re.compile(r"^(?:武器查询|d2武器)[\s:：]+(.+?)\s*$")
+_AT_ARMOR_PREFIX = re.compile(r"^(?:护甲查询|d2护甲|护甲(?!套装))[\s:：]+(.+?)\s*$")
+
+
 @at_lookup.handle()
 async def _(event: MessageEvent):
     if not _allowed_group(event):
         return
-    q = event.get_message().extract_plain_text().strip()
-    if not q or q.startswith("/"):  # 空消息 / 带斜杠的交给命令响应器
+    # 剥 at 段与空白：开头的 @我 适配器预处理时已摘掉，这里兜底再清（含零宽空格）
+    q = event.get_message().extract_plain_text().strip().strip("\u200b").strip()
+    if not q:  # 纯 @ / 空文本：不响应
         return
-    res = d2.search_weapons_full(q, 12)
+    m = _AT_PERK_PREFIX.match(q)  # 显式 perk 前缀 → 强制走 perk 查询
+    if m:
+        name = m.group(1)
+        if name and not name.startswith("/"):
+            await _perk_reply(at_lookup, event, name)
+        return
+    m = _AT_WEAPON_PREFIX.match(q)  # 显式武器前缀 → 强制走武器查询
+    if m:
+        name, ver_num = _split_ver(m.group(1))
+        if name and not name.startswith("/"):
+            await _weapon_reply(at_lookup, event, name, ver_num)
+        return
+    m = _AT_ARMOR_PREFIX.match(q)  # 显式护甲前缀 → 强制走护甲查询（不吃「护甲套装 …」）
+    if m:
+        name = m.group(1)
+        if name and not name.startswith("/"):
+            await _armor_reply(at_lookup, event, name, source="护甲")
+        return
+    if q.startswith(("/", "／")) or re.match(r"(?i)^d2", q):
+        # 以 / 或 d2 开头 = 指令语义，交给 on_command（priority 8 命中即 block），不重复响应
+        return
+    # 自由文本：先武器匹配；武器无命中再查护甲；护甲也无命中才落 perk
+    name, ver_num = _split_ver(q)
+    res = d2.search_weapons_full(name, 12)
     if res:
-        top = res[0]
-        strong = (len(res) == 1 or top["name"].lower().startswith(q.lower())
-                  or top["name"].lower() == q.lower())
-        if strong:
-            others = [w["name"] for w in res[1:4]]
-            # 同名多版本：@ 直查也默认最新版本，卡片带版本列表
-            vers = d2.weapon_versions_by_name(top["name"])
-            ver_tags, ver_names = [], []
-            if len(vers) > 1:
-                top = dict(d2.weapon_detail(vers[-1]["hash"]), hash=vers[-1]["hash"])
-                ver_tags = [d2.season_tag(v["season"]) + ("·活动" if v["event"] else "") for v in vers]
-                ver_names = [d2.season_name(v["season"]) for v in vers]
-            await _send_card(at_lookup, event,
-                             bot_cards.weapon_card(top, others, ver_tags, len(ver_tags) or 0, ver_names),
-                             f"武器卡片 {top['name']}", f"武器：{top['name']}")
-        else:
-            await _send_card(at_lookup, event, bot_cards.weapons_list_card(res, q),
-                             f"武器候选列表 {q}", f"武器候选：{q}")
+        await _weapon_reply(at_lookup, event, name, ver_num, source="武器", res=res)
         return
-    perks = d2.search_perks(q, 3)
+    arm = _armor_data()
+    if arm is not None:
+        exact, fuzzy = _armor_match(arm, name)
+        if exact or fuzzy:
+            await _armor_reply(at_lookup, event, name, source="护甲")
+            return
+    perks = d2.search_perks(name, 3)
     if perks:
-        await _send_card(at_lookup, event, bot_cards.perk_card(perks, q),
-                         f"Perk 卡片 {q}", f"perk：{q}")
+        await _send_card(at_lookup, event, bot_cards.perk_card(perks, name),
+                         f"Perk 卡片 {name}", f"perk：{name}")
         return
     await _notice(at_lookup, event, "没找到",
-                  [f"没有匹配「{q}」的武器或 perk",
-                   "可以发 <code>/武器查询 名称</code> 或 <code>/perk查询 名称</code>"],
-                  kind="warn", fallback=f"没找到「{q}」的武器或 perk")
+                  [f"没有匹配「{name}」的武器、护甲或 perk",
+                   "可以发 <code>/武器查询 名称</code>、<code>/护甲查询 名称</code>"
+                   " 或 <code>/perk查询 名称</code>"],
+                  kind="warn", fallback=f"没找到「{name}」的武器或 perk")
 
 
 # ---------- 战绩类指令（对齐小日向：/raid、/地牢、/pvp、/pve、/智谋 …） ----------
@@ -1058,7 +1192,7 @@ async def _(event: Event, args: Message = CommandArg()):
 
 
 HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /称号 /锻造 "
-              "/生涯武器 /pve生涯武器 /宗师 /武器查询 /perk查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
+              "/生涯武器 /pve生涯武器 /宗师 /武器查询 /perk查询 /护甲查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
 
 
 @help_query.handle()

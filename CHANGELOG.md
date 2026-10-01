@@ -2,6 +2,81 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-01 武器卡 v2 改版 + 使用率管线 + @bot 直查扩容 + 异域护甲查询
+
+### 武器卡片 v2（照设计稿完全重排，bot_cards.weapon_card）
+
+- 全新 900px 深色版式：头部横幅（品质/伤害/弹药 meta + 赛季行 + screenshot 大图 + 赛季水印全幅低透明叠加）、
+  特长金名横条、版本胶囊（`#N 赛季文案`，当前绿描边+"当前"徽标）、左素体数值 + 右热门组合 2×4、
+  perk 分列（发射管蓝/弹匣琥珀/特性1绿/特性2紫/起源橙红，第一名列色高亮+百分比）、
+  大师杰作行、武器模组行、异域催化换肤、双栏页脚（雷尼克斯联合 · 武器图谱 / Bungie Manifest · light.gg 社区快照 · 非精确概率）。
+- 素体数值对齐游戏内面板：主栏全部条形（含变焦/弹药生成），分隔线后底栏右对齐数量组
+  （每分钟发射数/弹匣/充能时间/弹药容量等），**后坐方向=游戏内同款半圆仪表**
+  （SVG 实心扇形自右端按 v/100 逆时针填充，100=满半圆即完全竖直，缺口方向=水平漂移方向）。
+- 属性顺序修正为游戏内面板序（STAT_ORDER 重排：射速/充能在前→冲击/爆炸范围/弹头速度→射程/稳定/操控/填装/弹匣→辅助瞄准/变焦/后坐→空中效率/弹药生成→剑类）。
+- 赛季年份修正：S24-26=年7、S27 起年8（旧公式 (S-4)//4+2 算错，现按 d2ai d2-season-info 发布日期分界推算，SEASON_YEAR 表+未知赛季外推）。
+- **非锻造异域不显示使用率区**（热门组合面板整体隐藏、素体数值拉通全宽，靠 _wcat 品质 q==6 或 catalysts 判定）；
+  传奇无数据时显示"暂无社区使用率数据"占位、页脚自动切回 Starside/Clarity 署名。
+
+### light.gg 社区使用率管线（weapon_usage.py）
+
+- `await weapon_usage.get_usage(item_hash)`：提供者链 = 本地快照 `manifest_index/weapon_usage_snapshot.json` →
+  自定义端点（cwd `usage_config.json` 的 endpoint/proxy，或 `D2_USAGE_ENDPOINT`/`D2_USAGE_PROXY`，可指向自建 CF Worker）→
+  d2foundry → light.gg（仅配置 proxy 才尝试：httpx 走代理，失败再 Playwright 真 Edge+proxy；解析失败 HTML 落 `logs/usage_debug/`）。
+- 缓存 7 天 / 负缓存 24h / 同 hash 单飞 / 全局节流 10 次/分钟；combos=特性1×特性2 选取率乘积 top8（页脚注明非精确概率）。
+- `build_plug_meta.py` → `manifest_index/plug_meta.json`（2574 插件 hash→中文名/图标，供大师杰作/模组 join）；
+  `build_weapon_usage.py --proxy <代理> [--limit N]` 批量生成快照（节流 1.5s、断点续跑）。
+- **CDP 通道（已打通，主用）**：`start_edge_debug.bat` 一键把 Edge 以独立调试 profile + `--remote-debugging-port=9222`
+  重启（cookies 从默认配置复制，light.gg 验证直接复用；**新版 Edge 对默认配置目录会忽略调试端口，必须独立 user-data-dir**）。
+  提供者③零配置接入用户已验证浏览器：开 item 页取 HTML → 真实 DOM 解析（community-average 五列选取率 + trait-combos
+  真实组合百分比 + masterwork-stats）；标题仍挑战则轮询等放行，失败冷停 10 分钟防连击。
+- **批量快照**：`build_weapon_usage_fast.py`（页内 fetch 免渲染 + 6 页面错峰并发，实测 ~3 条/秒，11 分钟跑完；
+  导航模式另有 `build_weapon_usage.py --via cdp --workers`）产出 `manifest_index/weapon_usage_snapshot.json`
+  （断点续跑、每 25 条落盘）。**覆盖率 1591/2154（74%）**：失败 545 把全部复核为落日/冷门武器——
+  light.gg 对它们本就没有 community-average 区块（页面 200 正常、只是无数据），当代在用武器全覆盖。
+  大师杰作行按「大师杰作：」前缀与武器模组分拣（light.gg 的 MW Bonus 列表混着备用弹匣等模组），并剥掉重复前缀。
+- 校验与风控：`challenge-platform` 是 CF 注入在**正常页面**上的运行时脚本，不是挑战标志（只看开头 4KB 的
+  "Just a moment/请稍候/cf-chl-"）；6 页同时开种子页会触发挑战，**错峰 3 秒启动**即可。
+- 实测：42435996 完美逆行 端到端出数据（高爆弹药 28.9%、回转弹药 52.5%、组合「回转弹药+诱导推销」17.42%、大师杰作操控性 66.4%），
+  中文名运行时 join（weapons_full/plug_meta），source=cdp。新武器无 community-average 属正常无数据。
+- 备用通路照旧：快照 → 自定义端点（D2_USAGE_ENDPOINT） → d2foundry → 代理 light.gg（D2_USAGE_PROXY）。
+- 接线：`destiny2.py _weapon_reply` 出详情卡前 `get_usage(int(top["hash"]))`，异常兜底 None。
+
+### 触发方式扩容（destiny2.py）
+
+- `@bot 武器名` 等价 `/武器查询`：支持结尾版本序号（`@bot 完美逆行 2`）、无命中回候选列表；
+  旧 @bot 直查的缺陷（序号不拆、`d2武器` 前缀失效）已修。
+- `@bot perk xxx` 显式强制 perk 查询；`/护甲查询`（别名 d2护甲）新增；
+  @bot 自由文本判定顺序：武器 → 护甲 → perk；`/`、`d2` 开头不接（防双回复）。
+- 已知边界：NapCat 把 @机器人 解析成 qq=0（群名片形式）时适配器不置 to_me，直查不触发。
+
+### 异域护甲查询（/护甲查询 + @bot 护甲名）
+
+- 数据 `manifest_index/exotic_armor.json`（`build_exotic_armor.py` 生成）：141 件 = 348 个 Manifest hash 去重，
+  starside.work/exotic-armor（可达、无 CF、静态 HTML）提供特性详版文案/赛季/评测，本地 Manifest 提供 hash/图标/中文名并交叉校验。
+- 卡片 `bot_cards.armor_card`（a2-* 同风格）：**不显示六维**（用户要求），特性名+完整数值描述；
+  职业金（相对主义/唯我主义/坚忍克己）显示 perk_cols 两列 18+18 之灵全池（描述含 +18.2% 等数值），注明"共 324 种组合"；
+  永劫教派臂甲显示三学派文案。aliases 外号（腚眼甲/滑板鞋/职业金等 7 条）在 build 脚本顶部 ALIASES 扩充后重跑。
+
+### /轮换 新增「扭曲星球轮换」板块
+
+- `scrape_starside_rotation.py` 增加 `parse_distortion()`：解析 starside 轮换页的扭曲 7 列表 → `rotation_pairs.json`
+  新增 `distortion` 段（cycle[7] + slots[周几][小时] 共 168 时段 + 口径注释）。校验：周三 02:00=幽梦之城、
+  周六 15:00=王座世界、周二 23:59=涅索斯，与页面逐格一致；北京周三 01:00（周复位）恰为 7 整循环回到表头。
+- `destiny_data.distortion_now(dt=None)`：按本机时钟（UTC+8）算当前目的地/时段起止/下一个目的地与倒计时/今日剩余时段。
+- `bot_cards.rotation_card` 追加扭曲板块：当前时段横幅高亮（绿色）+ 下一个目的地（金色）与切换倒计时 + 今日剩余时段网格；
+  突袭/地牢板块原样。Bungie 接口失败但扭曲可用时仍出卡。
+
+### 踩坑
+
+- **spec 误收 58MB 缓存**：数据构建用了 `raw_items_en_lite.json`（英文名速查），D2Query.spec 的 `_MI_SKIP` 只排了
+  raw_items/raw_plugsets，会把它打进包——已加入 skip 名单。新增 manifest_index/*.json 时记得检查 skip 名单。
+- **starside 页脚混进末条描述**：页面最后的之灵/学派描述会吞进"更新 20xx/数据源：…/©/ICP备案"页脚文本，
+  build_exotic_armor.py 已加 `_strip_footer()` 按标记截断（职业金列Ⅱ末条与永劫第三学派共 6 处，复跑后清零）。
+- light.gg 数据源全线不可达的排查记录与解封路径见记忆/上文管线节。
+
+- 已重打包旁路部署 `dist_new\D2Query\`（exe+_internal+外置模块，不杀运行中的实例）。
+
 ## 2026-10-01 新增 /宗师 —— 宗师征服 + 宗师警戒战绩（对齐 nightfall.report）
 
 - **指令**：`/宗师`（别名 `宗师战绩` / `征服` / `gm战绩`），可带 `@某人` 和赛季参数（`s27` 等），

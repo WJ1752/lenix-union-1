@@ -30,7 +30,7 @@ if (Test-Path $dstInt) { Remove-Item $dstInt -Recurse -Force }
 Copy-Item (Join-Path $src "_internal") $dstInt -Recurse -Force
 
 # 3) sync external modules (these live outside the exe)
-$ext = @("bot_cards.py", "card_render.py", "weapon_filter.py", "nonebot_plugins\destiny2.py")
+$ext = @("bot_cards.py", "card_render.py", "weapon_filter.py", "weapon_usage.py", "nonebot_plugins\destiny2.py")
 foreach ($f in $ext) {
   $s = Join-Path $root $f
   $d = Join-Path $dst  $f
