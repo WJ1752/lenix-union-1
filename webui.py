@@ -3,8 +3,9 @@ import asyncio
 import json as _json
 import os
 import subprocess
+import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
@@ -213,7 +214,8 @@ async function refreshNap(){
     qr.innerHTML = ''; return;
   }
   if(s.isLogin || s.uin || s.qq){
-    box.innerHTML = `<span class="on">● NapCat 已登录</span>　QQ：${s.uin || s.qq}　${s.connected===false?'等待接入 Bot…':''}`;
+    box.innerHTML = `<span class="on">● NapCat 已登录</span>　QQ：${s.uin || s.qq}　${s.connected===false?'等待接入 Bot…':''}
+      <button onclick="resetNap()" style="margin-left:12px">退出并重置（需重新扫码）</button>`;
     qr.innerHTML = ''; return;
   }
   box.innerHTML = '<span class="off">● NapCat 运行中</span>　等待扫码登录…';
@@ -237,6 +239,11 @@ async function refreshQR(){
 async function startNap(){
   const j = await (await fetch('/api/napcat/start', {method:'POST'})).json();
   if(!j.started && j.error) alert(j.error);
+  refreshNap();
+}
+async function resetNap(){
+  if(!confirm('退出当前 QQ 登录并重置？之后需要重新扫码登录（短时间反复重登可能触发 QQ 风控）。')) return;
+  await fetch('/api/napcat/reset', {method:'POST'});
   refreshNap();
 }
 async function refresh(){
@@ -343,6 +350,9 @@ async function refreshBungie(){
     + 'border:1px solid #2c3a52;background:#0e1524;color:#e8eef7;font-size:12px">'
     + '<button onclick="bungieManual()">完成授权</button></div>'
     + '<div class="dim" id="bmsg" style="margin-top:6px"></div>'
+    + '<div class="dim" style="margin-top:4px;word-break:break-all">程序使用的回调地址：<code>'
+    + esc(s.redirect_uri || '') + '</code>（Bungie 应用里登记的 Redirect URL 必须与它完全一致，'
+    + '换 token 时会先试你粘的地址、再试这条）</div>'
     + '<div class="dim" style="margin-top:4px;word-break:break-all">授权页打不开就来这里：'
     + '<code>http://127.0.0.1:8900/bungie/authorize</code></div>';
 }
@@ -398,6 +408,12 @@ async def napcat_start():
     return napcat_runtime.start()
 
 
+@app.post("/api/napcat/reset")
+async def napcat_reset():
+    # 退出登录并重置：杀掉 NapCat/QQ，回到未启动态，需要重新扫码
+    return napcat_runtime.reset()
+
+
 @app.get("/api/napcat/qr")
 def napcat_qr():
     # 同步函数：qr_data_url 在码过期时会顺带续期（内部可能 sleep），不能阻塞事件循环
@@ -440,10 +456,21 @@ async def bot_logs_clear():
     return {"ok": True}
 
 
+_ob11_recheck_at = 0.0  # 上次"未连接时补发反向 WS 配置"的时间（限频，WebUI API 有频率限制）
+
+
 @app.get("/api/bot/status")
 async def bot_status():
+    global _ob11_recheck_at
     bots = bot_runtime.get_bots()
     if not bots:
+        # 已登录但协议端没接入：多半是 NapCat 登录时反向 WS 配置没生效
+        # （watcher 不在/下发失败）。面板轮询在这里低频补发，热更即生效。
+        st = napcat_runtime.status()
+        if st.get("isLogin") and time.time() - _ob11_recheck_at > 60:
+            _ob11_recheck_at = time.time()
+            await asyncio.get_event_loop().run_in_executor(
+                None, napcat_runtime.ensure_ob11_via_api)
         return {"connected": False}
     for bot in bots.values():
         try:
@@ -516,6 +543,7 @@ __NAV__
   <button data-m="dungeon">地牢</button>
   <button data-m="wpvp">PVP生涯武器</button>
   <button data-m="wpve">PVE生涯武器</button>
+  <button data-m="gm">宗师</button>
   <button data-m="heat">热力图</button>
   <button data-m="titles">称号</button>
   <button data-m="patterns">锻造</button>
@@ -549,14 +577,14 @@ function go(){
   document.getElementById('tabs').style.display='flex';
   open('all');
 }
-const JOB_TABS={wpvp:'/start_wpvp',wpve:'/start_wpve'};
+const JOB_TABS={wpvp:'/start_wpvp',wpve:'/start_wpve',gm:'/start_gm'};
 function scopeKey(m){
-  const s=document.getElementById(m==='wpve'?'scope_pve':'scope');
+  const s=document.getElementById(m==='wpvp'?'scope':'scope_pve');
   return s&&s.value?s.value:'all';
 }
 function syncScopeBar(m){
   document.getElementById('scopebar').style.display=JOB_TABS[m]?'flex':'none';
-  document.querySelectorAll('#scopebar select').forEach(s=>{s.style.display=(s.dataset.for===m)?'':'none';});
+  document.querySelectorAll('#scopebar select').forEach(s=>{s.style.display=(s.dataset.for===m||(m==='gm'&&s.dataset.for==='wpve'))?'':'none';});
 }
 function cacheSet(k,v){
   cache.set(k,v);
@@ -697,6 +725,20 @@ async def wpve_result(job: str):
     if j.get("status") != "done":
         return HTMLResponse("<h2 style='color:#eee;font-family:sans-serif'>任务不存在或未完成</h2>")
     return HTMLResponse(render_wpvp(j["result"]))
+
+
+@app.get("/start_gm")
+async def start_gm(name: str, scope: str = "current"):
+    jid = await d2.start_gm_report(name, scope, who="网页面板")
+    return {"job": jid}
+
+
+@app.get("/gm_result", response_class=HTMLResponse)
+async def gm_result(job: str):
+    j = d2.JOBS.get(job, {})
+    if j.get("status") != "done":
+        return HTMLResponse("<h2 style='color:#eee;font-family:sans-serif'>任务不存在或未完成</h2>")
+    return HTMLResponse(render_gm(j["result"]))
 
 
 @app.get("/start_heat")
@@ -908,7 +950,7 @@ async def bungie_manual(request: dict):
     if not code:
         return {"ok": False, "error": "没找到 code，请把浏览器地址栏里整条地址复制过来"}
     try:
-        await bungie_auth.exchange(code)
+        await bungie_auth.exchange(code, bungie_auth.redirect_from_text((request or {}).get("text", "")))
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"换取 token 失败：{exc}"}
     st = bungie_auth.status()
@@ -916,7 +958,7 @@ async def bungie_manual(request: dict):
 
 
 @app.get("/bungie/callback", response_class=HTMLResponse)
-async def bungie_callback(code: str = "", state: str = "", error: str = ""):
+async def bungie_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     # DIM 板块的授权回跳（state 固定为 dimauth- 前缀）：原样转交 DIM 的 authReturn 页，
     # 由 DIM 自己（构建时烘焙的 client_secret）完成 code 换 token，与面板授权互不干扰
     if state.startswith("dimauth-") and code and not error:
@@ -930,7 +972,10 @@ async def bungie_callback(code: str = "", state: str = "", error: str = ""):
     if not bungie_auth.check_state(state):
         return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>{back}")
     try:
-        await bungie_auth.exchange(code)
+        # 实际落地 URL 的 scheme://host:port/path 才是发 code 那次授权真正用的 redirect_uri，
+        # 拿它去换 token（换 token 的校验只认这个），配置值作为兜底重试
+        ru = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
+        await bungie_auth.exchange(code, ru)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}")
     return HTMLResponse("<h2 style='color:#7dff9c;font-family:sans-serif'>授权成功</h2>"
@@ -1096,18 +1141,32 @@ def render_history_card(rep: dict) -> str:
     rows = ""
     for m in rep["matches"][:80]:
         dur = f"{m['duration'] // 60}m{m['duration'] % 60:02d}s"
-        tag, _ = match_result(m)
+        tag, tcls = match_result(m)
         mtag = f"<span class='mtag'>{m['mode_name']}</span>" if m.get("mode_name") else ""
+        kda = f"{(m['kills'] + m['assists']) / max(1, m['deaths']):.1f}"
+        # 小日向式四列：标签在上、数值在下，等宽对齐
+        cols = "".join(
+            f"<div class='hcol{' hl' if i == 2 else ''}'><span>{lab}</span><b>{val}</b></div>"
+            for i, (lab, val) in enumerate(
+                [("击杀", m['kills']), ("死亡", m['deaths']),
+                 ("KD", f"{m['kd']:.1f}"), ("KDA", kda)]))
         rows += (
             f"<a class='mrow hist' href='/pgcr?i={m['instance']}'>"
             f"<img src='{m['pgcr']}'>"
-            f"<div class='mi'><b>{m['name']}</b>{tag}{mtag}"
-            f"<span class='dim'>{m['period']} · {dur}</span></div>"
-            f"<div class='ms'><span>击杀 <b>{m['kills']}</b></span><span>死亡 <b>{m['deaths']}</b></span>"
-            f"<span>KD <b>{m['kd']:.1f}</b></span><span>KDA <b>{(m['kills'] + m['assists']) / max(1, m['deaths']):.1f}</b></span></div></a>"
+            f"<div class='mi'><div class='hname'>{m['name']}{tag}{mtag}</div>"
+            f"<span class='dim'>{m['period'][5:16]} · 用时 {dur}</span></div>"
+            f"<div class='hcols'>{cols}</div></a>"
         )
     body = (f"<h1>{rep['display']}</h1>"
-            f"<div class='sub'>最近战绩 · 共 {len(rep['matches'])} 场 · 点击查看对局详情</div>{rows}")
+            f"<div class='sub'>最近战绩 · 共 {len(rep['matches'])} 场 · 点击查看对局详情</div>{rows}"
+            "<style>"
+            ".hname{font-size:14px;font-weight:600;margin-bottom:2px}"
+            ".hcols{display:grid;grid-template-columns:repeat(4,minmax(46px,auto));gap:0 13px;"
+            "text-align:right;flex-shrink:0}"
+            ".hcol span{display:block;color:#8fa3bd;font-size:11px;line-height:1.5}"
+            ".hcol b{font-size:14px;color:#e8eef7;line-height:1.4}"
+            ".hcol.hl b{color:#7dff9c}"
+            "</style>")
     return CARD_CSS.replace("__BODY__", body)
 
 
@@ -1327,6 +1386,76 @@ def render_wpvp(rep: dict) -> str:
             f".wstat.hs{{color:#ffd76e}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
+
+
+def _gm_mmss(sec: int) -> str:
+    if not sec:
+        return "—"
+    return f"{sec // 60}m {sec % 60:02d}s"
+
+
+def render_gm(rep: dict) -> str:
+    """/宗师：宗师征服 + 宗师警戒（日落）战绩，对齐 nightfall.report 的栏目"""
+    rec = rep.get("records") or {}
+
+    def chip(label: str, val: str, sub: str = "", cls: str = "") -> str:
+        sub_html = f"<span class='csub'>{sub}</span>" if sub else ""
+        return (f"<div class='chip {cls}'><span class='clab'>{label}</span>"
+                f"<b>{val}</b>{sub_html}</div>")
+
+    cq, ul = rec.get("conquest") or (0, 0), rec.get("ultimate") or (0, 0)
+    chips = (chip("宗师征服进度", f"{cq[0]}/{cq[1]}")
+             + chip("终极征服进度", f"{ul[0]}/{ul[1]}")
+             + chip("历史镀金次数", str(rec.get("gilds", 0)), "伟大征服者")
+             + chip("宗师对局", f"{rep.get('matches', 0):,}", f"扫描 {rep.get('scanned', 0):,} 场"))
+
+    def rows(items: list[dict]) -> str:
+        out = ""
+        for g in items:
+            tier_cls = {"终极": "ut", "宗师": "gm", "大师": "ms", "专家": "ex"}.get(g["tier"], "")
+            out += (f"<div class='grow'>"
+                    f"<span class='tier {tier_cls}'>{esc(g['tier'])}</span>"
+                    f"<div class='gn'><b>{esc(g['strike'])}</b>"
+                    f"<span class='dim'>最后 {esc(g['last'][:10] or '—')}</span></div>"
+                    f"<div class='gs'>{g['clears']} 通关 / {g['attempts']} 次"
+                    f"<span class='dim'> 通关率 {g['rate']:.1f}%</span></div>"
+                    f"<div class='gt'>最快 {_gm_mmss(g['fastest'])}"
+                    f"<span class='dim'> 平均 {_gm_mmss(g.get('avg', 0))}</span></div>"
+                    f"</div>")
+        return out or "<p class='empty'>这个范围里没有宗师对局</p>"
+
+    rng = rep.get("range") or ("", "")
+    span = f" · {rng[0]} ~ {rng[1]}" if rng and rng[0] else ""
+    body = (f"<h1>{rep['display']}</h1>"
+            f"<div class='sub'>宗师战绩 · <b class='sl'>{esc(rep.get('scope_label') or '当前赛季')}</b>"
+            f"{span}</div>"
+            f"<div class='chips'>{chips}</div>"
+            f"<h2>征服（赛季中心，每赛季一轮）</h2>{rows(rep.get('conquests') or [])}"
+            f"<h2>宗师警戒（日落轮换）</h2>{rows(rep.get('nightfalls') or [])}"
+            f"<div class='dim' style='margin-top:10px'>通关率 = 通关 / 参战次数（含失败）；"
+            f"最快 / 平均只统计通关场次；进度与镀金次数来自游戏内成就记录。</div>")
+    style = (f"<style>"
+             f".chips{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}}"
+             f".chip{{display:flex;align-items:center;gap:6px;background:#141c2e;"
+             f"border:1px solid #22304a;border-radius:8px;padding:7px 10px;font-size:13px}}"
+             f".chip .clab{{color:#8fa3bd;font-size:11px}}"
+             f".chip .csub{{color:#8fa3bd;font-size:11px}}"
+             f".chip b{{color:#ffd76e}}"
+             f".grow{{display:flex;align-items:center;gap:12px;background:#141c2e;"
+             f"border:1px solid #22304a;border-radius:8px;padding:8px 12px;margin:6px 0}}"
+             f".grow:hover{{border-color:#2f6edb}}"
+             f".tier{{flex:0 0 44px;text-align:center;font-size:12px;border-radius:6px;"
+             f"padding:3px 0;border:1px solid #2c3a52;color:#8fa3bd}}"
+             f".tier.ut{{color:#ff9de2;border-color:#ff9de2}}"
+             f".tier.gm{{color:#ffd76e;border-color:#ffd76e}}"
+             f".tier.ms{{color:#b18cff;border-color:#b18cff}}"
+             f".tier.ex{{color:#5ea8ff;border-color:#5ea8ff}}"
+             f".gn{{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.5}}"
+             f".gs{{flex:0 0 200px;font-size:13px}}"
+             f".gt{{flex:0 0 200px;font-size:13px;text-align:right;white-space:nowrap}}"
+             f".gt .dim{{margin-left:6px}}"
+             f"</style>")
+    return CARD_CSS.replace("__BODY__", body + style)
 
 
 def render_heat(rep: dict) -> str:

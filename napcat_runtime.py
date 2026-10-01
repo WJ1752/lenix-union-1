@@ -70,8 +70,63 @@ def is_running() -> bool:
     return _proc is not None and _proc.poll() is None
 
 
+def _tree_kill(pid: int) -> bool:
+    """taskkill 连子进程一起杀：NapCatWinBootMain 拉起的 QQ.exe 是它的子进程，
+    只 kill 主进程会留下僵尸 QQ 继续占着 WebUI 端口"""
+    try:
+        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kill_webui_holder() -> bool:
+    """杀掉占着 WebUI 端口(6099)的残留 QQ/NapCat 进程（上一轮崩溃/退出没带走的）。
+    只认 QQ.exe / NapCatWinBootMain.exe，不会误伤用户自己的其他程序"""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[3] == "LISTENING" and parts[1].endswith(f":{WEBUI_PORT}"):
+            pids.add(parts[4])
+    killed = False
+    for pid in pids:
+        try:
+            q = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                               capture_output=True, text=True, timeout=15).stdout
+        except Exception:  # noqa: BLE001
+            continue
+        name = q.split(",")[0].strip('"').strip() if q else ""
+        if name.lower() in ("qq.exe", "napcatwinbootmain.exe"):
+            killed = _tree_kill(int(pid)) or killed
+    return killed
+
+
 def webui_url() -> str:
     return f"http://127.0.0.1:{WEBUI_PORT}/webui"
+
+
+def _missing_napcat_files() -> list[str]:
+    """napcat.mjs 是打包产物，会 import 同目录的分包文件（conout-*.js）。
+    缺一个就会在 loader 里静默 import 失败——QQ 照常启动但 NapCat 永远不初始化，
+    面板二维码永远"加载中"。启动前把引用的相对文件全部查一遍，缺了直接报出来。"""
+    mjs = os.path.join(NAPCAT_DIR, "napcat.mjs")
+    if not os.path.exists(mjs):
+        return ["napcat.mjs"]
+    missing = []
+    try:
+        body = open(mjs, "rb").read().decode("utf-8", "ignore")
+    except OSError:
+        return ["napcat.mjs(不可读)"]
+    for ref in sorted(set(re.findall(r'(?:from\s*"\./|import\s*\("\./)([^"\')]+?\.js)', body))):
+        if not os.path.exists(os.path.join(NAPCAT_DIR, ref)):
+            missing.append(ref)
+    return missing
 
 
 def start(qq_path: str = "") -> dict:
@@ -80,15 +135,27 @@ def start(qq_path: str = "") -> dict:
     with _lock:
         if is_running():
             return {"started": True, "log": LOG_FILE, "webui": webui_url()}
-        if login_qr_ready():  # NapCat 已在跑（如面板服务重启后）：直接认领，不重复拉起
-            threading.Thread(target=_watch_login, daemon=True).start()
-            return {"started": True, "log": LOG_FILE, "webui": webui_url()}
+        if login_qr_ready():  # NapCat 已在跑（如面板服务重启后）
+            try:
+                healthy = bool(login_status().get("webui"))
+            except Exception:  # noqa: BLE001
+                healthy = False
+            if healthy:  # WebUI 有响应：认领，不重复拉起
+                threading.Thread(target=_watch_login, daemon=True).start()
+                return {"started": True, "log": LOG_FILE, "webui": webui_url()}
+            # WebUI 没响应＝残留僵尸 QQ 占着端口：清掉后走全新启动
+            _kill_webui_holder()
+            time.sleep(2)
         wait = START_COOLDOWN - (time.time() - _last_start)
         if wait > 0:  # 冷却：频繁登录会被 QQ 判定为异常登录
             return {"started": False,
                     "error": f"请稍候 {int(wait)} 秒再启动（短时间内反复登录会触发 QQ 风控）"}
         if not os.path.exists(os.path.join(NAPCAT_DIR, "NapCatWinBootMain.exe")):
             return {"started": False, "error": "napcat_shell 目录不存在（先运行 setup_napcat.py）"}
+        miss = _missing_napcat_files()
+        if miss:
+            return {"started": False,
+                    "error": f"NapCat 文件不完整，缺少 {', '.join(miss)}（从仓库 napcat_shell 同步后重试）"}
         qq = qq_path or _find_qq()
         if not qq or not os.path.exists(qq):
             return {"started": False, "error": "找不到本机 QQ.exe，请安装 QQ NT 版后重试"}
@@ -128,8 +195,17 @@ def stop():
     global _proc
     with _lock:
         if _proc and _proc.poll() is None:
-            _proc.kill()
+            _tree_kill(_proc.pid)
         _proc = None
+        _kill_webui_holder()  # 残留的 QQ.exe 不清掉，下次启动会误认领僵尸进程
+
+
+def reset() -> dict:
+    """手动退出登录并重置：杀掉 NapCat/QQ 进程树，回到未启动态（面板可重新扫码）。
+    注意：重置后再扫码＝一次重新登录，短时间反复操作可能触发 QQ 风控"""
+    stop()
+    _cred_cache["v"] = ""
+    return {"reset": True, "webui": webui_url()}
 
 
 def login_qr_ready() -> bool:
@@ -175,11 +251,21 @@ def _api_post(path: str, payload=None):
             r = httpx.post(f"http://127.0.0.1:{WEBUI_PORT}/api{path}",
                            headers={"Authorization": f"Bearer {cred}"},
                            json=payload, timeout=5)
-            if r.status_code == 401:  # 凭证失效，换新重试一次
-                _cred_cache["v"] = ""
-                continue
-            r.raise_for_status()
-            return r.json().get("data") or {}
+            body = {}
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                pass
+            # NapCat 凭证失效时返回 HTTP 200 + {"code":-1}，不是 401：
+            # 必须按业务码判定，否则坏凭证会被永久缓存，面板永远显示"等待扫码登录"
+            if body.get("code") not in (None, 0):
+                if attempt == 0:  # 换新凭证重试一次
+                    _cred_cache["v"] = ""
+                    continue
+                raise RuntimeError(f"WebUI {path} 返回错误: {body.get('message')}")
+            return body.get("data") or {}
+        except RuntimeError:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
     raise last_exc or RuntimeError(f"WebUI {path} 调用失败")
@@ -196,6 +282,12 @@ def login_status() -> dict:
                "isLogin": bool(d.get("isLogin")),
                "isOffline": bool(d.get("isOffline")),
                "uin": str(d.get("uin") or d.get("Uin") or "")})
+    if st["isLogin"] and not st["uin"]:  # CheckLoginStatus 不带 uin，另查一次
+        try:
+            info = _api_post("/QQLogin/GetQQLoginInfo")
+            st["uin"] = str(info.get("uin") or "")
+        except Exception:  # noqa: BLE001
+            pass
     return st
 
 
@@ -307,9 +399,10 @@ def _restart_login_for_qr():
     try:
         with _lock:
             if _proc and _proc.poll() is None:
-                _proc.kill()
+                _tree_kill(_proc.pid)
             _proc = None
             _last_start = 0.0  # 卡死重启不受 5 分钟冷却限制（这不是用户反复登录）
+            _kill_webui_holder()  # 僵尸 QQ 不清掉，start() 会把它当"已在跑"认领回去
         start()
         return True
     except Exception:  # noqa: BLE001
@@ -343,10 +436,11 @@ def qr_data_url() -> str:
                     return _render_qr(raw)
             _qr_seen.update(url=_qr_seen["url"], since=now)
         return _render_qr(raw)
-    # 兜底：旧版 NapCat 落盘的图片
+    # 兜底：旧版 NapCat 落盘的图片。只认 2 分钟内的，旧码扫了必报"二维码超时"，
+    # 显示过期码反而误导用户
     p = os.path.join(NAPCAT_DIR, "cache", "qrcode.png")
     try:
-        if os.path.exists(p):
+        if os.path.exists(p) and time.time() - os.path.getmtime(p) < 120:
             import base64
             b = open(p, "rb").read()
             if b:
