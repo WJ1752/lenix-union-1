@@ -92,12 +92,17 @@ def _wait_bindable(port: int, timeout: float = BIND_WAIT_SEC) -> bool:
         time.sleep(2)
 
 
-def _serve(state: dict):
+def _serve(state: dict) -> None:
     import nonebot
     from nonebot.adapters.onebot.v11 import Adapter
 
-    if not _wait_bindable(BOT_PORT):
-        print(f"[bot] 等 {BOT_PORT} 可用已超 {BIND_WAIT_SEC}s，仍先尝试启动一次")
+    if not _wait_bindable(BOT_PORT, BIND_WAIT_SEC):
+        # 等够了还绑不上，说明已经有实例在 8901 上听着（不是 TIME_WAIT 残留）。
+        # 这时绝不能硬起：uvicorn 也带 SO_REUSEADDR，硬绑会变成两个监听者抢连接，
+        # 协议端会被抢到另一个实例上，正主反而"未连接"。
+        print(f"[bot] {BOT_PORT} 已超 {BIND_WAIT_SEC}s 仍被占用：多半已有一个实例在跑，"
+              "本实例不启动 QQ bot（网页查询不受影响）")
+        return
     nonebot.init(driver="~fastapi", host="127.0.0.1", port=BOT_PORT,
                  log_level="WARNING", command_start={"/"})
     state["inited"] = True          # 到这里之后再失败就不能重来了，见 _run
@@ -121,6 +126,7 @@ def _run():
 
     nonebot.init 之前失败（端口迟迟不可用、驱动起不来）可以整段重来一次；
     init 之后失败（uvicorn 最终没绑上等）不能再 init 一遍，只记日志、等下回开程序。
+    端口被别人占着时 _serve 直接返回，不重试——那是"已经有实例在跑"，不是故障。
     """
     state: dict = {}
     for attempt in (1, 2):
