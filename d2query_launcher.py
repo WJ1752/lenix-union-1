@@ -3,8 +3,20 @@
 - QQ bot 后台线程随程序启动，NapCat 反向WS接入后在"Bot面板"里管理群聊
 """
 import socket
+import sys
 import threading
 import time
+
+# windowed exe（console=False）没有控制台，stdout/stderr 是 None，
+# loguru/uvicorn 往 None 写日志会直接崩——重定向到 exe 同目录的日志文件
+if sys.stdout is None or sys.stderr is None:
+    try:
+        import os
+        _log = open(os.path.join(os.path.dirname(sys.executable), "exe_stdout.log"),
+                    "a", buffering=1, encoding="utf-8", errors="replace")
+        sys.stdout = sys.stderr = _log
+    except Exception:  # noqa: BLE001  连日志都开不了就静默跑
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 import uvicorn
 import webview

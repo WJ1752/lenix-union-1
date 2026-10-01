@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -174,6 +175,23 @@ def parse_code(text: str) -> tuple[str, str]:
     return s, ""
 
 
+def redirect_from_text(text: str) -> str:
+    """从粘贴的回调地址里取 redirect_uri（scheme://host[:port]/path）。
+
+    Bungie 对 redirect_uri 的校验只发生在换 token 这一步，且必须与**发 code 那次
+    授权**实际用的地址完全一致——地址栏里那条回调地址的 origin+path 就是它
+    （可能是旧会话/旧配置留下的，与当前 BUNGIE_REDIRECT_URI 不同）。取不到返回空串，
+    exchange 会退回配置值。
+    """
+    import re
+    from urllib.parse import urlparse
+    m = re.search(r"https?://[^\s?'&<>]+", (text or ""))
+    if not m:
+        return ""
+    u = urlparse(m.group(0))
+    return f"{u.scheme}://{u.netloc}{u.path}"
+
+
 async def _token_call(data: dict) -> dict:
     """换/续 token。有 secret 走 Basic 认证；没有则把 client_id（和 PKCE verifier）放 body。"""
     d = dict(data)
@@ -198,10 +216,31 @@ async def _token_call(data: dict) -> dict:
     return r.json()
 
 
-async def exchange(code: str) -> dict:
-    """用授权码换 token 并落盘（redirect_uri 必须与授权时一致，故一并带上）"""
-    d = await _token_call({"grant_type": "authorization_code", "code": code,
-                           "redirect_uri": REDIRECT_URI()})
+async def exchange(code: str, redirect_uri: str = "") -> dict:
+    """用授权码换 token 并落盘（redirect_uri 必须与授权时一致，故一并带上）。
+
+    redirect_uri 校验只发生在 token 这一步（authorize 那步不拦），所以「浏览器
+    拿到 code、换 token 却报 mismatch」= 发 code 的授权页用的地址与当前配置不同
+    （典型：旧会话/旧配置留下的授权页，Bungie 应用里登记的还是旧地址）。
+    传入 redirect_uri（从粘贴的回调地址或实际落地 URL 里取）后先试它，不行再退
+    回当前配置值，两边各试一次，哪个匹配用哪个。
+    """
+    candidates = []
+    for ru in (redirect_uri, REDIRECT_URI()):
+        if ru and ru not in candidates:
+            candidates.append(ru)
+    last_err: Exception | None = None
+    for ru in candidates:
+        try:
+            d = await _token_call({"grant_type": "authorization_code", "code": code,
+                                   "redirect_uri": ru})
+            break
+        except RuntimeError as exc:
+            last_err = exc
+            if "does not match" not in str(exc):
+                raise
+    else:
+        raise last_err or RuntimeError("Bungie 换 token 失败：所有 redirect_uri 都被拒绝")
     tok = {"access_token": d.get("access_token", ""),
            "refresh_token": d.get("refresh_token", ""),
            "expires_at": time.time() + int(d.get("expires_in", 3600)) - 60,
@@ -216,8 +255,23 @@ async def exchange(code: str) -> dict:
     return tok
 
 
+_refresh_lock: dict = {"lock": None}
+
+
+def _lock():
+    import asyncio
+    if _refresh_lock["lock"] is None:
+        _refresh_lock["lock"] = asyncio.Lock()
+    return _refresh_lock["lock"]
+
+
 async def access_token() -> str:
-    """取一个有效的 access token（过期就地刷新）；未授权返回空串"""
+    """取一个有效的 access token（过期就地刷新）；未授权返回空串。
+
+    刷新失败不再吞掉：Bungie 的 refresh_token 是一次性的，且偶发返回非 JSON 的
+    错误页，此前吞掉会让上层误报「未授权」；这里抛出真实原因，并把失败时正在
+    并发刷新的多个请求用锁串起来，避免互相把对方的 refresh_token 作废。
+    """
     t = _load()
     if not t:
         return ""
@@ -225,11 +279,20 @@ async def access_token() -> str:
         return t["access_token"]
     if not t.get("refresh_token"):
         return t.get("access_token", "")
-    try:
-        d = await _token_call({"grant_type": "refresh_token",
-                               "refresh_token": t["refresh_token"]})
-    except Exception:  # noqa: BLE001
-        return ""
+    async with _lock():
+        t = _load()          # 锁内重读：别的请求可能刚刷新完
+        if t.get("access_token") and time.time() < t.get("expires_at", 0):
+            return t["access_token"]
+        try:
+            d = await _token_call({"grant_type": "refresh_token",
+                                   "refresh_token": t["refresh_token"]})
+        except Exception as exc:  # noqa: BLE001
+            await asyncio.sleep(2)   # Bungie 偶发抖动：隔 2 秒重试一次再放弃
+            try:
+                d = await _token_call({"grant_type": "refresh_token",
+                                       "refresh_token": t["refresh_token"]})
+            except Exception as exc2:  # noqa: BLE001
+                raise RuntimeError(f"Bungie token 刷新失败：{exc2}") from exc2
     t.update(access_token=d.get("access_token", t.get("access_token", "")),
              refresh_token=d.get("refresh_token", t.get("refresh_token", "")),
              expires_at=time.time() + int(d.get("expires_in", 3600)) - 60)
@@ -245,7 +308,12 @@ async def authorized_get(path: str, params: dict | None = None) -> dict:
     headers = {"X-API-Key": _env("BUNGIE_API_KEY"), "Authorization": f"Bearer {tok}"}
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
         r = await c.get(BASE + path, params=params or {}, headers=headers)
-    d = r.json()
+    try:
+        d = r.json()
+    except ValueError:
+        # Bungie 偶发返回 HTML 错误页（维护/风控/5xx），此前这里抛 JSONDecodeError
+        raise RuntimeError(
+            f"Bungie 返回了非 JSON 响应（HTTP {r.status_code}），多为官方临时故障，稍后再试")
     if d.get("ErrorCode") != 1:
         raise RuntimeError(f"Bungie: {d.get('ErrorStatus')} {d.get('Message')}")
     return d.get("Response") or {}

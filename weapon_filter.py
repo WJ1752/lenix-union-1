@@ -12,6 +12,23 @@ import re
 import sys
 
 _IDX: dict | None = None
+_VER: dict = {}  # hash → {season, event}（weapon_versions.json，缺省为空=全部按首发）
+
+
+def _versions() -> dict:
+    global _VER
+    if not _VER:
+        base = os.path.dirname(_index_path())
+        try:
+            _VER = json.load(open(os.path.join(base, "weapon_versions.json"),
+                                  encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _VER = {}
+    return _VER
+
+
+def _season_of(w: dict) -> int:
+    return int(_versions().get(str(w.get("h", "")), {}).get("season") or 0)
 
 
 def _index_path() -> str:
@@ -131,7 +148,7 @@ def filter_weapons(query: str, limit: int = 120) -> dict:
                 "unknown": words, "dropped": [], "labels": [],
                 "relaxed": False, "empty": True}
 
-    items = list(index().values())
+    items = [dict(w, h=h) for h, w in index().items()]
 
     def run(sub):
         return [w for w in items if all(fn(w) for _, (_, fn) in sub)]
@@ -156,16 +173,16 @@ def filter_weapons(query: str, limit: int = 120) -> dict:
             relaxed = True
             hits = [w for w in items if any(fn(w) for _, (_, fn) in preds)]
 
-    hits.sort(key=lambda w: (not w["x"], w["a"], w["t"], w["n"]))
-
-    # 同一把武器在 Manifest 里按 perk 池分多个 hash（普通/专家/不同赛季版本），
-    # 筛选结果里逐条列出会刷屏，按名字合并
+    # 同名武器在 Manifest 里按 perk 池/赛季分多个 hash：全部列出（同参考图那样逐版本展示），
+    # 只有名字+赛季+水印都相同的才算同一把的重复条目
+    hits.sort(key=lambda w: (not w["x"], w["a"], w["t"], w["n"], _season_of(w)))
     seen, uniq = set(), []
     for w in hits:
-        if w["n"] in seen:
+        key = (w["n"], _season_of(w), w.get("w") or "")
+        if key in seen:
             continue
-        seen.add(w["n"])
-        uniq.append(w)
+        seen.add(key)
+        uniq.append(dict(w, s=_season_of(w)))
 
     return {
         "items": uniq[:limit],

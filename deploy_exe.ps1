@@ -46,4 +46,16 @@ if (Test-Path (Join-Path $dimSrc "index.html")) {
   Write-Output "sync dim_app"
 }
 
+# 3.6) sync NapCat runtime files into dist's napcat_shell (that dir is created once by
+# setup_napcat.py and never rebuilt - if napcat.mjs gets updated there without its
+# rollup chunk (conout-*.js), the loader fails silently and the QR never appears)
+$napSrc = Join-Path $root "napcat_shell"
+$napDst = Join-Path $dst "napcat_shell"
+if (Test-Path (Join-Path $napSrc "napcat.mjs")) {
+  foreach ($f in @("napcat.mjs") + (Get-ChildItem $napSrc -Filter "conout-*.js" -Name)) {
+    Copy-Item (Join-Path $napSrc $f) (Join-Path $napDst $f) -Force
+    Write-Output "sync napcat_shell/$f"
+  }
+}
+
 Write-Output "deployed. launch: $dst\D2Query.exe (cwd must be $dst)"

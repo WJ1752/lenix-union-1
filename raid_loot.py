@@ -26,7 +26,7 @@ CHARTS: dict[str, tuple[str, list[str], str]] = {
     "kings_fall": ("国王的陨落", ["kf", "王陨", "国王"],
                    "https://www.bilibili.com/read/cv18338130"),
     "vog": ("玻璃穹顶(VOG)", ["vog", "玻璃", "琉璃宝库"],
-            "https://www.bilibili.com/read/cv11398914"),
+            "Sayalarry 图 V1.0（2023.12.26 修订版，群文件收录）"),
     "vesper": ("晚星之主", ["vh", "晚星"],
                "Sayalarry 图 S25 V1.0（群文件收录）"),
     "vow": ("门徒誓约", ["vow", "门徒"], "Sayalarry 图 V2.0（群文件收录）"),

@@ -8,8 +8,10 @@ NapCat / LLOneBot 等协议端（负责 QQ 扫码登录）以反向 WS 接入：
 """
 import json
 import os
+import socket
 import sys
 import threading
+import time
 
 CONFIG_FILE = "bot_config.json"
 BOT_PORT = 8901
@@ -50,6 +52,17 @@ def _run():
         import nonebot
         from nonebot.adapters.onebot.v11 import Adapter
 
+        # 上个实例被杀后 8901 的已建立连接会进 TIME_WAIT（最长约 4 分钟），
+        # 期间绑定会 10048 → nonebot 直接退出 → 协议端永远"未连接"。
+        # 等端口真正能绑再启动（ NapCat 反向 WS 每 5 秒重连，等得起）。
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            with socket.socket() as probe:
+                try:
+                    probe.bind(("127.0.0.1", BOT_PORT))
+                    break
+                except OSError:
+                    time.sleep(2)
         nonebot.init(driver="~fastapi", host="127.0.0.1", port=BOT_PORT,
                      log_level="WARNING", command_start={"/"})
         driver = nonebot.get_driver()
