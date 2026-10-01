@@ -73,3 +73,8 @@ dim_app/
 _*.png
 ss_test.html
 raid_images/
+build_log*.txt
+build_tmp/
+dist_new/
+dist_build/
+build/
