@@ -40,6 +40,7 @@
 """
 import asyncio
 import base64
+import html as _html
 import json
 import re
 import time
@@ -47,8 +48,9 @@ import time
 from nonebot import on_command, on_message, on_type
 from nonebot.adapters import Event
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
-from nonebot.exception import FinishedException, IgnoredException
-from nonebot.message import event_preprocessor
+from nonebot.exception import FinishedException, IgnoredException, SkippedException
+from nonebot.internal.matcher import Matcher
+from nonebot.message import event_preprocessor, run_postprocessor
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
@@ -216,6 +218,27 @@ async def _notice(matcher, event: Event, title: str, lines: list[str],
                      title, fallback or f"{title}\n" + "\n".join(lines))
 
 
+def _exc_msg(exc: Exception) -> str:
+    # 超时类异常（httpx.ReadTimeout 等）的 str() 是空串，只拼 exc 会显示成
+    # 「接口暂时不可用：」，带上类型名才能看出是超时
+    return f"{type(exc).__name__}: {exc}".strip()
+
+
+@run_postprocessor
+async def _unhandled_error(matcher: Matcher, event: Event, exception: Exception):
+    """处理器里没接住的异常（如 Bungie 返回非 JSON 时的 JSONDecodeError）不该静默——
+    此前 /raid 在网络抖动时就是「收了指令毫无回复」，用户以为机器人挂了"""
+    if isinstance(exception, (FinishedException, SkippedException, IgnoredException)):
+        return
+    try:
+        await _notice(matcher, event, "查询失败",
+                      [f"指令处理出错：{type(exception).__name__}",
+                       "多为 Bungie 接口或网络抖动，稍后重发一次即可"],
+                      kind="err", fallback=f"查询失败：{type(exception).__name__}，稍后重试")
+    except Exception:  # noqa: BLE001  兜底里再出错就只留日志
+        _log_out(event, f"[兜底失败] {type(exception).__name__}: {exception}")
+
+
 # ---------- 账号绑定（小日向式快捷指令：绑定后玩家查询可省去名字） ----------
 BIND_HINT = ("还没有绑定账号", ["先发 <code>/绑定 玩家名#1234</code>，之后 <code>/生涯</code>、"
                               "<code>/玩家</code> 就不用再带名字了"])
@@ -261,9 +284,12 @@ def _at_target(args: Message | None, event: Event) -> str:
 async def _resolve_name(matcher, event: Event, raw: str,
                         args: Message | None = None) -> str | None:
     """玩家查询取名字：带参数用参数，否则用参数里 @ 的那个人（得有绑定），
-    再否则用发起人自己的绑定，都没有则提示绑定并结束"""
+    再否则用发起人自己的绑定，都没有则提示绑定并结束。
+    参数不带 #编号 时走模糊搜索：唯一命中直接查，重名列出候选让用户补编号"""
     q = (raw or "").strip()
     if q:
+        if "#" not in q:
+            return await _fuzzy_player(matcher, event, q)
         return q
     qq = _at_target(args, event)
     if qq:
@@ -286,6 +312,36 @@ async def _resolve_name(matcher, event: Event, raw: str,
 
 async def _player_arg(matcher, event: Event, args: Message) -> str | None:
     return await _resolve_name(matcher, event, args.extract_plain_text(), args)
+
+
+async def _fuzzy_player(matcher, event: Event, q: str) -> str | None:
+    """不带 #编号 的名字：Bungie 模糊搜索，唯一命中直接出，重名让用户补编号"""
+    try:
+        cands = await d2.search_players_fuzzy(q)
+    except Exception:  # noqa: BLE001  搜索挂了就走原来的精确解析，让它报该报的错
+        return q
+    uniq = {}
+    for p in cands:
+        uniq[(p.get("bungieGlobalDisplayName"),
+              p.get("bungieGlobalDisplayNameCode"))] = p
+    if not uniq:
+        await _notice(matcher, event, "没找到这个玩家",
+                      [f"本地名单里没有「{q}」开头的玩家。",
+                       "Bungie 已关闭不带编号的模糊搜索，如果 TA 没和本群的人打过对局，"
+                       "就查不到——请发完整 <code>名字#编号</code>（游戏内个人资料页可以看到）"],
+                      kind="warn", fallback=f"没找到玩家 {q}，请带 #编号")
+        return None
+    if len(uniq) == 1:
+        (name, code), = uniq
+        return f"{name}#{code}"
+    top = list(uniq)[:12]
+    rows = "".join(f"<code>{_html.escape(n)}#{c}</code>　" for n, c in top)
+    lines = [f"找到 <b>{len(uniq)}</b> 个同名玩家，发指令时带上 <code>#编号</code>：",
+             rows]
+    await _notice(matcher, event, "有重名玩家", lines,
+                  kind="warn", fallback=f"有 {len(uniq)} 个同名玩家，请带上 #编号："
+                  + "、".join(f"{n}#{c}" for n, c in top))
+    return None
 
 
 # 生涯武器的统计范围写在参数末尾：s27 / 赛季27 / 全生涯（不写＝全生涯）
@@ -569,8 +625,8 @@ async def _(event: Event):
                       kind="warn", fallback="光尘商店需要先在 Bot 面板授权 Bungie 账号")
     except Exception as exc:  # noqa: BLE001
         await _notice(dust_query, event, "光尘商店获取失败",
-                      [f"Bungie 接口暂时不可用：{exc}"],
-                      kind="err", fallback=f"光尘商店获取失败：{exc}")
+                      [f"Bungie 接口暂时不可用：{_exc_msg(exc)}"],
+                      kind="err", fallback=f"光尘商店获取失败：{_exc_msg(exc)}")
     await _send_card(dust_query, event, bot_cards.eververse_card(store),
                      "光尘商店", "光尘商店数据获取失败")
 
@@ -583,8 +639,8 @@ async def _(event: Event):
         rot = await d2.rotation_week()
     except Exception as exc:  # noqa: BLE001
         await _notice(rot_query, event, "本周轮换获取失败",
-                      [f"Bungie 里程碑接口暂时不可用：{exc}"],
-                      kind="err", fallback=f"本周轮换获取失败：{exc}")
+                      [f"Bungie 里程碑接口暂时不可用：{_exc_msg(exc)}"],
+                      kind="err", fallback=f"本周轮换获取失败：{_exc_msg(exc)}")
     await _send_card(rot_query, event, bot_cards.rotation_card(rot),
                      "本周轮换", "本周轮换数据获取失败")
 
@@ -731,6 +787,8 @@ wpvp_query = on_command("常用武器", aliases={"武器统计", "mvp", "d2武�
 # PVE 场次远多于 PVP，所以默认只统计当前赛季（写 全生涯 才跑全量）
 wpve_query = on_command("pve生涯武器", aliases={"pve武器", "pve常用武器"},
                         priority=8, block=True, force_whitespace=True)
+gm_query = on_command("宗师", aliases={"宗师战绩", "征服", "gm战绩"}, priority=8, block=True,
+                      force_whitespace=True)
 help_query = on_command("帮助", aliases={"help", "菜单", "指令"}, priority=6, block=True,
                         force_whitespace=True)
 
@@ -978,40 +1036,34 @@ async def _(event: Event, args: Message = CommandArg()):
                      f"PVE武器使用 {name}")
 
 
-HELP_LINES = [
-    "<b>玩家</b>：<code>/玩家</code> <code>/生涯</code> <code>/raid</code> <code>/地牢</code> "
-    "<code>/pvp</code> <code>/pve</code> <code>/智谋</code>",
-    "<b>记录</b>：<code>/历史</code> <code>/热力图</code> <code>/称号</code> <code>/锻造</code> "
-    "<code>/生涯武器</code>（<code>/pvp生涯武器</code> 也行）<code>/pve生涯武器</code>",
-    "<b>生涯武器范围</b>：PVP 默认全生涯，PVE 默认当前赛季；想只看某赛季在末尾加 "
-    "<code>s27</code> / <code>赛季27</code>，例：<code>/pve生涯武器 Wj#8984 s27</code>",
-    "<b>资料</b>：<code>/武器查询 武器名</code> <code>/perk查询 perk名</code> "
-    "<code>/护甲套装 [套装名]</code>（别名 <code>/套装效果</code>；"
-    "支持触发词：炽天使套 / 一愿 / 梦魇 / vog / kf …）"
-    "<code>/每日光尘</code>（光尘商店，别名 <code>/光尘商店</code>）"
-    "<code>/轮换</code>（本周突袭与地牢）；"
-    "群里也可以直接 <b>@机器人 武器名/perk名</b>",
-    "<b>掉落表</b>：<code>/掉落 副本名</code>，裸指令也行：<code>/二象性掉落</code>、<code>/ron掉落</code>、"
-    "<code>/ce掉落</code>…（全副本可查，发 <code>/掉落</code> 看列表）",
-    "<b>武器筛选</b>：<code>/武器筛选 关键词…</code>（空格分隔，多词同时满足），"
-    "例 <code>/武器筛选 主手 锻造 微冲 900</code>、<code>/武器筛选 电 重弹 腹背受敌</code>；"
-    "词可以是 类型/弹药/槽位(动能·能量·威能)/元素/射速/框架/特性名/"
-    "<code>锻造</code>/<code>异域</code>",
-    "<b>账号</b>：<code>/绑定 玩家名#1234</code> <code>/我的</code> <code>/解绑</code>",
-    "<b>查别人</b>：玩家类指令后面可以 <code>@某人</code>，对方绑定过就直接出 TA 的数据，"
-    "例 <code>/生涯 @某人</code> <code>/raid @某人</code> <code>/pve生涯武器 @某人 s27</code>"
-    "（<b>@ 要放在指令后面</b>）",
-    "绑定过账号后，玩家类指令都可以不带名字；<b>指令必须带 <code>/</code> 前缀</b>（裸写不响应）",
-    "<b>排队</b>：<code>/生涯武器</code> <code>/pve生涯武器</code> <code>/热力图</code> 会逐场拉对局、"
-    "一个个排队统计；跟在别人后面时会提示你排第几位",
-]
+@gm_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    raw, scope = _split_scope(args.extract_plain_text().strip())
+    name = await _resolve_name(gm_query, event, raw, args)
+    if not name:
+        return
+    jid = await d2.start_gm_report(name, scope or "current", who=_who(event))
+    if not jid:
+        await _not_found(gm_query, event, name)
+        return
+    _, _, label = d2.scope_window(scope or "current")
+    await _working(gm_query, event, "正在统计宗师战绩",
+                   [*_queue_line(jid),
+                    f"范围：<b>{label}</b>；统计宗师征服与宗师警戒的通关率 / 最快 / 平均，请稍候…",
+                    "默认只统计当前赛季；想查别的赛季在末尾加 <code>s27</code> / <code>赛季27</code>"])
+    await _jobs_card(gm_query, event, jid, "宗师战绩", bot_cards.gm_card,
+                     f"宗师战绩 {name}")
+
+
 HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /称号 /锻造 "
-              "/生涯武器 /pve生涯武器 /武器查询 /perk查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
+              "/生涯武器 /pve生涯武器 /宗师 /武器查询 /perk查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
 
 
 @help_query.handle()
 async def _(event: Event, args: Message = CommandArg()):
     if not _allowed_group(event):
         return
-    await _send_card(help_query, event, bot_cards.notice("指令一览", HELP_LINES),
+    await _send_card(help_query, event, bot_cards.help_card(),
                      "指令一览", HELP_PLAIN)

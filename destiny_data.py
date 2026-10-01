@@ -96,7 +96,8 @@ def current_season() -> dict | None:
 
 
 async def resolve_member(name: str):
-    """玩家名#编号 → dict(mtype, mid, display, code)；精确查不到时走模糊搜索兜底"""
+    """玩家名#编号 → dict(mtype, mid, display, code)；
+    先精确查 Bungie，查不到（带错编号）再回落本地索引"""
     if "#" not in name:
         return None
     fname, _, code = name.partition("#")
@@ -108,24 +109,79 @@ async def resolve_member(name: str):
     )
     resp = _parse(r)
     cands = resp.get("Response") or []
-    if not cands:
-        # 模糊搜索兜底（大小写不敏感），再按编号精确匹配
-        r = await client().get(f"/Platform/Destiny2/SearchDestinyPlayers/-1/{fname}/")
-        resp = _parse(r)
-        for p in resp.get("Response") or []:
-            if p.get("bungieGlobalDisplayNameCode") == code:
-                cands = [p]
-                break
+    # 注：Bungie 已下线免鉴权模糊搜索（SearchDestinyPlayers 404），带错编号只能报没找到
     # 跨存档玩家：主平台(crossSaveOverride)那条才是有效数据；无跨存档取第一条
     best = next((p for p in cands
                  if p.get("crossSaveOverride") and p["membershipType"] == p["crossSaveOverride"]),
                 cands[0] if cands else None)
     if best:
-        return {"mtype": best.get("crossSaveOverride") or best["membershipType"],
-                "mid": best["membershipId"], "display": best["bungieGlobalDisplayName"],
-                "code": best["bungieGlobalDisplayNameCode"],
+        mtype = best.get("crossSaveOverride") or best["membershipType"]
+        display = best["bungieGlobalDisplayName"]
+        dcode = best["bungieGlobalDisplayNameCode"]
+        harvest_player(f"{display}#{fmt_code(dcode)}", best["membershipId"], mtype)
+        return {"mtype": mtype,
+                "mid": best["membershipId"], "display": display,
+                "code": dcode,
                 "icon": BASE + best["iconPath"] if best.get("iconPath") else ""}
+    # Bungie 没查到：回落本地索引（PGCR 采集的 seen_players.json）
+    seen = seen_players()
+    if name in seen:
+        mtype, mid, _ts = seen[name]
+        return {"mtype": mtype, "mid": mid, "display": fname,
+                "code": code, "icon": ""}
     return None
+
+
+_SEEN_PATH = os.path.join("seen_players.json")
+_SEEN: dict | None = None
+_SEEN_CAP = 30000
+
+
+def seen_players() -> dict:
+    """本地玩家索引：name#code → [membershipType, membershipId, last_seen_ts]
+
+    Bungie 已关闭免鉴权的前缀搜索，带不出 #编号 的名字只能靠本地积累：
+    绑定名单 + 生涯/热力图任务拉过的每场 PGCR 里顺手采集的对局玩家"""
+    global _SEEN
+    if _SEEN is None:
+        try:
+            _SEEN = json.load(open(_SEEN_PATH, encoding="utf-8"))
+        except Exception:  # noqa: BLE001  首次运行/文件损坏都从空表开始
+            _SEEN = {}
+    return _SEEN
+
+
+def harvest_player(name: str, mid, mtype):
+    """PGCR 解析时调用：记下对局里出现过的玩家，容量超限时淘汰最久没见的"""
+    if not name or not mid or name.endswith("#?"):
+        return
+    seen = seen_players()
+    import time as _t
+    seen[name] = [int(mtype or 0), str(mid), int(_t.time())]
+    if len(seen) > _SEEN_CAP:
+        for k in sorted(seen, key=lambda k: seen[k][2])[:len(seen) - _SEEN_CAP + 1024]:
+            del seen[k]
+
+
+def save_seen_players():
+    if _SEEN:
+        json.dump(_SEEN, open(_SEEN_PATH, "w", encoding="utf-8"), ensure_ascii=False)
+
+
+def search_seen(prefix: str) -> list[tuple[str, int, str]]:
+    """本地索引按名字前缀（大小写不敏感）找玩家：[(name#code, mtype, mid), ...]"""
+    p = prefix.lower()
+    return [(k, v[0], v[1]) for k, v in seen_players().items()
+            if k.rsplit("#", 1)[0].lower().startswith(p)]
+
+
+async def search_players_fuzzy(q: str) -> list[dict]:
+    """不带 #编号 的模糊搜索：Bungie 公开接口已不支持前缀搜索，
+    这里只在本地索引（绑定 + PGCR 采集）里找，返回候选玩家列表"""
+    return [{"bungieGlobalDisplayName": k.rsplit("#", 1)[0],
+             "bungieGlobalDisplayNameCode": int(k.rsplit("#", 1)[1]),
+             "membershipType": mt, "membershipId": mid}
+            for k, mt, mid in search_seen(q)]
 
 
 def _parse(r) -> dict:
@@ -558,8 +614,10 @@ async def get_pgcr(instance_id: str) -> dict:
         p = e.get("player", {})
         info = p.get("destinyUserInfo", {})
         v = e.get("values", {})
+        _pname = f"{info.get('bungieGlobalDisplayName', info.get('displayName', '?'))}#{fmt_code(info.get('bungieGlobalDisplayNameCode', ''))}"
+        harvest_player(_pname, info.get("membershipId", ""), info.get("membershipType"))
         entries.append({
-            "name": f"{info.get('bungieGlobalDisplayName', info.get('displayName', '?'))}#{fmt_code(info.get('bungieGlobalDisplayNameCode', ''))}",
+            "name": _pname,
             "mid": info.get("membershipId", ""),
             "class": {"Titan": "泰坦", "Hunter": "猎人", "Warlock": "术士"}.get(p.get("characterClass"), "未知"),
             "light": p.get("lightLevel", 0),
@@ -1188,6 +1246,7 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                 JOBS[jid]["done"] += 1
 
         await asyncio.gather(*(one(m) for m in matches))
+        save_seen_players()
         _save_pvp_cache()
         weapons = sorted((v for v in agg.values() if v["kills"] > 0), key=lambda x: -x["kills"])
         total_matches = base_matches + len(matches)
@@ -1214,6 +1273,134 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
             "newest": newest, "newest_full": newest_full,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
         _save_agg_cache()
+    except Exception as exc:  # noqa: BLE001
+        JOBS[jid].update(status="error", error=str(exc))
+
+
+# ---------- 宗师战绩（征服 / 先锋警戒） ----------
+# 宗师类活动在对局历史里以活动名前缀区分难度档位（征服）或类型（宗师日落/警戒）；
+# 征服是独立模式(18)不走 mode=7 过滤，所以用全量历史按名字筛
+
+_GM_CONQUEST_TIERS = ("终极征服", "宗师征服", "大师征服", "专家征服")
+_GM_NIGHTFALL_KWS = ("宗师日落", "日落: 宗师", "日落：宗师")
+# 成就记录：完成赛季中心内所有宗师征服 / 所有终极征服 / 伟大征服者（镀金计数）
+_GM_REC_CONQUEST = "340857458"
+_GM_REC_ULTIMATE = "914587616"
+_GM_REC_GILD = "4018593209"
+
+
+def _gm_parse(name: str) -> tuple[str, str, str] | None:
+    """活动名 → (类别, 副本名, 难度)；非宗师类返回 None"""
+    for tier in _GM_CONQUEST_TIERS:
+        if name.startswith(tier):
+            strike = name[len(tier):].lstrip("：:")
+            for suf in (": 自定义", "：自定义", ": 匹配", "：匹配"):
+                strike = strike.replace(suf, "")
+            return ("conquest", strike.strip(), tier[:-2])
+    for kw in _GM_NIGHTFALL_KWS:
+        if kw in name:
+            strike = name.replace(kw, "").lstrip("：:")
+            for suf in (": 自定义", "：自定义", ": 匹配", "：匹配"):
+                strike = strike.replace(suf, "")
+            return ("nightfall", strike.strip() or name, "宗师")
+    return None
+
+
+def _gm_bucket(matches: list[dict]) -> list[dict]:
+    """按 (类别, 副本名, 难度) 聚合宗师对局：次数/通关/通关率/最快"""
+    groups: dict[tuple, dict] = {}
+    for m in matches:
+        p = _gm_parse(m["name"])
+        if not p:
+            continue
+        cat, strike, tier = p
+        g = groups.setdefault(p, {
+            "cat": cat, "strike": strike, "tier": tier,
+            "attempts": 0, "clears": 0, "fastest": 0, "avg": 0,
+            "last": ""})
+        g["attempts"] += 1
+        g["last"] = max(g["last"], m["period"])
+        if m["completed"]:
+            g["clears"] += 1
+            dur = m["duration"]
+            if dur > 0 and (not g["fastest"] or dur < g["fastest"]):
+                g["fastest"] = dur
+    out = list(groups.values())
+    for g in out:
+        g["rate"] = round(g["clears"] * 100.0 / g["attempts"], 1) if g["attempts"] else 0.0
+    out.sort(key=lambda x: (0 if x["cat"] == "conquest" else 1, -x["attempts"]))
+    return out
+
+
+def _gm_avg_clears(matches: list[dict]) -> dict[tuple, int]:
+    """每组的通关时长和 → 平均通关时长（对局历史页自带 duration，无需逐场 PGCR）"""
+    sums: dict[tuple, list] = {}
+    for m in matches:
+        if not m["completed"] or m["duration"] <= 0:
+            continue
+        p = _gm_parse(m["name"])
+        if p:
+            sums.setdefault(p, []).append(m["duration"])
+    return sums
+
+
+async def start_gm_report(name: str, scope: str = "current", who: str = "") -> str | None:
+    """宗师战绩后台任务：当前（或指定）赛季的征服/宗师警戒对局聚合"""
+    member = await resolve_member(name)
+    if not member:
+        return None
+    mtype, mid = member["mtype"], member["mid"]
+    since, until, label = scope_window(scope)
+    key = f"{mtype}:{mid}:gm:{since}:{until}"
+    hit = _reuse_job(key)
+    if hit:
+        _mark_reused(hit, who)
+        return hit
+    profile = await get_profile(mtype, mid)
+    chars = list(profile.get("characters", {}).get("data", {}))
+    jid = f"{mid}_gm_{len(JOBS)}"
+    _register_job(key, jid, {
+        "done": 0, "total": 0, "status": "queued", "name":
+        f"{member['display']}#{fmt_code(member['code'])}", "result": None,
+        "kind": "gm", "who": who or "网页", "ts": time.time(),
+        "label": f"宗师战绩（{label}）"})
+    _enqueue_job(jid, lambda: _run_gm_job(jid, mtype, mid, chars, since, until, label, profile))
+    return jid
+
+
+async def _run_gm_job(jid: str, mtype: int, mid: str, chars: list[str],
+                      since: str, until: str, label: str, profile: dict):
+    try:
+        JOBS[jid].update(status="running", total=2, done=0)
+        # 征服是独立模式，mode=0 全量历史再按活动名筛（历史页自带 completed/duration）
+        matches = await _collect_matches(mtype, mid, chars, 0, since, until, 5000, frozenset())
+        JOBS[jid].update(done=1)
+        rr = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/",
+                                params={"components": "900"})
+        pr = _merged_records({"profileRecords": (_parse(rr).get("Response") or {}).get("profileRecords")})
+        gild = 0
+        for o in (pr.get(_GM_REC_GILD, {}).get("objectives") or []):
+            gild = max(gild, int(o.get("progress") or 0))
+        gm = [m for m in matches if _gm_parse(m["name"])]
+        buckets = _gm_bucket(gm)
+        avgs = _gm_avg_clears(gm)
+        for g in buckets:
+            ds = avgs.get((g["cat"], g["strike"], g["tier"]), [])
+            g["avg"] = int(sum(ds) / len(ds)) if ds else 0
+        result = {
+            "display": JOBS[jid]["name"], "scope_label": label,
+            "scanned": len(matches), "matches": len(gm),
+            "range": (min((m["period"] for m in gm), default=""),
+                      max((m["period"] for m in gm), default="")),
+            "conquests": [g for g in buckets if g["cat"] == "conquest"],
+            "nightfalls": [g for g in buckets if g["cat"] == "nightfall"],
+            "records": {
+                "conquest": _obj_progress(pr.get(_GM_REC_CONQUEST, {})),
+                "ultimate": _obj_progress(pr.get(_GM_REC_ULTIMATE, {})),
+                "gilds": gild},
+            "added": len(gm), "cached": 0, "missed": 0, "capped": False,
+        }
+        JOBS[jid].update(status="done", total=2, done=2, result=result)
     except Exception as exc:  # noqa: BLE001
         JOBS[jid].update(status="error", error=str(exc))
 
@@ -1398,6 +1585,7 @@ def _load_heat_cache():
 
 
 def _save_heat_cache():
+    save_seen_players()
     if len(_HEAT_CACHE) > _HEAT_CACHE_MAX:  # 满了丢最久没更新的四分之一，够用就行
         stale = sorted(_HEAT_CACHE, key=lambda k: _HEAT_CACHE[k].get("updated") or "")
         for k in stale[: _HEAT_CACHE_MAX // 4]:
@@ -1766,6 +1954,9 @@ async def _ev_vendor_responses() -> list:
         raise BungieAuthRequired("还没有授权 Bungie 账号")
     mem = await bungie_auth.membership()
     if not mem or not mem.get("membership_id"):
+        # membership() 失败时会吞掉真实原因（token 刷新失败 / 官方 5xx），
+        # 这里直接调一次把真实异常透传出去，别让用户误以为要去重新授权
+        await bungie_auth.authorized_get("/Platform/User/GetMembershipsForCurrentUser/")
         raise BungieAuthRequired("Bungie 授权信息无效，请在面板重新授权")
     mt, mid = mem["membership_type"], mem["membership_id"]
     prof = await bungie_auth.authorized_get(

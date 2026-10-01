@@ -96,6 +96,15 @@ section{background:rgba(255,255,255,.03);border-radius:8px;padding:4px 8px 10px}
 .nt.err{border-color:#ff8d85;color:#ff8d85}
 .nline{font-size:14px;line-height:1.9;color:#cfd8e3;margin:6px 0}
 .nline code{background:#0e1524;border-radius:5px;padding:2px 7px;color:#5ea8ff;font-size:13px}
+/* 帮助卡 */
+.help{display:grid;grid-template-columns:76px 1fr;gap:8px 12px;align-items:start}
+.help .cat{font-size:14px;font-weight:bold;color:#ffd76e;text-align:right;padding-top:5px}
+.help .cmds{font-size:14px;line-height:2.1;color:#cfd8e3}
+.help .cmds code{background:#0e1524;border-radius:5px;padding:2px 7px;color:#5ea8ff;font-size:13px}
+.help .note{color:#8fa3bd;font-size:12.5px;margin-left:6px}
+.help .tip{grid-column:1 / -1;background:rgba(255,255,255,.04);border-radius:8px;
+           padding:9px 12px;font-size:13px;line-height:1.9;color:#cfd8e3;margin-top:6px}
+.help .tip b{color:#ffd76e}
 .dim{color:#8fa3bd;font-size:12.5px}
 .others{margin-top:10px}
 .foot{margin-top:14px;padding-top:10px;border-top:1px solid #22304a;color:#8fa3bd;font-size:12px}
@@ -276,6 +285,33 @@ def notice(title: str, lines: list[str], kind: str = "info") -> str:
     body = (f"<div class='nt {kind if kind != 'info' else ''}'>{esc(title)}</div>"
             + "".join(f"<div class='nline'>{ln}</div>" for ln in lines)
             + "<div class='foot'>命运2 查询 · 数据来自 Bungie.net</div>")
+    return _page(body)
+
+
+def help_card() -> str:
+    def cat(name, cmds, note=""):
+        n = f"<span class='note'>{note}</span>" if note else ""
+        return f"<div class='cat'>{esc(name)}</div><div class='cmds'>{cmds}{n}</div>"
+
+    c = lambda s: f"<code>{esc(s)}</code>"
+    rows = (
+        cat("玩家", f"{c('/玩家')} {c('/生涯')} {c('/raid')} {c('/地牢')} {c('/pvp')} {c('/pve')} {c('/智谋')}") +
+        cat("记录", f"{c('/历史')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
+            "pvp 版同理") +
+        cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲套装')} {c('/每日光尘')} {c('/轮换')}") +
+        cat("掉落表", f"{c('/掉落 副本名')}", "裸指令也行：/二象性掉落、/ron掉落…，发 /掉落 看列表") +
+        cat("武器筛选", f"{c('/武器筛选 关键词…')}", "空格分隔多词，例：/武器筛选 主手 锻造 微冲 900") +
+        cat("账号", f"{c('/绑定 玩家名#1234')} {c('/我的')} {c('/解绑')}") +
+        "<div class='tip'>"
+        "<b>赛季参数</b>：生涯武器末尾加 <code>s27</code> / <code>赛季27</code> 只看该赛季，"
+        "PVE 默认当前赛季、PVP 默认全生涯<br>"
+        "<b>查别人</b>：玩家类指令后加 <code>@某人</code>（对方绑定过即可）<br>"
+        "<b>省事</b>：绑定后玩家类指令可不带名字；群里可直接 <b>@机器人 武器名/perk名</b>；"
+        "指令必须带 <code>/</code> 前缀"
+        "</div>"
+    )
+    body = (f"<div class='nt'>指令一览</div><div class='help'>{rows}</div>"
+            "<div class='foot'>命运2 查询 · 数据来自 Bungie.net</div>")
     return _page(body)
 
 
@@ -488,14 +524,23 @@ def weapons_list_card(results: list[dict], q: str) -> str:
 # ---------- /武器筛选 ----------
 
 def weapon_filter_card(res: dict, q: str) -> str:
-    """筛选结果：小日向式三列网格，每格 图标 + 名称 + 类型·弹药 + 框架"""
+    """筛选结果：小日向式三列网格，每格 图标 + 名称 + 类型·弹药 + 框架。
+    同名多版本武器逐条列出，多版本的名字加赛季角标（首发/S 号）区分"""
+    items = res.get("items") or []
+    multi: dict[str, int] = {}
+    for w in items:
+        multi[w["n"]] = multi.get(w["n"], 0) + 1
     cells = ""
-    for w in res.get("items") or []:
+    for w in items:
         water = f"<img class='wm' src='{esc(w['w'])}'>" if w.get("w") else ""
         icon = f"<img src='{esc(w['i'])}'>" if w.get("i") else ""
         cls = " class='ex'" if w.get("x") else ""
+        tag = ""
+        if multi.get(w["n"], 0) > 1:
+            st = "首发" if w.get("s", 0) <= 0 else f"S{w['s']}"
+            tag = f"<span class='dim' style='font-size:11px;margin-left:6px'>{st}</span>"
         cells += (f"<div class='wfcell'><span class='wfico'>{water}{icon}</span>"
-                  f"<div class='wftxt'><b{cls}>{esc(w['n'])}</b>"
+                  f"<div class='wftxt'><b{cls}>{esc(w['n'])}</b>{tag}"
                   f"<span>{esc(w['t'])} · {esc(w['a'])}</span>"
                   f"<span class='fr'>{esc(w['f'])}</span></div></div>")
 
@@ -679,6 +724,11 @@ def wpvp_card(rep: dict) -> str:
 def wpve_card(rep: dict) -> str:
     """/pve生涯武器：PVE 生涯武器排名（默认当前赛季）"""
     return _webui().render_wpvp(rep)
+
+
+def gm_card(rep: dict) -> str:
+    """/宗师：宗师征服 + 宗师警戒战绩"""
+    return _webui().render_gm(rep)
 
 
 def heat_card(rep: dict) -> str:

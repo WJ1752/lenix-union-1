@@ -2,6 +2,133 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-01 新增 /宗师 —— 宗师征服 + 宗师警戒战绩（对齐 nightfall.report）
+
+- **指令**：`/宗师`（别名 `宗师战绩` / `征服` / `gm战绩`），可带 `@某人` 和赛季参数（`s27` 等），
+  默认当前赛季；网页首页新增「宗师」页签（后台任务模式，`/start_gm` + `/gm_result`）。
+- **数据源**：全量对局历史（mode=0）按活动名前缀筛——征服是独立模式(18)，
+  `mode=7` 过滤拿不到；活动 hash → 中文名来自 `manifest_index/activities.json`
+  （含 6 个「宗师征服：X」和「宗师日落: X」轮换条目）。对局历史页自带 completed/duration，
+  不用逐场拉 PGCR，一个赛季 3000+ 场也就翻几页历史，秒级出结果。
+- **输出**：征服 / 宗师警戒两栏，每项 通关次数/通关率(含失败)/最快/平均（只算通关场）；
+  顶部四个指标：宗师征服进度（成就 340857458）、终极征服进度（914587616）、
+  历史镀金次数（伟大征服者 4018593209 的 objective progress）、宗师对局数。
+- **踩坑**：伟大征服者记录的镀金 objective 是 completionValue=4 / progress=累计通关数，
+  直接取 progress 当镀金计数比 nightfall.report 显示大 1（截图 6 vs 实测 7，
+  应是截图后又完成了一次，姑且按 progress 展示）。
+- 已重打包旁路部署 `dist_new\D2Query\`。
+
+## 2026-10-01 修「实际在线但面板显示等待扫码登录」+ 新增退出重置按钮
+
+- **现象**：Bot 实际在线能回指令，面板 QQ 登录卡片却一直「NapCat 运行中 等待扫码登录…」。
+- **根因**：面板查询登录态走 NapCat WebUI 的 `QQLogin/CheckLoginStatus`，
+  `napcat_runtime._api_post` 只在 HTTP 401 时换新凭证重试；但 NapCat 凭证失效时
+  返回的是 **HTTP 200 + `{"code":-1,"message":"Unauthorized"}`**，不检查业务码导致
+  过期凭证被永久缓存，每次查询都拿到空 data → isLogin 永远 false。
+  （顺带发现：`CheckLoginStatus` 响应里本来就没有 uin 字段，登录后 uin 由
+  `QQLogin/GetQQLoginInfo` 补齐。）
+- **修复**：`_api_post` 按业务码 `code != 0` 判定失败并换新凭证重试一次；
+  已用注入坏凭证方式对真实 NapCat 验证自愈。
+- **新功能**：面板登录态新增「退出并重置（需重新扫码）」按钮 →
+  `POST /api/napcat/reset` → `napcat_runtime.reset()`：taskkill 进程树杀掉
+  NapCat/QQ（WebUI 没有 Logout API，重置只能杀进程），清凭证缓存，回到未启动态。
+  按钮带风控提示（短时间反复重登可能触发 QQ 风控）。
+- 已重打包并旁路部署到 `dist_new\D2Query\`（只覆盖 exe+_internal，未动正在跑的实例）。
+
+## 2026-10-01 修「扫码登录后协议端未连接」——8901 绑定失败 + WS 配置没生效
+
+- **现象**：二维码修复后能扫码登录（NapCat 已登录），但面板顶部一直「未连接」，
+  NapCat 的反向 WS 没接到 NoneBot。
+- **两个叠加原因**：
+  1. 部署脚本杀旧 exe 后 800ms 就起新 exe，旧实例 8901 上的已建立连接进 TIME_WAIT
+    （最长 4 分钟），新实例 NoneBot 绑定 8901 报 10048 → bot 线程直接退出，
+    面板/网页还能用（8900 正常），但协议端永远没人接。修法：`bot_runtime._run()`
+    启动前用裸 socket 试绑 8901，最多等 60 秒再 `nonebot.run()`。
+  2. NapCat 运行实例里 `websocketClients` 是空的——watcher 下发配置那次没成功，
+    之后没有任何兜底。修法：面板轮询 `/api/bot/status` 时，若「已登录但未连接」，
+    低频（≥60s 一次）调 `ensure_ob11_via_api()` 热更反向 WS 配置，SetConfig 即时生效。
+- **现场处置**：手工调 `ensure_ob11_via_api()` 后「雷尼克斯联合-2」立即上线
+  （`/api/bot/status` 返回 connected:true）。
+
+## 2026-10-01 修「二维码一直加载中」——napcat.mjs 分包文件缺失
+
+- **现象**：面板「QQ 登录」卡在"二维码加载中…"，NapCat 壳进程活着但 6099 永远不监听、
+  napcat.log 0 字节、logs/ 目录空，反复重启 NapCat 也一样（凌晨 03:18–04:00 五次全失败）。
+- **根因**：`napcat.mjs` 是 rollup 打包产物，开头 `import { … } from "./conout-wiJ7YKRd.js"`
+  引用同目录分包；dist 的 napcat_shell 里恰好缺这一个文件。loader 里 `import()` 失败是
+  异步 rejection，**一个字都不打**——QQ 照常启动成普通 QQ，NapCat 永远不初始化，
+  面板自然永远拿不到实时码。与"用户自己的 QQ 在跑"、风控、Defender 都无关（全部排除了）。
+- **修法**：
+  - 把 `napcat_shell/conout-wiJ7YKRd.js` 补进 dist（源仓库里一直都在）；
+  - `napcat_runtime.start()` 启动前新增 `_missing_napcat_files()` 自检：解析 napcat.mjs 的
+    `from "./xx.js"` / `import("./xx.js")` 引用，缺文件直接报
+    「NapCat 文件不完整，缺少 …」，不再静默；
+  - `deploy_exe.ps1` 新增 3.6 步：部署时把 napcat.mjs + conout-*.js 同步进 dist 的
+    napcat_shell（该目录由 setup_napcat.py 一次性建出、打包流程从不重建，是这次断层的根源）。
+- **排查手段（下次直接用）**：给 `loadNapCat.js` 包一层 fs.appendFileSync 追踪 +
+  try/catch，重跑 BootMain 就能看到 import 失败的真实栈。
+- 期间把自己的 QQ 和机器人 QQ 都杀过做对照实验：补齐 chunk 后两者**可共存**，
+  NapCat 照常出码（数据目录冲突假说被证伪）。
+
+## 2026-10-01 修「光尘商店获取失败」——token 刷新链路加固
+
+- **现象**：01:25 私聊 `/每日光尘` 回「光尘商店获取失败」，但面板显示已授权；
+  用 dist 里 01:25 落盘的新 token 复测，接口本身是通的（说明是那次刷新/请求
+  赶上了 Bungie 偶发故障）。
+- **根因**：`bungie_auth.access_token()` 把刷新异常整个吞掉返回空串，上层误报
+  「未授权」；且 `authorized_get()` 对非 JSON 返回直接抛 JSONDecodeError
+  （Bungie 偶发回 HTML 错误页）；并发刷新时一次性 refresh_token 还会互相作废。
+- **修法**：刷新失败抛出真实原因（`Bungie token 刷新失败：…`）；非 JSON 响应
+  报「HTTP 状态码 + 多为官方临时故障」；刷新加 asyncio.Lock、锁内重读避免竞态；
+  `eververse_store` 里 membership() 吞错时再调一次接口透传真实异常。
+- 已重新打包部署到 dist/D2Query（QQ 占用 napcat_shell/guild1.db 不能整目录重建，
+  改旁路打包 dist_new 后只覆盖 exe + _internal），烟测通过后停掉自己的实例。
+- **事故记录**：第一次打包没走旁路，PyInstaller 清 dist 时把根目录用户数据删了
+  （.env、bungie_token.json、seen_players.json、dim_user.json），删到被 QQ 锁住的
+  guild1.db 才中断。.env 已从仓库根恢复；token 无法恢复需重新授权；
+  seen_players.json（本地玩家索引）丢失会随查询重建；dim_user.json 的 DIM 标签/配装丢失。
+
+## 2026-10-01 修「授权换 token 报 redirect_uri does not match」
+
+- **根因**：Bungie 对 redirect_uri 的校验只发生在**换 token** 这一步，authorize 那步
+  不拦——所以会出现「浏览器拿到了 code、换 token 却 400」。发 code 的授权页用的
+  地址（可能是旧会话/旧配置留下的，或 Bungie 应用里登记的还是旧值）与当前
+  `BUNGIE_REDIRECT_URI` 不一致就会这样。
+- **修法（自愈）**：`bungie_auth.exchange()` 支持传 redirect_uri，先试「实际发 code
+  用的那个」再退回配置值；手动授权从粘贴的回调地址里取（`redirect_from_text`），
+  自动回跳从落地 URL 里取。面板未授权块明示程序生效的回调地址，方便对照 Bungie
+  应用后台登记值。
+
+## 2026-10-01 错误卡片带上异常类型名
+
+- `/每日光尘` 超时失败时卡片显示「Bungie 接口暂时不可用：」冒号后是空的——
+  httpx 超时类异常的 `str()` 为空串。现统一经 `_exc_msg()` 拼 `类型名: 消息`，
+  光尘商店与本周轮换两处生效，卡片能直接看出是 `ReadTimeout` 还是别的错。
+
+## 2026-10-01 /武器筛选 显示同名武器全版本
+
+- 此前筛选结果按武器名去重（Manifest 里同名武器按 perk 池/赛季分多个 hash），
+  山巅这类多赛季复刻武器只出一条。现改为与参考图一致**逐版本列出**：
+  只有「名字+赛季+水印」全同的才算重复条目；同名出现多个版本时在名字旁加
+  赛季角标（首发 / S 号，赛季映射复用 weapon_versions.json 即 d2ai 水印表）。
+- 网页 /catalog 图鉴页本来就在每条版本上算筛选，无需改。
+
+## 2026-09-30 修「掉线后重新扫码一直二维码超时」
+
+- **根因（僵尸 QQ 进程）**：`stop()`/卡死重启只 kill `NapCatWinBootMain.exe` 主进程，
+  它拉起的 QQ.exe 是独立子进程会残留，继续占着 NapCat WebUI 端口 6099。之后
+  `start()` 里 `login_qr_ready()` 误判「已在跑」认领僵尸进程，所有二维码 API 都打在
+  半死的登录服务上 → 面板永远「正在获取新二维码…」，落盘兜底又显示旧的过期码，
+  扫了必报「二维码超时」。
+- **修复**：新增 `_tree_kill`（taskkill /T 连子进程）与 `_kill_webui_holder`
+  （netstat 找到占 6099 的进程，只认 QQ.exe/NapCatWinBootMain.exe 再杀）；
+  `stop()`、`_restart_login_for_qr` 改为树杀+清端口占用者；`start()` 认领前先用
+  `login_status()` 探活，没响应就清僵尸走全新启动；qrcode.png 兜底只认 2 分钟内的
+  （旧码扫了就是超时，显示出来纯属误导）。
+- **掉线本身**（NapCat 日志：`快速登录错误： 登录需要手Q验证`）是 QQ 风控踢下线，
+  代码治不了；NapCat 4.18.28 + QQ 9.9.36 组合偏旧（社区反馈该版本段掉线频繁，
+  NapNeko/NapCatQQ#1728）。掉线后重启扫一次码即可，不会再卡在「二维码超时」。
+
 ## 2026-09-30 修 DIM 登录链路 + 面板授权回跳 + 二维码卡死自愈
 
 - **DIM 构建产物路径烘焙错误（登录全挂的根因）**：打包 DIM 时 PUBLIC_PATH 被 MSYS 路径转换污染，
