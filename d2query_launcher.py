@@ -23,14 +23,14 @@ import webview
 
 
 def _free_port(start=8900):
-    port = start
-    while port < start + 20:
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                port += 1
+    """挑主界面端口。端口契约（哪些能用、怎么算"可用"）统一放在 bot_runtime：
+    8901/8902 是同进程另外两个服务写死的口，必须绕开，否则会把协议端坑成"未连接"。"""
+    from bot_runtime import RESERVED_PORTS, port_usable
+    for port in range(start, start + 20):
+        if port in RESERVED_PORTS:
+            continue
+        if port_usable(port):
+            return port
     return start
 
 

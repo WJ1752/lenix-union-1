@@ -47,39 +47,92 @@ def get_bots() -> dict:
         return {}
 
 
-def _run():
-    try:
-        import nonebot
-        from nonebot.adapters.onebot.v11 import Adapter
+BIND_WAIT_SEC = 300   # 等 8901 可用的上限；Windows 的 TIME_WAIT 约 4 分钟，留够余量
 
-        # 上个实例被杀后 8901 的已建立连接会进 TIME_WAIT（最长约 4 分钟），
-        # 期间绑定会 10048 → nonebot 直接退出 → 协议端永远"未连接"。
-        # 等端口真正能绑再启动（ NapCat 反向 WS 每 5 秒重连，等得起）。
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            with socket.socket() as probe:
-                try:
-                    probe.bind(("127.0.0.1", BOT_PORT))
-                    break
-                except OSError:
-                    time.sleep(2)
-        nonebot.init(driver="~fastapi", host="127.0.0.1", port=BOT_PORT,
-                     log_level="WARNING", command_start={"/"})
-        driver = nonebot.get_driver()
-        driver.register_adapter(Adapter)
-        # 打包 exe 时插件目录在 exe 旁边；开发时在源码目录
-        if getattr(sys, "frozen", False):
-            plugin_dir = os.path.join(os.path.dirname(sys.executable), "nonebot_plugins")
-        else:
-            plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nonebot_plugins")
-        # 目录含 __init__.py 时 nonebot 按包导入，需保证父目录在 sys.path
-        plugin_parent = os.path.dirname(plugin_dir)
-        if plugin_parent not in sys.path:
-            sys.path.insert(0, plugin_parent)
-        nonebot.load_plugins(plugin_dir)
-        nonebot.run()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[bot] QQ bot 线程启动失败（不影响网页查询）：{exc}")
+TLS_PORT = 8902       # 与 bungie_auth.TLS_PORT 一致：Bungie OAuth 的回跳口
+
+# 这两个端口是同进程里另外两个服务写死的：8901 被协议端 NapCat 的 onebot11_<QQ>.json
+# 指着，8902 写进了 Bungie 后台的回调地址。主界面挑自己端口时必须绕开——
+# 一旦抢到 8901，协议端就会连到网页应用上，面板永远"未连接"，且重启也治不好。
+RESERVED_PORTS = frozenset({BOT_PORT, TLS_PORT})
+
+
+def port_usable(port: int) -> bool:
+    """这个端口现在能不能拿来监听。分两步，因为 Windows 的 SO_REUSEADDR 允许"抢绑"：
+
+    ① 连得上说明有人在听 —— 那绝不能抢，哪怕技术上绑得上（抢了就是两个监听者抢连接）；
+    ② 连不上再试绑，这一步开 SO_REUSEADDR：上个实例留下的 TIME_WAIT 只是残留状态，
+       裸 bind 会把它误判成"被占用"，白白把端口一路挤走。
+    """
+    with socket.socket() as c:
+        c.settimeout(0.25)
+        if c.connect_ex(("127.0.0.1", port)) == 0:
+            return False
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _wait_bindable(port: int, timeout: float = BIND_WAIT_SEC) -> bool:
+    """等到 port 真能用为止（协议端每 5 秒重连一次，等得起）。
+
+    只做裸 bind 的老逻辑会把上个实例留下的 TIME_WAIT 当成"端口被占用"，于是
+    nonebot 起来即报 10048 退出、协议端从此永远"未连接"；而且它只等 60 秒。
+    """
+    deadline = time.time() + timeout
+    while True:
+        if port_usable(port):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def _serve(state: dict):
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Adapter
+
+    if not _wait_bindable(BOT_PORT):
+        print(f"[bot] 等 {BOT_PORT} 可用已超 {BIND_WAIT_SEC}s，仍先尝试启动一次")
+    nonebot.init(driver="~fastapi", host="127.0.0.1", port=BOT_PORT,
+                 log_level="WARNING", command_start={"/"})
+    state["inited"] = True          # 到这里之后再失败就不能重来了，见 _run
+    driver = nonebot.get_driver()
+    driver.register_adapter(Adapter)
+    # 打包 exe 时插件目录在 exe 旁边；开发时在源码目录
+    if getattr(sys, "frozen", False):
+        plugin_dir = os.path.join(os.path.dirname(sys.executable), "nonebot_plugins")
+    else:
+        plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nonebot_plugins")
+    # 目录含 __init__.py 时 nonebot 按包导入，需保证父目录在 sys.path
+    plugin_parent = os.path.dirname(plugin_dir)
+    if plugin_parent not in sys.path:
+        sys.path.insert(0, plugin_parent)
+    nonebot.load_plugins(plugin_dir)
+    nonebot.run()
+
+
+def _run():
+    """启动 QQ bot 线程。
+
+    nonebot.init 之前失败（端口迟迟不可用、驱动起不来）可以整段重来一次；
+    init 之后失败（uvicorn 最终没绑上等）不能再 init 一遍，只记日志、等下回开程序。
+    """
+    state: dict = {}
+    for attempt in (1, 2):
+        try:
+            _serve(state)
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bot] QQ bot 线程第 {attempt} 次启动失败：{exc}")
+            if state.get("inited"):
+                return
+            time.sleep(3)
+    print("[bot] QQ bot 线程起不来（不影响网页查询）：端口一直没就绪，重启程序可再试")
 
 
 def start():

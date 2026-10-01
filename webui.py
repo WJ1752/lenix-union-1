@@ -43,18 +43,18 @@ def navbar(active: str = "") -> str:
         for href, txt in _NAV_ITEMS)
     return (
         "<style>.d2nav{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:0 0 16px}"
-        ".d2nav .nv{color:#cfd8e3;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;"
+        ".d2nav .nv{color:#c5cacd;background:#16181b;border:1px solid #2a2e33;border-radius:8px;"
         "padding:9px 12px;font-size:14px;text-decoration:none;white-space:nowrap}"
-        ".d2nav .nv:hover{border-color:#5ea8ff;color:#fff}"
-        ".d2nav .nv.on{background:#2f6edb;border-color:#2f6edb;color:#fff;font-weight:bold}"
+        ".d2nav .nv:hover{border-color:#4b8fd4;color:#fff}"
+        ".d2nav .nv.on{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold}"
         "</style>"
         f"<div class='d2nav'>{links}</div>")
 
 
 def err_page(title: str, detail: str) -> HTMLResponse:
     return HTMLResponse(
-        f"<h1 style='font:600 20px sans-serif;color:#e8eef7;margin:0 0 8px'>{title}</h1>"
-        f"<div style='font:14px/1.7 sans-serif;color:#cfd8e3'>{detail}</div>", status_code=200)
+        f"<h1 style='font:600 20px sans-serif;color:#e8e6e3;margin:0 0 8px'>{title}</h1>"
+        f"<div style='font:14px/1.7 sans-serif;color:#c5cacd'>{detail}</div>", status_code=200)
 
 
 @app.exception_handler(Exception)
@@ -62,7 +62,7 @@ async def on_error(request, exc: Exception):
     """兜底：上游/网络异常不再吐 500 白页，给一句人话 + 重试提示"""
     return err_page("数据获取失败",
                     "Bungie 接口或网络暂时不可用，请点上方标签重试（已自动重试 2 次）。<br>"
-                    f"<span style='color:#8fa3bd'>{d2.esc_err(exc)}</span>")
+                    f"<span style='color:#9aa0a6'>{d2.esc_err(exc)}</span>")
 
 
 @app.middleware("http")
@@ -75,31 +75,31 @@ async def no_cache(request, call_next):
 # ---------- QQ Bot 面板 ----------
 PANEL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Bot 面板</title>
 <style>
-body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;color:#e8eef7;padding:22px}
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;padding:22px}
 h1{font-size:20px;text-align:center;margin:0 0 16px}
 .wrap{display:flex;gap:18px;align-items:flex-start;justify-content:center;max-width:1180px;margin:0 auto}
 .col-main{flex:1 1 620px;max-width:680px;min-width:0}
 .col-side{flex:0 0 380px;position:sticky;top:22px}
 @media(max-width:1020px){.wrap{flex-direction:column}.col-side{position:static;flex:1 1 auto;width:100%}}
-.card{background:#141c2e;border:1px solid #22304a;border-radius:10px;padding:14px 18px;
+.card{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:14px 18px;
       margin:0 0 14px;font-size:14px;line-height:1.8;box-sizing:border-box}
-.on{color:#7dff9c}.off{color:#ff8d85}
+.on{color:#35c66b}.off{color:#ff8d85}
 .grow{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;
-      border-radius:6px;margin:3px 0;background:rgba(255,255,255,.03)}
-.grow:hover{background:#1c2942}
-button{padding:6px 14px;border-radius:6px;border:1px solid #2c3a52;background:#2f6edb;
-       color:#e8eef7;cursor:pointer;font-weight:bold}
-button.ghost{background:#39445c;font-weight:normal}
+      border-radius:6px;margin:3px 0;background:#16181b}
+.grow:hover{background:#1b1e22}
+button{padding:6px 14px;border-radius:6px;border:1px solid #2a2e33;background:#35c66b;
+       color:#e8e6e3;cursor:pointer;font-weight:bold}
+button.ghost{background:#2a2e33;font-weight:normal}
 button:disabled{opacity:.4;cursor:default}
-code{background:#0e1524;border-radius:4px;padding:1px 6px;font-size:12px;color:#5ea8ff}
-.dim{color:#8fa3bd;font-size:12px}
-.pbar{height:8px;background:#0e1524;border-radius:4px;overflow:hidden;margin-top:6px}
-.pfill{height:100%;background:linear-gradient(90deg,#2f6edb,#5ea8ff);transition:width .4s}
+code{background:#1b1e22;border-radius:4px;padding:1px 6px;font-size:12px;color:#4b8fd4}
+.dim{color:#9aa0a6;font-size:12px}
+.pbar{height:8px;background:#1b1e22;border-radius:4px;overflow:hidden;margin-top:6px}
+.pfill{height:100%;background:linear-gradient(90deg,#35c66b,#4b8fd4);transition:width .4s}
 .pfill.err{background:#b04a42}
 .jobhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 .jobbox{max-height:calc(100vh - 300px);min-height:120px;overflow:auto;padding-right:4px}
 .jobbox::-webkit-scrollbar{width:8px}
-.jobbox::-webkit-scrollbar-thumb{background:#2c3a52;border-radius:4px}
+.jobbox::-webkit-scrollbar-thumb{background:#2a2e33;border-radius:4px}
 .pager{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:8px}
 .pager button{padding:4px 10px;font-size:12px}
 </style></head><body>
@@ -125,7 +125,7 @@ code{background:#0e1524;border-radius:4px;padding:1px 6px;font-size:12px;color:#
     <b>消息日志</b> <span class="dim">（群里的指令与私聊消息 + 机器人回复，最新在前，最多 500 条）</span>
     <div style="margin:8px 0;display:flex;gap:8px;align-items:center">
       <select id="logGroup" onchange="refreshLogs()" style="padding:5px 8px;border-radius:6px;
-        border:1px solid #2c3a52;background:#0e1524;color:#e8eef7"></select>
+        border:1px solid #2a2e33;background:#1b1e22;color:#e8e6e3"></select>
       <button class="ghost" onclick="clearLogs()">清空日志</button>
       <span class="dim" id="logCount"></span>
     </div>
@@ -189,7 +189,7 @@ async function refreshLogs(){
       ? '<span class="on">回</span>'
       : (e.enabled === false ? '<span class="off">未启用群</span>'
          : (e.skip ? `<span class="off">${esc(e.skip)}</span>` : '<span class="dim">收</span>'));
-    return `<div style="padding:6px 10px;border-radius:6px;margin:3px 0;background:rgba(255,255,255,.03)">
+    return `<div style="padding:6px 10px;border-radius:6px;margin:3px 0;background:#16181b">
       <div class="dim">${e.time} · ${esc(gname)} · ${esc(e.dir==='out'?'机器人':(e.nickname||e.user_id))} ${tag}</div>
       <div style="white-space:pre-wrap;word-break:break-all;margin-top:2px">${esc(e.text)}</div></div>`;
   }).join('');
@@ -299,7 +299,7 @@ async function refreshJobs(){
     // 复用的任务不会多出一条记录，这里标一下，免得看着像「指令没反应」
     const reuse = j.reused
       ? `<span class="dim"> · 已复用于 ${esc((j.reused_by || []).join('、') || '同一查询')}</span>` : '';
-    return `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:rgba(255,255,255,.03)">
+    return `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:#16181b">
       <div style="display:flex;justify-content:space-between;gap:10px">
         <span><b>${esc(j.label)}</b> <span class="dim">${esc(j.name)}</span></span>
         <span class="dim" style="white-space:nowrap">${esc(j.who)}${reuse}</span>
@@ -347,7 +347,7 @@ async function refreshBungie(){
     + '<button>打开 Bungie 授权页</button></a></div>'
     + '<div style="margin-top:8px;display:flex;gap:6px">'
     + '<input id="bcode" placeholder="粘贴回调地址或 code" style="flex:1;padding:6px 8px;border-radius:6px;'
-    + 'border:1px solid #2c3a52;background:#0e1524;color:#e8eef7;font-size:12px">'
+    + 'border:1px solid #2a2e33;background:#1b1e22;color:#e8e6e3;font-size:12px">'
     + '<button onclick="bungieManual()">完成授权</button></div>'
     + '<div class="dim" id="bmsg" style="margin-top:6px"></div>'
     + '<div class="dim" style="margin-top:4px;word-break:break-all">程序使用的回调地址：<code>'
@@ -505,33 +505,33 @@ async def bot_groups_save(request: dict):
 INDEX = """<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>D2 查询</title>
 <style>
-body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;
-     display:flex;flex-direction:column;align-items:center;padding:24px;color:#cfd8e3}
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;
+     display:flex;flex-direction:column;align-items:center;padding:24px;color:#c5cacd}
 .bar{display:flex;gap:10px;margin-bottom:12px}
-input,button{padding:10px 14px;border-radius:8px;border:1px solid #2c3a52;
-     background:#141c2e;color:#e8eef7;font-size:15px;outline:none}
-button{background:#2f6fed;border:none;cursor:pointer;font-weight:bold}
-button:hover{background:#4a83f5}
+input,button{padding:10px 14px;border-radius:8px;border:1px solid #2a2e33;
+     background:#16181b;color:#e8e6e3;font-size:15px;outline:none}
+button{background:#35c66b;border:none;cursor:pointer;font-weight:bold}
+button:hover{background:#4b8fd4}
 #tabs{display:none;flex-wrap:wrap;gap:8px;margin-bottom:14px;justify-content:center}
-#tabs button{background:#141c2e;font-weight:normal;font-size:14px}
-#tabs button.on{background:#2f6edb;font-weight:bold}
+#tabs button{background:#16181b;font-weight:normal;font-size:14px}
+#tabs button.on{background:#35c66b;font-weight:bold}
 #scopebar{display:none;gap:10px;margin-bottom:14px;align-items:center;
-     color:#8fa3bd;font-size:13px;flex-wrap:wrap;justify-content:center}
-#scopebar select{padding:8px 12px;border-radius:8px;border:1px solid #2c3a52;
-     background:#141c2e;color:#e8eef7;font-size:13px;outline:none;max-width:360px}
-.tlabel{color:#8fa3bd;font-size:13px}
-.sugrow{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;color:#e8eef7}
-.sugrow:hover{background:#1c2942}
+     color:#9aa0a6;font-size:13px;flex-wrap:wrap;justify-content:center}
+#scopebar select{padding:8px 12px;border-radius:8px;border:1px solid #2a2e33;
+     background:#16181b;color:#e8e6e3;font-size:13px;outline:none;max-width:360px}
+.tlabel{color:#9aa0a6;font-size:13px}
+.sugrow{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;color:#e8e6e3}
+.sugrow:hover{background:#1b1e22}
 .sugrow img{width:28px;height:28px;border-radius:4px}
-.sugcode{color:#5ea8ff}
+.sugcode{color:#4b8fd4}
 iframe{width:760px;height:900px;border:none;border-radius:12px;display:none}
-#tip{color:#7a8aa0;margin-top:10px}
+#tip{color:#6d737b;margin-top:10px}
 </style></head><body>
 __NAV__
 <div class="bar" style="position:relative">
   <input id="name" placeholder="玩家名#编号，如 Wj#8984" size="44" autocomplete="off">
   <button onclick="go()">查询</button>
-  <div id="sug" style="display:none;position:absolute;top:44px;left:0;width:100%;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;z-index:9"></div>
+  <div id="sug" style="display:none;position:absolute;top:44px;left:0;width:100%;background:#16181b;border:1px solid #2a2e33;border-radius:8px;z-index:9"></div>
 </div>
 <div id="tabs">
   <button data-m="all" class="on">总览</button>
@@ -554,9 +554,9 @@ __NAV__
   <select id="scope_pve" data-for="wpve">__SCOPES_PVE__</select>
   <span>（要逐场拉对局详情；拉过的场次会缓存，换赛季/换人很快）</span>
 </div>
-<div id="bar" style="display:none;width:760px;height:26px;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;margin-bottom:12px;position:relative;overflow:hidden">
-<div id="barfill" style="height:100%;width:0;background:linear-gradient(90deg,#2f6edb,#5ea8ff);transition:width .4s"></div>
-<span id="bartxt" style="position:absolute;left:0;right:0;top:0;bottom:0;text-align:center;line-height:26px;font-size:13px;color:#e8eef7">加载中…</span>
+<div id="bar" style="display:none;width:760px;height:26px;background:#16181b;border:1px solid #2a2e33;border-radius:8px;margin-bottom:12px;position:relative;overflow:hidden">
+<div id="barfill" style="height:100%;width:0;background:linear-gradient(90deg,#35c66b,#4b8fd4);transition:width .4s"></div>
+<span id="bartxt" style="position:absolute;left:0;right:0;top:0;bottom:0;text-align:center;line-height:26px;font-size:13px;color:#e8e6e3">加载中…</span>
 </div>
 <iframe id="card"></iframe>
 <div id="tip">输入 ID 查询后，用上方标签切换该玩家的各项数据（已查看过的标签秒开）；武器/Perk 查询随时可用，无需先查玩家</div>
@@ -838,10 +838,10 @@ async def perks_page(q: str = ""):
 
 
 def card_page(html: str, active: str, extra: str = "") -> HTMLResponse:
-    """把 bot_cards 的卡片 HTML 当网页来用：卡片是按 760px 定宽出图的（body{width:760px}），
+    """把 bot_cards 的卡片 HTML 当网页来用：卡片是按 900px 定宽出图的（body{width:900px}），
     直接打开会贴在左上角、导航挤成两行。这里补一层网页外壳——顶部导航 + 居中定宽内容列，
     与其余页面保持一致。extra 插在导航之后、卡片之前（如套装页的搜索框/分类筛选）。"""
-    shell = ("<style>body{width:auto;max-width:800px;margin:0 auto;padding:24px 20px}"
+    shell = ("<style>body{width:auto;max-width:940px;margin:0 auto;padding:24px 12px 38px}"
              "</style>")
     html = html.replace("</head>", shell + "</head>", 1)
     return HTMLResponse(html.replace('<div class="card">', navbar(active) + extra + '<div class="card">', 1))
@@ -857,7 +857,7 @@ async def eververse_page(force: int = 0):
     except Exception as exc:  # noqa: BLE001
         return err_page("光尘商店获取失败",
                         "读取 Bungie 商店接口失败，稍后刷新重试。<br>"
-                        f"<span style='color:#8fa3bd'>{d2.esc_err(exc)}</span>")
+                        f"<span style='color:#9aa0a6'>{d2.esc_err(exc)}</span>")
     return card_page(bot_cards.eververse_card(store), "/eververse")
 
 
@@ -869,7 +869,7 @@ async def rotation_page(force: int = 0):
     except Exception as exc:  # noqa: BLE001
         return err_page("本周轮换获取失败",
                         "读取 Bungie 里程碑接口失败，稍后刷新重试。<br>"
-                        f"<span style='color:#8fa3bd'>{d2.esc_err(exc)}</span>")
+                        f"<span style='color:#9aa0a6'>{d2.esc_err(exc)}</span>")
     return card_page(bot_cards.rotation_card(rot), "/rotation")
 
 
@@ -912,9 +912,9 @@ async def armorsets_page(q: str = "", cat: str = ""):
 
 # ---------- Bungie 账号授权（读实时商店等需要登录的接口） ----------
 def needs_bungie_page() -> str:
-    return ("<div style='font:14px/1.8 sans-serif;color:#cfd8e3;padding:20px;max-width:640px'>"
-            "<h2 style='color:#e8eef7'>需要先授权 Bungie 账号</h2>"
-            "光尘商店是「登录后才能读」的接口，请到 <a style='color:#5ea8ff' href='/panel'>Bot 面板</a> "
+    return ("<div style='font:14px/1.8 sans-serif;color:#c5cacd;padding:20px;max-width:640px'>"
+            "<h2 style='color:#e8e6e3'>需要先授权 Bungie 账号</h2>"
+            "光尘商店是「登录后才能读」的接口，请到 <a style='color:#4b8fd4' href='/panel'>Bot 面板</a> "
             "点「授权 Bungie 账号」。</div>")
 
 
@@ -927,12 +927,12 @@ def bungie_status():
 def bungie_authorize():
     if not bungie_auth.configured():
         return HTMLResponse(
-            "<div style='font:14px/1.9 sans-serif;color:#cfd8e3;padding:20px;max-width:680px'>"
-            "<h2 style='color:#e8eef7'>还没配置 Bungie 应用</h2>"
+            "<div style='font:14px/1.9 sans-serif;color:#c5cacd;padding:20px;max-width:680px'>"
+            "<h2 style='color:#e8e6e3'>还没配置 Bungie 应用</h2>"
             "在项目 <code>.env</code> 里补上：<br><br>"
             "<code>BUNGIE_CLIENT_ID=...</code><br><code>BUNGIE_CLIENT_SECRET=...</code><br>"
             "<code>BUNGIE_REDIRECT_URI=https://127.0.0.1:8902/bungie/callback</code><br><br>"
-            "到 <a style='color:#5ea8ff' href='https://www.bungie.net/zh-chs/Application' "
+            "到 <a style='color:#4b8fd4' href='https://www.bungie.net/zh-chs/Application' "
             "target='_blank'>bungie.net/zh-chs/Application</a> 打开你的应用（有 API Key 的那个）："
             "「开放授权客户端类型」选 <b>机密</b>，Redirect URL 填上面那行（Bungie 只收 https，"
             "填 http 会报「必须使用 http 以外的通信架构」），保存后把 Client ID / Client Secret "
@@ -966,7 +966,7 @@ async def bungie_callback(request: Request, code: str = "", state: str = "", err
         from urllib.parse import quote
         return RedirectResponse(f"/dim/authReturn.html?code={quote(code)}&state={quote(state)}")
     back = ("<div style='margin-top:14px'><a href='/panel' "
-            "style='color:#5ea8ff;font:14px sans-serif'>← 返回面板</a></div>")
+            "style='color:#4b8fd4;font:14px sans-serif'>← 返回面板</a></div>")
     if error or not code:
         return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>{back}")
     if not bungie_auth.check_state(state):
@@ -978,8 +978,8 @@ async def bungie_callback(request: Request, code: str = "", state: str = "", err
         await bungie_auth.exchange(code, ru)
     except Exception as exc:  # noqa: BLE001
         return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}")
-    return HTMLResponse("<h2 style='color:#7dff9c;font-family:sans-serif'>授权成功</h2>"
-                        "<div style='font:14px sans-serif;color:#cfd8e3'>可以关闭本页，回到面板或直接发 "
+    return HTMLResponse("<h2 style='color:#35c66b;font-family:sans-serif'>授权成功</h2>"
+                        "<div style='font:14px sans-serif;color:#c5cacd'>可以关闭本页，回到面板或直接发 "
                         "<code>/每日光尘</code>。</div>"
                         "<script>setTimeout(function(){location.href='/panel'},2500)</script>" + back)
 
@@ -1077,14 +1077,14 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
             f".rrow{{align-items:flex-start}}"
             f".rin{{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}}"
             f".rname{{display:flex;align-items:center;gap:8px;font-size:15px}}"
-            f".rdiff{{color:#8fa3bd;font-size:11px}}"
+            f".rdiff{{color:#9aa0a6;font-size:11px}}"
             f".rbads{{display:flex;flex-wrap:wrap;gap:5px}}"
             f".bd{{display:inline-flex;align-items:center;gap:4px;font-size:11px;border-radius:5px;"
-            f"padding:2px 7px;background:rgba(255,255,255,.05);color:#c6d2e2}}"
+            f"padding:2px 7px;background:rgba(255,255,255,.05);color:#c5cacd}}"
             f".bd b{{font-size:12px}}"
             f".bd.off{{opacity:.32}}"
-            f".bd.pl b{{color:#e8eef7}}.bd.cl b{{color:#7dff9c}}.bd.fw b{{color:#ffd76e}}.bd.ms b{{color:#ff8d85}}"
-            f".bd.lm b{{color:#5ea8ff}}.bd.sf b{{color:#c79bff}}"
+            f".bd.pl b{{color:#e8e6e3}}.bd.cl b{{color:#35c66b}}.bd.fw b{{color:#d4b26a}}.bd.ms b{{color:#ff8d85}}"
+            f".bd.lm b{{color:#4b8fd4}}.bd.sf b{{color:#9b6bd4}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1163,9 +1163,9 @@ def render_history_card(rep: dict) -> str:
             ".hname{font-size:14px;font-weight:600;margin-bottom:2px}"
             ".hcols{display:grid;grid-template-columns:repeat(4,minmax(46px,auto));gap:0 13px;"
             "text-align:right;flex-shrink:0}"
-            ".hcol span{display:block;color:#8fa3bd;font-size:11px;line-height:1.5}"
-            ".hcol b{font-size:14px;color:#e8eef7;line-height:1.4}"
-            ".hcol.hl b{color:#7dff9c}"
+            ".hcol span{display:block;color:#9aa0a6;font-size:11px;line-height:1.5}"
+            ".hcol b{font-size:14px;color:#e8e6e3;line-height:1.4}"
+            ".hcol.hl b{color:#35c66b}"
             "</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1182,7 +1182,7 @@ def render_patterns(rep: dict) -> str:
     sections = ""
     for g, items in groups.items():
         done = sum(1 for i in items if i["completed"])
-        color = "#7dff9c" if done == len(items) else "#ffd76e"
+        color = "#35c66b" if done == len(items) else "#d4b26a"
         # 称号里只有一部分可镀金，组标题单独给出镀金进度
         gildable = [i for i in items if i.get("can_gild")]
         gild_note = ""
@@ -1233,33 +1233,33 @@ def render_patterns(rep: dict) -> str:
             f"{sections}"
             f"<style>"
             f".phead{{display:flex;align-items:center;gap:8px;margin:16px 0 8px;font-size:15px;"
-            f"font-weight:bold;color:#e8eef7}}"
-            f".paccent{{width:4px;height:16px;border-radius:2px;background:#2f6edb}}"
+            f"font-weight:bold;color:#e8e6e3}}"
+            f".paccent{{width:4px;height:16px;border-radius:2px;background:#35c66b}}"
             f".pcount{{margin-left:auto;font-size:13px}}"
             f".pgrid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(214px,1fr));gap:6px}}"
-            f".pcard{{display:flex;align-items:center;gap:8px;background:#141c2e;"
-            f"border:1px solid #22304a;border-radius:8px;padding:6px 8px;min-width:0}}"
-            f".pcard.on{{border-color:rgba(55,192,110,.35)}}"
+            f".pcard{{display:flex;align-items:center;gap:8px;background:#16181b;"
+            f"border:1px solid #2a2e33;border-radius:8px;padding:6px 8px;min-width:0}}"
+            f".pcard.on{{border-color:rgba(53,198,107,.35)}}"
             f".pcard.off{{opacity:.45}}"
-            f".pcard.gold{{border-color:rgba(255,215,110,.55);"
-            f"background:linear-gradient(150deg,rgba(255,215,110,.10),#141c2e 60%)}}"
-            f".pcard img{{width:36px;height:36px;border-radius:6px;background:#0b0f19;flex-shrink:0}}"
-            f".pcard img.gild{{box-shadow:0 0 0 2px #ffd76e,0 0 8px rgba(255,215,110,.55)}}"
-            f".pcard img.gildable{{box-shadow:0 0 0 2px rgba(255,215,110,.38)}}"
+            f".pcard.gold{{border-color:rgba(212,178,106,.55);"
+            f"background:linear-gradient(150deg,rgba(212,178,106,.10),#16181b 60%)}}"
+            f".pcard img{{width:36px;height:36px;border-radius:6px;background:#0f1113;flex-shrink:0}}"
+            f".pcard img.gild{{box-shadow:0 0 0 2px #d4b26a,0 0 8px rgba(212,178,106,.55)}}"
+            f".pcard img.gildable{{box-shadow:0 0 0 2px rgba(212,178,106,.38)}}"
             f".pinfo{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}"
             f".pname{{font-size:12px;line-height:1.3;"
             f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
-            f".psub{{color:#8fa3bd;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
-            f".psub b{{color:#e8eef7}}"
-            f".pbar{{display:block;height:3px;border-radius:2px;background:#22304a;overflow:hidden}}"
-            f".pbar i{{display:block;height:100%;background:linear-gradient(90deg,#2f6edb,#7dff9c)}}"
+            f".psub{{color:#9aa0a6;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
+            f".psub b{{color:#e8e6e3}}"
+            f".pbar{{display:block;height:3px;border-radius:2px;background:#2a2e33;overflow:hidden}}"
+            f".pbar i{{display:block;height:100%;background:linear-gradient(90deg,#35c66b,#35c66b)}}"
             f".ptags{{display:flex;flex-direction:column;align-items:flex-end;gap:3px;flex-shrink:0}}"
             f".ptag{{font-size:10px;line-height:1.5;border-radius:4px;padding:0 5px;flex-shrink:0;white-space:nowrap}}"
-            f".ptag.got{{color:#7dff9c;background:rgba(55,192,110,.15)}}"
-            f".ptag.gold{{color:#141c2e;background:#ffd76e;font-weight:bold}}"
-            f".ptag.gild{{color:#ffd76e;background:transparent;border:1px solid rgba(255,215,110,.5)}}"
-            f".ptag.not{{color:#999;background:rgba(120,120,120,.15)}}"
-            f".pgildcount{{color:#ffd76e;font-size:12px;font-weight:normal;margin-left:2px}}"
+            f".ptag.got{{color:#35c66b;background:rgba(53,198,107,.15)}}"
+            f".ptag.gold{{color:#16181b;background:#d4b26a;font-weight:bold}}"
+            f".ptag.gild{{color:#d4b26a;background:transparent;border:1px solid rgba(212,178,106,.5)}}"
+            f".ptag.not{{color:#999;background:rgba(154,160,166,.15)}}"
+            f".pgildcount{{color:#d4b26a;font-size:12px;font-weight:normal;margin-left:2px}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1306,7 +1306,7 @@ def render_wpvp(rep: dict) -> str:
                 f"<b>{val}</b>{sub_html}</div>")
 
     rows = ""
-    medal = ["#ffd76e", "#cfd8e3", "#e0965a"]
+    medal = ["#d4b26a", "#c5cacd", "#e0965a"]
     for i, w in enumerate(weapons):
         rank = (f"<span class='rk' style='color:{medal[i]};border-color:{medal[i]}'>{i + 1}</span>"
                 if i < 3 else f"<span class='rk'>{i + 1}</span>")
@@ -1355,35 +1355,35 @@ def render_wpvp(rep: dict) -> str:
                "Bungie 不逐把归属，所以武器击杀占比通常在 50%~65%。" if kind == "pve" else "") +
             f"</div>"
             f"<style>"
-            f".sl{{color:#5ea8ff}}"
+            f".sl{{color:#4b8fd4}}"
             f".chips{{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px}}"
-            f".chip{{background:#141c2e;border:1px solid #22304a;border-radius:8px;padding:7px 8px;"
+            f".chip{{background:#16181b;border:1px solid #2a2e33;border-radius:8px;padding:7px 8px;"
             f"text-align:center;display:flex;flex-direction:column;line-height:1.35}}"
-            f".chip .clab{{color:#8fa3bd;font-size:11px}}"
-            f".chip b{{color:#e8eef7;font-size:17px}}"
-            f".chip .csub{{color:#8fa3bd;font-size:11px}}"
-            f".chip.acc{{border-color:rgba(255,215,110,.45)}}"
-            f".chip.acc b{{color:#ffd76e}}"
+            f".chip .clab{{color:#9aa0a6;font-size:11px}}"
+            f".chip b{{color:#e8e6e3;font-size:17px}}"
+            f".chip .csub{{color:#9aa0a6;font-size:11px}}"
+            f".chip.acc{{border-color:rgba(212,178,106,.45)}}"
+            f".chip.acc b{{color:#d4b26a}}"
             f".whead{{display:grid;grid-template-columns:34px 40px minmax(0,1fr) 130px 38px 38px 44px 42px 44px;"
-            f"gap:5px;align-items:center;color:#8fa3bd;font-size:11px;padding:0 8px 6px;"
-            f"border-bottom:1px solid #22304a}}"
+            f"gap:5px;align-items:center;color:#9aa0a6;font-size:11px;padding:0 8px 6px;"
+            f"border-bottom:1px solid #2a2e33}}"
             f".wrow{{display:grid;grid-template-columns:34px 40px minmax(0,1fr) 130px 38px 38px 44px 42px 44px;"
-            f"gap:5px;align-items:center;background:#141c2e;border:1px solid #22304a;border-radius:8px;"
+            f"gap:5px;align-items:center;background:#16181b;border:1px solid #2a2e33;border-radius:8px;"
             f"padding:7px 8px;margin:5px 0}}"
-            f".wrow:hover{{border-color:#2f6edb}}"
+            f".wrow:hover{{border-color:#35c66b}}"
             f".rk{{display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;"
-            f"border:1px solid #2c3a52;border-radius:6px;font-size:12px;color:#8fa3bd}}"
-            f".wrow img{{width:40px;height:40px;border-radius:6px;background:#0b0f19}}"
+            f"border:1px solid #2a2e33;border-radius:6px;font-size:12px;color:#9aa0a6}}"
+            f".wrow img{{width:40px;height:40px;border-radius:6px;background:#0f1113}}"
             f".wn{{display:flex;flex-direction:column;line-height:1.4;min-width:0}}"
             f".wn b{{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
-            f".wtype{{color:#8fa3bd;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
-            f".kbar{{position:relative;height:18px;background:#0b0f19;border-radius:5px;overflow:hidden}}"
-            f".kfill{{height:100%;background:linear-gradient(90deg,#2f6edb,#ffd76e);border-radius:5px}}"
+            f".wtype{{color:#9aa0a6;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
+            f".kbar{{position:relative;height:18px;background:#0f1113;border-radius:5px;overflow:hidden}}"
+            f".kfill{{height:100%;background:linear-gradient(90deg,#35c66b,#d4b26a);border-radius:5px}}"
             f".kn{{position:absolute;left:0;right:0;top:0;bottom:0;text-align:center;line-height:18px;"
-            f"font-size:12px;color:#e8eef7}}"
+            f"font-size:12px;color:#e8e6e3}}"
             f".wstat{{font-size:12px;text-align:right}}"
-            f".wstat.dim{{color:#8fa3bd}}"
-            f".wstat.hs{{color:#ffd76e}}"
+            f".wstat.dim{{color:#9aa0a6}}"
+            f".wstat.hs{{color:#d4b26a}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1436,20 +1436,20 @@ def render_gm(rep: dict) -> str:
             f"最快 / 平均只统计通关场次；进度与镀金次数来自游戏内成就记录。</div>")
     style = (f"<style>"
              f".chips{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}}"
-             f".chip{{display:flex;align-items:center;gap:6px;background:#141c2e;"
-             f"border:1px solid #22304a;border-radius:8px;padding:7px 10px;font-size:13px}}"
-             f".chip .clab{{color:#8fa3bd;font-size:11px}}"
-             f".chip .csub{{color:#8fa3bd;font-size:11px}}"
-             f".chip b{{color:#ffd76e}}"
-             f".grow{{display:flex;align-items:center;gap:12px;background:#141c2e;"
-             f"border:1px solid #22304a;border-radius:8px;padding:8px 12px;margin:6px 0}}"
-             f".grow:hover{{border-color:#2f6edb}}"
+             f".chip{{display:flex;align-items:center;gap:6px;background:#16181b;"
+             f"border:1px solid #2a2e33;border-radius:8px;padding:7px 10px;font-size:13px}}"
+             f".chip .clab{{color:#9aa0a6;font-size:11px}}"
+             f".chip .csub{{color:#9aa0a6;font-size:11px}}"
+             f".chip b{{color:#d4b26a}}"
+             f".grow{{display:flex;align-items:center;gap:12px;background:#16181b;"
+             f"border:1px solid #2a2e33;border-radius:8px;padding:8px 12px;margin:6px 0}}"
+             f".grow:hover{{border-color:#35c66b}}"
              f".tier{{flex:0 0 44px;text-align:center;font-size:12px;border-radius:6px;"
-             f"padding:3px 0;border:1px solid #2c3a52;color:#8fa3bd}}"
+             f"padding:3px 0;border:1px solid #2a2e33;color:#9aa0a6}}"
              f".tier.ut{{color:#ff9de2;border-color:#ff9de2}}"
-             f".tier.gm{{color:#ffd76e;border-color:#ffd76e}}"
-             f".tier.ms{{color:#b18cff;border-color:#b18cff}}"
-             f".tier.ex{{color:#5ea8ff;border-color:#5ea8ff}}"
+             f".tier.gm{{color:#d4b26a;border-color:#d4b26a}}"
+             f".tier.ms{{color:#9b6bd4;border-color:#9b6bd4}}"
+             f".tier.ex{{color:#4b8fd4;border-color:#4b8fd4}}"
              f".gn{{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.5}}"
              f".gs{{flex:0 0 200px;font-size:13px}}"
              f".gt{{flex:0 0 200px;font-size:13px;text-align:right;white-space:nowrap}}"
@@ -1552,7 +1552,7 @@ def render_heat(rep: dict) -> str:
     else:
         src = f"全历史重新统计，数据截至 <b>{esc(newest)}</b>" if newest else ""
     if src:
-        top += f"<div style='margin-top:4px;color:#5ea8ff'>{src}</div>"
+        top += f"<div style='margin-top:4px;color:#4b8fd4'>{src}</div>"
 
     body = (f"<h1>{rep['display']}</h1>"
             f"<div class='sub'>赛季活跃度日历 · 全历史按天聚合 · 同一赛季同一颜色，越亮玩得越久</div>"
@@ -1560,22 +1560,22 @@ def render_heat(rep: dict) -> str:
             f"{parts}"
             f"<style>"
             f".shead{{display:flex;align-items:center;gap:8px;margin:16px 0 8px;"
-            f"font-size:14px;font-weight:bold;color:#e8eef7}}"
+            f"font-size:14px;font-weight:bold;color:#e8e6e3}}"
             f".sdot{{width:10px;height:10px;border-radius:3px}}"
-            f".hstat{{background:#141c2e;border:1px solid #22304a;border-radius:8px;"
-            f"padding:8px 12px;margin-bottom:4px;font-size:13px;color:#8fa3bd}}"
-            f".hstat b{{color:#ffd76e}}"
+            f".hstat{{background:#16181b;border:1px solid #2a2e33;border-radius:8px;"
+            f"padding:8px 12px;margin-bottom:4px;font-size:13px;color:#9aa0a6}}"
+            f".hstat b{{color:#d4b26a}}"
             f".mrow{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}"
-            f".mcal{{background:#141c2e;border:1px solid #22304a;border-radius:10px;"
+            f".mcal{{background:#16181b;border:1px solid #2a2e33;border-radius:10px;"
             f"padding:8px;box-sizing:border-box;min-width:0}}"
             f".mtitle{{font-size:13px;font-weight:bold;text-align:center}}"
-            f".msub{{color:#8fa3bd;font-size:11px;text-align:center;line-height:1.5}}"
-            f".msub2{{color:#5ea8ff;font-size:11px;text-align:center;line-height:1.5;"
+            f".msub{{color:#9aa0a6;font-size:11px;text-align:center;line-height:1.5}}"
+            f".msub2{{color:#4b8fd4;font-size:11px;text-align:center;line-height:1.5;"
             f"margin-bottom:6px}}"
             f".mgrid{{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}}"
-            f".mh{{color:#5a6b84;font-size:9px;text-align:center;line-height:1.3}}"
+            f".mh{{color:#6d737b;font-size:9px;text-align:center;line-height:1.3}}"
             f".mo{{aspect-ratio:1}}"
-            f".md{{aspect-ratio:1;border-radius:3px;background:#1a2438}}"
+            f".md{{aspect-ratio:1;border-radius:3px;background:#1b1e22}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1626,70 +1626,70 @@ async def pgcr_page(instance: str) -> str:
 
 CATALOG_PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>武器图鉴</title>
 <style>
-body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;color:#e8eef7;
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;
      display:flex;flex-direction:column;align-items:center;padding:20px}
 .wrap{width:100%;max-width:1440px}
 .hd{display:flex;align-items:flex-end;gap:10px;margin:0 0 12px}
 h1{font-size:22px;margin:0}
-.hd .sub{color:#6f86a6;font-size:11px;letter-spacing:2px;padding-bottom:3px}
+.hd .sub{color:#9aa0a6;font-size:11px;letter-spacing:2px;padding-bottom:3px}
 .bar{display:flex;gap:10px;margin:10px 0 12px}
-input{flex:1;padding:9px 14px;border-radius:8px;border:1px solid #2c3a52;background:#141c2e;
-      color:#e8eef7;font-size:14px;outline:none}
-input:focus{border-color:#5ea8ff}
-button,a.btn{padding:9px 14px;border-radius:8px;border:1px solid #2c3a52;background:#141c2e;
-      color:#cfd8e3;font-size:13.5px;cursor:pointer;text-decoration:none;white-space:nowrap;font-family:inherit}
-button:hover,a.btn:hover{border-color:#5ea8ff;color:#fff}
-.facets{background:#101728;border:1px solid #1e2b42;border-radius:12px;padding:8px 12px;margin-bottom:10px}
+input{flex:1;padding:9px 14px;border-radius:8px;border:1px solid #2a2e33;background:#16181b;
+      color:#e8e6e3;font-size:14px;outline:none}
+input:focus{border-color:#4b8fd4}
+button,a.btn{padding:9px 14px;border-radius:8px;border:1px solid #2a2e33;background:#16181b;
+      color:#c5cacd;font-size:13.5px;cursor:pointer;text-decoration:none;white-space:nowrap;font-family:inherit}
+button:hover,a.btn:hover{border-color:#4b8fd4;color:#fff}
+.facets{background:#0f1113;border:1px solid #1b1e22;border-radius:12px;padding:8px 12px;margin-bottom:10px}
 .fhdr{display:flex;justify-content:space-between;align-items:center;padding:0 0 5px}
-.fhdr b{color:#8fb6ff;font-size:12px;letter-spacing:1px}
+.fhdr b{color:#7fb2e8;font-size:12px;letter-spacing:1px}
 .facets.min .frow{display:none}
-.frow{display:flex;gap:8px;align-items:flex-start;padding:3px 0;border-bottom:1px dashed #1b263a}
+.frow{display:flex;gap:8px;align-items:flex-start;padding:3px 0;border-bottom:1px dashed #1b1e22}
 .frow:last-child{border-bottom:none}
-.flab{width:40px;flex:0 0 auto;color:#6f86a6;font-size:11px;padding-top:5px;letter-spacing:1px}
+.flab{width:40px;flex:0 0 auto;color:#9aa0a6;font-size:11px;padding-top:5px;letter-spacing:1px}
 .fchips{display:flex;flex-wrap:wrap;gap:5px;flex:1}
-.fc{background:#141c2e;border:1px solid #22304a;border-radius:12px;padding:3px 9px;font-size:12px;
-    color:#cfd8e3;cursor:pointer;user-select:none;white-space:nowrap}
-.fc:hover{border-color:#5ea8ff}
-.fc.on{background:#2a2413;border-color:#ffd76e;color:#ffd76e;font-weight:700}
+.fc{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:3px 9px;font-size:12px;
+    color:#c5cacd;cursor:pointer;user-select:none;white-space:nowrap}
+.fc:hover{border-color:#4b8fd4}
+.fc.on{background:#2b2417;border-color:#d4b26a;color:#d4b26a;font-weight:700}
 .fc.z{opacity:.3}
-.fc .n{color:#6f86a6;font-size:10.5px;margin-left:4px;font-style:normal}
-.fc.on .n{color:#e0b95a}
+.fc .n{color:#9aa0a6;font-size:10.5px;margin-left:4px;font-style:normal}
+.fc.on .n{color:#d4b26a}
 .fdot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:1px}
-.fmore{color:#5ea8ff;font-size:11.5px;cursor:pointer;padding:4px 4px}
+.fmore{color:#4b8fd4;font-size:11.5px;cursor:pointer;padding:4px 4px}
 .fmore:hover{text-decoration:underline}
-.rsbar{display:flex;align-items:center;gap:12px;margin:0 0 10px;color:#8fa3bd;font-size:13px}
-.rsbar b{color:#ffd76e}
-select{padding:6px 10px;border-radius:7px;border:1px solid #2c3a52;background:#141c2e;color:#cfd8e3;
+.rsbar{display:flex;align-items:center;gap:12px;margin:0 0 10px;color:#9aa0a6;font-size:13px}
+.rsbar b{color:#d4b26a}
+select{padding:6px 10px;border-radius:7px;border:1px solid #2a2e33;background:#16181b;color:#c5cacd;
        font-size:13px;font-family:inherit}
 .wggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(254px,1fr));gap:10px}
-.wgcard{box-sizing:border-box;background:#141c2e;border:1px solid #22304a;border-radius:10px;padding:8px 9px;
-        text-decoration:none;color:#e8eef7;display:flex;align-items:center;gap:9px;
+.wgcard{box-sizing:border-box;background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:8px 9px;
+        text-decoration:none;color:#e8e6e3;display:flex;align-items:center;gap:9px;
         cursor:pointer;position:relative;overflow:hidden}
-.wgcard:hover{border-color:#2f6edb;background:#16203a}
+.wgcard:hover{border-color:#35c66b;background:#16181b}
 /* 赛季水印只取左边缘那条竖带（Manifest 水印的有效像素就在左侧），单独裁成一条 spine；
    整张盖在图标上会把武器压住 → 现在武器 100% 可见 */
-.wmslice{width:20px;height:56px;flex:0 0 auto;overflow:hidden;position:relative;background:#0e1524;
+.wmslice{width:20px;height:56px;flex:0 0 auto;overflow:hidden;position:relative;background:#1b1e22;
          border-radius:4px}
 .wmslice img{position:absolute;left:0;top:0;width:56px;height:56px}
-.wgicon{position:relative;width:56px;height:56px;flex:0 0 auto;background:#0e1524;border-radius:4px}
+.wgicon{position:relative;width:56px;height:56px;flex:0 0 auto;background:#1b1e22;border-radius:4px}
 .wgicon>img{width:56px;height:56px;object-fit:contain}
 .wgtxt{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
 .wgtxt b{font-size:13.5px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.m2{display:block;color:#8fa3bd;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m2{display:block;color:#9aa0a6;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .el{font-size:12px;font-weight:700}
-.craft{flex:0 0 auto;background:rgba(47,110,219,.22);border:1px solid #2f6edb;
-       color:#8fb6ff;border-radius:5px;font-size:10px;padding:1px 5px}
+.craft{flex:0 0 auto;background:rgba(47,110,219,.22);border:1px solid #35c66b;
+       color:#7fb2e8;border-radius:5px;font-size:10px;padding:1px 5px}
 #more{display:none;margin:16px auto;padding:10px 22px}
-.empty{color:#8fa3bd;padding:20px 0}
+.empty{color:#9aa0a6;padding:20px 0}
 .ov{position:fixed;inset:0;background:rgba(4,7,13,.84);display:none;z-index:99;
     align-items:center;justify-content:center}
 .ov.show{display:flex}
-.ovb{width:860px;max-width:96vw;height:92vh;background:#0b0f19;border:1px solid #2c3a52;border-radius:12px;
+.ovb{width:860px;max-width:96vw;height:92vh;background:#0f1113;border:1px solid #2a2e33;border-radius:12px;
      display:flex;flex-direction:column;overflow:hidden;box-shadow:0 18px 60px rgba(0,0,0,.7)}
-.ovh{display:flex;align-items:center;gap:12px;padding:9px 14px;background:#101728;border-bottom:1px solid #22304a}
+.ovh{display:flex;align-items:center;gap:12px;padding:9px 14px;background:#0f1113;border-bottom:1px solid #2a2e33}
 .ovh b{flex:1;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ovh .hint{color:#6f86a6;font-size:12px}
-#ovf{flex:1;border:0;background:#0b0f19}
+.ovh .hint{color:#9aa0a6;font-size:12px}
+#ovf{flex:1;border:0;background:#0f1113}
 </style></head><body>
 <div class="wrap">
 __NAV__
@@ -1720,7 +1720,7 @@ __NAV__
 <script>
 const ALIAS=__ALIAS__;
 const TIER={6:'异域',5:'传说',4:'稀有',3:'罕见',2:'普通'};
-const ELCLR={电弧:'#7fe3ff',烈日:'#ff9d6e',虚空:'#b79cff',冰影:'#8fd8ff',缚丝:'#7dff9c',动能:'#cfd8e3'};
+const ELCLR={电弧:'#7fe3ff',烈日:'#ff9d6e',虚空:'#9b6bd4',冰影:'#8fd8ff',缚丝:'#35c66b',动能:'#c5cacd'};
 const DIMS=[{k:'t',lab:'类型'},{k:'f',lab:'框架'},{k:'e',lab:'元素'},
             {k:'a',lab:'弹药'},{k:'c',lab:'槽位'},{k:'q',lab:'品质'}];
 const SHOW=12, STEP=160;
@@ -1790,7 +1790,7 @@ function drawFacets(){
     let cs=`<span class="fc" data-all="${dim.k}">全部<i class="n">${qn}</i></span>`;
     shown.forEach(v=>{
       const n=c[v]||0, on=F[dim.k].has(v);
-      const dot=dim.k==='e'?`<i class="fdot" style="background:${ELCLR[v]||'#8fa3bd'}"></i>`:'';
+      const dot=dim.k==='e'?`<i class="fdot" style="background:${ELCLR[v]||'#9aa0a6'}"></i>`:'';
       cs+=`<span class="fc${on?' on':''}${n?'':' z'}" data-d="${dim.k}" data-v="${esc(v)}">${dot}${esc(lab(dim.k,v))}<i class="n">${n}</i></span>`;
     });
     if(vals.length>SHOW)cs+=`<span class="fmore" data-more="${dim.k}">${open?'收起':('展开全部 '+vals.length)}</span>`;
@@ -1815,7 +1815,7 @@ function sortList(l){
 function card(it){
   const d=it.d, wm=d.w?`<span class="wmslice"><img loading="lazy" src="${esc(d.w)}"></span>`:'';
   const ec=ELCLR[d.e];
-  const el=d.e?`<span class="el" style="color:${ec||'#8fa3bd'}">◈ ${esc(d.e)}</span> · `:'';
+  const el=d.e?`<span class="el" style="color:${ec||'#9aa0a6'}">◈ ${esc(d.e)}</span> · `:'';
   const f2=[d.f,d.r?(d.r+' 射速'):''].filter(Boolean).join(' · ');
   return `<a class="wgcard" data-h="${esc(it.h)}" data-n="${esc(d.n)}">
     ${wm}<span class="wgicon"><img loading="lazy" src="${esc(d.i)}"></span>
@@ -1905,33 +1905,33 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeOv();});
 
 PERKS_PAGE = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Perk查询</title>
 <style>
-body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;color:#e8eef7;
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;
      display:flex;flex-direction:column;align-items:center;padding:24px}
 h1{font-size:22px}
 .bar{display:flex;gap:10px;margin:14px 0;position:relative}
-input,button{padding:10px 14px;border-radius:8px;border:1px solid #2c3a52;
-     background:#141c2e;color:#e8eef7;font-size:15px;outline:none}
-button{background:#2f6edb;border:none;cursor:pointer;font-weight:bold}
-#sug{position:absolute;top:46px;left:0;width:100%;background:#141c2e;border:1px solid #2c3a52;border-radius:8px;z-index:9}
-.sugrow{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;color:#e8eef7}
-.sugrow:hover{background:#1c2942}
+input,button{padding:10px 14px;border-radius:8px;border:1px solid #2a2e33;
+     background:#16181b;color:#e8e6e3;font-size:15px;outline:none}
+button{background:#35c66b;border:none;cursor:pointer;font-weight:bold}
+#sug{position:absolute;top:46px;left:0;width:100%;background:#16181b;border:1px solid #2a2e33;border-radius:8px;z-index:9}
+.sugrow{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;color:#e8e6e3}
+.sugrow:hover{background:#1b1e22}
 .sugrow img{width:32px;height:32px;object-fit:contain;border-radius:4px}
-.wcard{display:flex;gap:14px;background:#141c2e;border:1px solid #22304a;border-radius:10px;
+.wcard{display:flex;gap:14px;background:#16181b;border:1px solid #2a2e33;border-radius:10px;
        padding:12px 16px;margin:10px 0;width:680px}
 .wcard img{width:48px;height:48px;object-fit:contain;flex-shrink:0}
-.wcard p{margin:4px 0 0;color:#a8b8cc;font-size:13px}
+.wcard p{margin:4px 0 0;color:#9aa0a6;font-size:13px}
 .wcard .stats{margin-top:4px}
 .wcard .stats span{display:inline-block;margin-right:8px;padding:1px 6px;border-radius:4px;font-size:12px}
-.wcard .stats .up{background:rgba(55,192,110,.12);color:#7dff9c}
+.wcard .stats .up{background:rgba(53,198,107,.12);color:#35c66b}
 .wcard .stats .dn{background:rgba(217,72,63,.12);color:#ff8d85}
-.wcard .ci{margin-top:6px;padding:6px 8px;background:#0e1524;border-left:2px solid #2f6edb;
-       border-radius:4px;color:#9db4d0;font-size:12px;line-height:1.6;white-space:pre-wrap}
-.wcard .ci .cil{display:block;color:#5ea8ff;font-size:10px;letter-spacing:1px;margin-bottom:2px}
-.wcard .ci .enh{color:#ffd76e;font-weight:700;background:rgba(255,215,110,.14);border-radius:4px;padding:0 3px}
-.wcard .legend{color:#8fa3bd;font-size:11px;margin-top:3px}
-.wcard .vnote{margin:3px 0 0;color:#a8b8cc;font-size:13px}
-.wcard .vnote .dim{color:#8fa3bd}
-#empty{color:#8fa3bd}
+.wcard .ci{margin-top:6px;padding:6px 8px;background:#1b1e22;border-left:2px solid #35c66b;
+       border-radius:4px;color:#9aa0a6;font-size:12px;line-height:1.6;white-space:pre-wrap}
+.wcard .ci .cil{display:block;color:#4b8fd4;font-size:10px;letter-spacing:1px;margin-bottom:2px}
+.wcard .ci .enh{color:#d4b26a;font-weight:700;background:rgba(212,178,106,.14);border-radius:4px;padding:0 3px}
+.wcard .legend{color:#9aa0a6;font-size:11px;margin-top:3px}
+.wcard .vnote{margin:3px 0 0;color:#9aa0a6;font-size:13px}
+.wcard .vnote .dim{color:#9aa0a6}
+#empty{color:#9aa0a6}
 </style></head><body>
 __NAV__
 <h1>Perk 查询</h1>
@@ -1978,85 +1978,85 @@ def render_weapon_detail(w: dict, embed: bool = False) -> str:
 
 DETAIL_PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <style>
-body{margin:0 auto;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;color:#e8eef7;
+body{margin:0 auto;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;
      width:820px;box-sizing:border-box;padding:20px}
-a{color:#5ea8ff;text-decoration:none}
+a{color:#4b8fd4;text-decoration:none}
 .head{display:flex;align-items:center;gap:14px;margin:10px 0}
 .wi{position:relative;width:64px;height:64px;flex-shrink:0}
 .wi img{width:64px;height:64px;object-fit:contain}
 .wi .wm{position:absolute;left:0;top:0;width:64px;height:64px}
 h1{margin:0;font-size:26px}
-.meta{color:#5ea8ff;font-size:13px}
+.meta{color:#4b8fd4;font-size:13px}
 .shot{width:100%;max-height:190px;object-fit:cover;object-position:center;border-radius:10px;
-      border:1px solid #22304a;margin:12px 0 4px;display:block}
-.flavor{color:#9a7bff;font-style:italic;font-size:13px;margin:6px 0 14px}
-.sec{background:#101728;border:1px solid #1e2b42;border-radius:12px;padding:14px 16px;margin:12px 0}
-.sec > h2{font-size:14px;color:#8fb6ff;margin:0 0 12px;font-weight:700;letter-spacing:.5px;
+      border:1px solid #2a2e33;margin:12px 0 4px;display:block}
+.flavor{color:#9b6bd4;font-style:italic;font-size:13px;margin:6px 0 14px}
+.sec{background:#0f1113;border:1px solid #1b1e22;border-radius:12px;padding:14px 16px;margin:12px 0}
+.sec > h2{font-size:14px;color:#7fb2e8;margin:0 0 12px;font-weight:700;letter-spacing:.5px;
      display:flex;align-items:center;gap:8px}
-.sec > h2::before{content:'';width:3px;height:14px;border-radius:2px;background:#2f6edb}
+.sec > h2::before{content:'';width:3px;height:14px;border-radius:2px;background:#35c66b}
 .statwrap{display:grid;grid-template-columns:1fr 1fr;gap:2px 22px}
 .srow{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:13px}
-.sname{width:86px;color:#a8b8cc;text-align:right;flex-shrink:0}
-.sbar{flex:1;height:10px;background:#1a2438;border-radius:5px;overflow:hidden;display:flex}
+.sname{width:86px;color:#9aa0a6;text-align:right;flex-shrink:0}
+.sbar{flex:1;height:10px;background:#1b1e22;border-radius:5px;overflow:hidden;display:flex}
 .sbar i{display:block;height:100%}
-.sb{background:linear-gradient(90deg,#2f6edb,#5ea8ff)}
-.sg{background:#37c06e}
+.sb{background:linear-gradient(90deg,#35c66b,#4b8fd4)}
+.sg{background:#35c66b}
 .sr{background:#d9483f}
 .sval{width:62px;text-align:left;font-size:12px}
-.sval b{color:#ffd76e}
+.sval b{color:#d4b26a}
 /* 绝对数量（射速/弹匣/充能时间）不画条，跨两列单独写一行 */
 .plainstat{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:2px 20px;font-size:13px;
-  color:#a8b8cc;margin:0 0 7px}
-.plainstat b{color:#ffd76e;font-weight:700;margin-left:4px}
-.dplus{color:#7dff9c;font-size:11px}.dminus{color:#ff8d85;font-size:11px}
+  color:#9aa0a6;margin:0 0 7px}
+.plainstat b{color:#d4b26a;font-weight:700;margin-left:4px}
+.dplus{color:#35c66b;font-size:11px}.dminus{color:#ff8d85;font-size:11px}
 .cols{display:flex;gap:10px;overflow-x:auto;padding-bottom:4px}
 .mgrid{display:flex;flex-wrap:wrap;gap:8px}
 .mgrid .perk{width:100px;flex:0 0 auto}
-.catcard{display:flex;gap:10px;background:#0e1524;border:1px solid #22304a;border-radius:8px;
+.catcard{display:flex;gap:10px;background:#1b1e22;border:1px solid #2a2e33;border-radius:8px;
          padding:10px 12px;margin-bottom:8px}
 .catcard img{width:44px;height:44px;object-fit:contain;flex:0 0 auto}
 .catbody{flex:1;min-width:0}
-.cattop b{color:#5ea8ff;font-size:14px;margin-right:8px}
-.cattop .st{color:#ffd76e;font-weight:700;font-size:12.5px;margin-right:8px}
-.catfx{color:#cfd8e3;font-size:12.5px;line-height:1.6;margin-top:3px}
-.catfx b{color:#c9a6ff}
-.catci{color:#8fa3bd;font-size:12px;line-height:1.6;margin-top:4px;padding-top:4px;
-       border-top:1px dashed #2c3a52}
-.catunlock{color:#8fa3bd;font-size:12px;margin-top:3px}
+.cattop b{color:#4b8fd4;font-size:14px;margin-right:8px}
+.cattop .st{color:#d4b26a;font-weight:700;font-size:12.5px;margin-right:8px}
+.catfx{color:#c5cacd;font-size:12.5px;line-height:1.6;margin-top:3px}
+.catfx b{color:#9b6bd4}
+.catci{color:#9aa0a6;font-size:12px;line-height:1.6;margin-top:4px;padding-top:4px;
+       border-top:1px dashed #2a2e33}
+.catunlock{color:#9aa0a6;font-size:12px;margin-top:3px}
 .tcol{min-width:104px;flex:1;display:flex;flex-direction:column;gap:8px}
-.perk{background:#141c2e;border:1px solid #22304a;border-radius:8px;padding:8px 4px;
+.perk{background:#16181b;border:1px solid #2a2e33;border-radius:8px;padding:8px 4px;
       display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer}
 .perk img{width:34px;height:34px;object-fit:contain}
 .perk span{font-size:12px;text-align:center;line-height:1.3}
-.perk.sel{border-color:#ffd76e;background:#2a2413;box-shadow:0 0 6px rgba(255,215,110,.35)}
-.perk:hover{border-color:#5ea8ff}
+.perk.sel{border-color:#d4b26a;background:#2b2417;box-shadow:0 0 6px rgba(212,178,106,.35)}
+.perk:hover{border-color:#4b8fd4}
 .pst{display:flex;flex-wrap:wrap;gap:2px 6px;justify-content:center}
-.pst em{font-style:normal;font-size:11px;color:#7dff9c}
+.pst em{font-style:normal;font-size:11px;color:#35c66b}
 .pst em.dn{color:#ff8d85}
-.clabel{color:#6f86a6;font-size:11px;text-align:center;letter-spacing:.5px;padding-bottom:2px;
-      border-bottom:1px solid #1e2b42;margin-bottom:2px}
+.clabel{color:#9aa0a6;font-size:11px;text-align:center;letter-spacing:.5px;padding-bottom:2px;
+      border-bottom:1px solid #1b1e22;margin-bottom:2px}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
-.chip{display:flex;align-items:center;gap:6px;background:#0e1524;border:1px solid #22304a;
-      border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;color:#cfd8e3}
+.chip{display:flex;align-items:center;gap:6px;background:#1b1e22;border:1px solid #2a2e33;
+      border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;color:#c5cacd}
 .chip img{width:22px;height:22px;object-fit:contain}
-.chip:hover{border-color:#5ea8ff}
-.chip.on{border-color:#ffd76e;background:#2a2413}
-.chip .st{color:#7dff9c;font-size:11px}
+.chip:hover{border-color:#4b8fd4}
+.chip.on{border-color:#d4b26a;background:#2b2417}
+.chip .st{color:#35c66b;font-size:11px}
 .chip .st.dn{color:#ff8d85}
-.hidesec{border-color:#1e2b42;background:#0c1220}
-.hidesec > h2{cursor:pointer;color:#6f86a6}
-.empty{color:#6f86a6;font-size:12px}
-#tip{position:fixed;display:none;z-index:99;background:#0e1524;border:1px solid #2f6edb;
+.hidesec{border-color:#1b1e22;background:#0f1113}
+.hidesec > h2{cursor:pointer;color:#9aa0a6}
+.empty{color:#9aa0a6;font-size:12px}
+#tip{position:fixed;display:none;z-index:99;background:#1b1e22;border:1px solid #35c66b;
      border-radius:8px;padding:10px 12px;max-width:320px;font-size:12px;line-height:1.6;
-     color:#a8b8cc;pointer-events:none;box-shadow:0 6px 20px rgba(0,0,0,.6)}
-#tip b{color:#e8eef7;font-size:13px;display:block;margin-bottom:4px}
+     color:#9aa0a6;pointer-events:none;box-shadow:0 6px 20px rgba(0,0,0,.6)}
+#tip b{color:#e8e6e3;font-size:13px;display:block;margin-bottom:4px}
 #tip .tstats{margin-bottom:4px}
 #tip .tstats span{display:inline-block;margin:2px 8px 2px 0;padding:1px 6px;border-radius:4px;
-     background:rgba(55,192,110,.12);color:#7dff9c;font-size:11px}
+     background:rgba(53,198,107,.12);color:#35c66b;font-size:11px}
 #tip .tstats span.dn{background:rgba(217,72,63,.12);color:#ff8d85}
-#tip .tci{margin-top:6px;padding-top:6px;border-top:1px dashed #2c3a52;
-     color:#9db4d0;white-space:pre-wrap;font-size:11px}
-#tip .tcilabel{color:#5ea8ff;font-size:10px;letter-spacing:1px;display:block;margin-bottom:2px}
+#tip .tci{margin-top:6px;padding-top:6px;border-top:1px dashed #2a2e33;
+     color:#9aa0a6;white-space:pre-wrap;font-size:11px}
+#tip .tcilabel{color:#4b8fd4;font-size:10px;letter-spacing:1px;display:block;margin-bottom:2px}
 </style></head><body>
 __NAV__
 <a href="javascript:history.back()" class="backlnk" style="display:inline-block;margin-bottom:10px">← 返回搜索结果</a>
@@ -2337,11 +2337,11 @@ def render_breakdown(rep: dict) -> str:
     style = ("<style>"
              f".bhead,.brow{{display:grid;grid-template-columns:1fr 56px {'64px ' if comp else ''}64px 64px 76px;"
              f"gap:6px;align-items:center;font-size:13px}}"
-             f".bhead{{color:#8fa3bd;font-size:12px;padding:0 8px 6px;border-bottom:1px solid #22304a}}"
-             f".brow{{background:#141c2e;border:1px solid #22304a;border-radius:7px;padding:7px 8px;margin:5px 0}}"
+             f".bhead{{color:#9aa0a6;font-size:12px;padding:0 8px 6px;border-bottom:1px solid #2a2e33}}"
+             f".brow{{background:#16181b;border:1px solid #2a2e33;border-radius:7px;padding:7px 8px;margin:5px 0}}"
              f".brow span{{text-align:right}}"
              f".bname{{text-align:left!important;font-weight:bold}}"
-             f".wrg{{color:#7dff9c}}.wrb{{color:#ff8d85}}"
+             f".wrg{{color:#35c66b}}.wrb{{color:#ff8d85}}"
              f"</style>")
     return f"<h2>模式细分</h2>{head}{rows}{style}"
 
@@ -2382,90 +2382,91 @@ def render_match_card(rep: dict, title: str, mode: str, lifetime: dict | None = 
 
 CARD_CSS = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><base href="http://127.0.0.1:8900/">
 <style>
-body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0b0f19;color:#e8eef7;
-     width:760px;box-sizing:border-box;padding:20px}
-.card{background:linear-gradient(160deg,#141c2e,#0e1524);border:1px solid #2c3a52;
-      border-radius:14px;padding:22px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
-h1{margin:0 0 2px;font-size:24px}
-.title{color:#e8eef7;font-size:20px}
-.sub{color:#8fa3bd;font-size:13px;margin-bottom:16px}
-h2{font-size:15px;color:#5ea8ff;border-left:3px solid #2f6fed;padding-left:8px;margin:18px 0 8px}
-.row{display:flex;justify-content:space-between;padding:7px 10px;border-radius:6px;font-size:14px}
-.row:nth-child(odd){background:rgba(255,255,255,.04)}
-.row b{color:#ffd76e}
-.row.hl b{color:#7dff9c}
-.char{display:flex;align-items:center;gap:12px;background-size:cover;border-radius:8px;
-      padding:10px 14px;margin:8px 0;background-color:#1a2438}
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;
+     width:900px;box-sizing:border-box;padding:12px}
+.card{background:none;border:none;border-radius:0;box-shadow:none;padding:0}
+h1{margin:0;font-size:34px;font-weight:700;color:#fff;line-height:1.22;padding:20px 24px;border:1px solid #2a2e33;border-radius:12px;background:linear-gradient(115deg,#1b1e22 0%,#141619 52%,#0f1113 100%);text-shadow:0 2px 12px rgba(0,0,0,.6)}
+.title{color:#e8e6e3;font-size:20px}
+.sub{color:#9aa0a6;font-size:13.5px;margin:8px 0 14px;padding:0 2px}
+h2{font-size:13.5px;color:#c5cacd;font-weight:700;letter-spacing:1.5px;border-left:3px solid #35c66b;padding-left:9px;margin:16px 0 8px}
+.row{display:flex;justify-content:space-between;padding:8px 12px;border-radius:8px;font-size:14px;margin:3px 0;background:#1b1e22}
+
+.row b{color:#d4b26a}
+.row.hl b{color:#35c66b}
+.char{display:flex;align-items:center;gap:12px;background-size:cover;border-radius:12px;border:1px solid #2a2e33;padding:10px 14px;margin:8px 0;background-color:#1b1e22}
 .char img{height:44px;border-radius:4px}
-.ci{display:flex;flex-direction:column;line-height:1.5;font-size:14px;background:rgba(11,15,25,.72);
+.ci{display:flex;flex-direction:column;line-height:1.5;font-size:14px;background:rgba(15,17,19,.72);
     padding:4px 10px;border-radius:6px}
-.ci .dim{color:#8fa3bd;font-size:12px}
+.ci .dim{color:#9aa0a6;font-size:12px}
 .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-section{background:rgba(255,255,255,.03);border-radius:8px;padding:4px 8px 10px}
-.empty{color:#8fa3bd}
-.gridwrap{background:#1a2438;border-radius:8px;padding:8px;margin-bottom:10px}
+section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:10px 12px 12px}
+.empty{color:#9aa0a6}
+.gridwrap{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:10px;margin-bottom:10px}
 .gridline{display:grid;grid-template-columns:repeat(auto-fill,19px);gap:3px}
-.cell{width:19px;height:19px;border-radius:3px;background:#2b3547;transition:transform .08s}
+.cell{width:19px;height:19px;border-radius:3px;background:#2b2e33;transition:transform .08s}
 .cell:hover{transform:scale(1.18)}
-.cell.w{background:#37c06e}.cell.l{background:#d9483f}.cell.d{background:#555f70}
-.mrow{display:flex;align-items:center;gap:12px;background:#141c2e;border:1px solid #22304a;
-      border-radius:8px;padding:8px 12px;margin:6px 0;text-decoration:none;color:#e8eef7}
-.mrow:hover{border-color:#2f6edb}
-.rrow{display:flex;align-items:center;gap:12px;background:#141c2e;border:1px solid #22304a;
-      border-radius:8px;padding:8px 12px;margin:6px 0;font-size:14px;text-decoration:none;color:#e8eef7}
-.rrow:hover{border-color:#2f6edb}
+.cell.w{background:#35c66b}.cell.l{background:#d9483f}.cell.d{background:#3a3e44}
+.mrow{display:flex;align-items:center;gap:12px;background:#16181b;border:1px solid #2a2e33;
+      border-radius:8px;padding:8px 12px;margin:6px 0;text-decoration:none;color:#e8e6e3}
+.mrow:hover{border-color:#35c66b}
+.rrow{display:flex;align-items:center;gap:12px;background:#16181b;border:1px solid #2a2e33;
+      border-radius:8px;padding:8px 12px;margin:6px 0;font-size:14px;text-decoration:none;color:#e8e6e3}
+.rrow:hover{border-color:#35c66b}
 .rrow img{width:86px;height:44px;object-fit:cover;border-radius:4px}
-.rrow .clears{color:#7dff9c}
-.rrow .fw{color:#ffd76e}
-.rrow .lm{color:#5ea8ff}
-.rrow .dim{color:#8fa3bd;font-size:12px;margin-left:auto}
+.rrow .clears{color:#35c66b}
+.rrow .fw{color:#d4b26a}
+.rrow .lm{color:#4b8fd4}
+.rrow .dim{color:#9aa0a6;font-size:12px;margin-left:auto}
 .months{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
-.ml{color:#8fa3bd;font-size:13px;text-decoration:none;background:#141c2e;border:1px solid #22304a;
+.ml{color:#9aa0a6;font-size:13px;text-decoration:none;background:#16181b;border:1px solid #2a2e33;
     border-radius:6px;padding:3px 10px}
-.ml.on{color:#fff;background:#2f6edb;border-color:#2f6edb}
+.ml.on{color:#0b1a10;background:#35c66b;border-color:#35c66b;font-weight:700}
 .mrow>img{width:86px;height:48px;object-fit:cover;border-radius:4px;flex-shrink:0}
 .mi{flex:1;font-size:13px;line-height:1.6}
-.ms{display:flex;gap:14px;font-size:13px;color:#8fa3bd;flex-shrink:0}
-.ms b{color:#e8eef7}
+.ms{display:flex;gap:14px;font-size:13px;color:#9aa0a6;flex-shrink:0}
+.ms b{color:#e8e6e3}
 .tagw,.tagl,.tagd{font-size:12px;border-radius:4px;padding:1px 6px}
-.tagw{color:#7dff9c;background:rgba(55,192,110,.15)}
+.tagw{color:#35c66b;background:rgba(53,198,107,.15)}
 .tagl{color:#ff8d85;background:rgba(217,72,63,.15)}
-.tagd{color:#999;background:rgba(120,120,120,.15)}
-.mtag{display:inline-block;background:#1a2a45;color:#5ea8ff;border-radius:4px;
-      font-size:11px;padding:0 6px;margin-left:4px;vertical-align:1px}
-.mtag.mvp{background:rgba(255,180,40,.18);color:#ffb428}
+.tagd{color:#999;background:rgba(154,160,166,.15)}
+.mtag{display:inline-block;background:#22262b;color:#9aa0a6;border-radius:6px;font-size:11px;padding:1px 7px;margin-left:4px;vertical-align:1px}
+.mtag.mvp{background:rgba(212,178,106,.16);color:#d4b26a}
 .mrow.hist{padding:10px 12px}
 .hist .mi{flex:1.4}
 .weps{margin-top:6px}
-.weps summary{cursor:pointer;color:#5ea8ff;font-size:12px}
-.wrow{display:flex;align-items:center;gap:8px;background:#0e1524;border-radius:6px;
+.weps summary{cursor:pointer;color:#4b8fd4;font-size:12px}
+.wrow{display:flex;align-items:center;gap:8px;background:#1b1e22;border-radius:8px;
       padding:4px 8px;margin:4px 0;font-size:12px}
 .wrow img{width:26px;height:26px;object-fit:contain}
-.wrow b{margin-left:auto;color:#ffd76e}
-.mvpname{color:#ffb428;font-size:18px;font-weight:bold}
-.pcard{background:#141c2e;border:1px solid #22304a;border-radius:10px;padding:10px;margin:8px 0}
-.pban{display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,#1a2438,#141c2e);
-      border:1px solid #22304a;border-radius:8px;padding:8px 14px}
+.wrow b{margin-left:auto;color:#d4b26a}
+.mvpname{color:#d4b26a;font-size:18px;font-weight:bold}
+.pcard{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:10px;margin:8px 0}
+.pban{display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,#1b1e22,#16181b);
+      border:1px solid #2a2e33;border-radius:8px;padding:8px 14px}
 .pban img{width:72px;height:38px;object-fit:contain;border-radius:4px;flex-shrink:0}
 .pbanname{line-height:1.6}
 .pbanname b{font-size:15px}
-.pbandim{display:block;color:#8fa3bd;font-size:12px}
+.pbandim{display:block;color:#9aa0a6;font-size:12px}
 .pstats{display:flex;gap:8px;margin-top:8px}
-.pstats div{flex:1;background:#0e1524;border-radius:6px;text-align:center;padding:6px 2px}
-.pstats i{display:block;font-style:normal;color:#8fa3bd;font-size:11px}
-.pstats b{color:#ffd76e;font-size:14px}
-.hgrid{display:flex;gap:3px;background:#141c2e;border:1px solid #22304a;border-radius:8px;padding:10px}
+.pstats div{flex:1;background:#1b1e22;border-radius:8px;text-align:center;padding:6px 2px}
+.pstats i{display:block;font-style:normal;color:#9aa0a6;font-size:11px}
+.pstats b{color:#d4b26a;font-size:14px}
+.hgrid{display:flex;gap:3px;background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:10px}
 .hcol{display:flex;flex-direction:column;gap:3px}
 .hcell{width:14px;height:14px;border-radius:3px;display:block}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
-.chips .on{border-color:#ffd76e;background:#2a2413}
+.chips .on{border-color:#d4b26a;background:#2b2417}
 .chips .dim2{opacity:.45}
 .chips img{width:26px;height:26px;object-fit:contain;border-radius:4px}
 .chips span{font-size:13px}
 .wcard img{width:52px;height:52px;object-fit:contain;flex-shrink:0}
 .wcard b{font-size:16px}
-.wcard p{margin:4px 0 0;color:#a8b8cc;font-size:13px}
-.tag{color:#5ea8ff;font-size:12px}
+.wcard p{margin:4px 0 0;color:#9aa0a6;font-size:13px}
+.tag{color:#4b8fd4;font-size:12px}
+/* 角落水印：bot 名 + 作者（与 bot_cards.CSS 同一条，改一处要两处一起改） */
+body,body.pgw{position:relative;padding-bottom:30px}
+body::after{content:"雷尼克斯联合-1 · by Wj";position:absolute;right:14px;bottom:8px;
+            font-size:11.5px;letter-spacing:1.2px;color:rgba(212,178,106,.5)}
 </style></head><body><div class="card">
 __BODY__
 </div></body></html>"""

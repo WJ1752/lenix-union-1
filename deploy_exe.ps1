@@ -6,10 +6,15 @@
 # (README notes /MIR hangs on these paths).
 #
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1
+#        powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1 -Dst dist_new\D2Query
+#        （现在实际在跑的是 dist_new\D2Query，默认的 dist\D2Query 是旧的旁路目录）
+param(
+  [string]$Dst = "dist\D2Query"
+)
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $src  = Join-Path $root "dist_build\D2Query"
-$dst  = Join-Path $root "dist\D2Query"
+$dst  = Join-Path $root $Dst
 
 if (-not (Test-Path (Join-Path $src "D2Query.exe"))) {
   Write-Output "missing $src\D2Query.exe - run build_exe.bat first"
@@ -30,7 +35,8 @@ if (Test-Path $dstInt) { Remove-Item $dstInt -Recurse -Force }
 Copy-Item (Join-Path $src "_internal") $dstInt -Recurse -Force
 
 # 3) sync external modules (these live outside the exe)
-$ext = @("bot_cards.py", "card_render.py", "weapon_filter.py", "weapon_usage.py", "nonebot_plugins\destiny2.py")
+$ext = @("bot_cards.py", "card_render.py", "weapon_filter.py", "weapon_usage.py", "raid_loot.py",
+         "nonebot_plugins\destiny2.py")
 foreach ($f in $ext) {
   $s = Join-Path $root $f
   $d = Join-Path $dst  $f
