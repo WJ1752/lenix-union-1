@@ -81,3 +81,6 @@ build_tmp/
 dist_new/
 dist_build/
 build/
+
+# ZCode 编辑预览临时目录（工具自动生成）
+_preview/
