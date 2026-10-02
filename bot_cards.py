@@ -1968,6 +1968,7 @@ def fireteam_card(data: dict) -> str:
            "pending": "<span class='ft-tag live'>进行中</span>",
            "ended": "<span class='ft-tag'>已结束</span>",
            "orbit": "<span class='ft-tag'>在轨道</span>",
+           "world": "<span class='ft-tag'>在游戏中</span>",
            "offline": "<span class='ft-tag'>不在线</span>"}.get(
                state, "<span class='ft-tag'>组队中</span>")
     parts = [f"<span class='ft-badge' style='border-left-color:{color};color:{color}'>"
@@ -1983,6 +1984,9 @@ def fireteam_card(data: dict) -> str:
             parts.append(f"<span>开始 {esc(data.get('started_text'))}（UTC+8）</span>")
             parts.append(f"<span>已进行 {int(data.get('duration_min') or 0)} 分钟</span>")
         parts.append("<span>本场名单还没发布，先显示可见队伍成员</span>")
+    elif state == "world":
+        parts.append(f"<b>{esc(data.get('activity') or '自由漫游')}</b>")
+        parts.append("<span>不在对局里（自由漫游 / 社交空间），队内生涯总览</span>")
     elif state == "orbit":
         parts.append("<b>在轨道待机</b>")
         parts.append("<span>队内生涯总览（生涯总时长 / 成就点数）</span>")
@@ -2014,9 +2018,9 @@ def fireteam_card(data: dict) -> str:
             grouped = True
     if not grouped:
         rows = "".join(_ft_row(m, bucket) for m in members)
-    foot = ("命运2 查询 · 数据来自 Bungie.net · 在轨道/不在线：显示生涯累计"
+    foot = ("命运2 查询 · 数据来自 Bungie.net · 在轨道/自由漫游/不在线：显示生涯累计"
             "（生涯总时长 / 成就点数）；名单取自官方实时队伍，队友未公开时可能不全"
-            if state in ("orbit", "offline") else
+            if state in ("orbit", "world", "offline") else
             "命运2 查询 · 数据来自 Bungie.net · 熔炉/智谋按阵营分列，"
             "突袭/地牢为全队 + 每副本完成数/导师；名单取自本场对局，刚开局或队友未公开时可能不全")
     body = (f"<style>{_FT_CSS}</style>"

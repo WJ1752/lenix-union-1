@@ -4,6 +4,9 @@
 - **在不在活动 = 看 204 组件的 currentActivityHash 是不是「真活动」**：官方在轨道待机
   照样给一个占位 hash（实测 82913930，manifest 里没有名字），拿它去配历史会配上刚打完
   的那一场，卡片就成了「还在打某某副本」。真活动在 manifest / 本地索引里都有名字。
+- **名字不是判据，类型才是**（2026-10-03 事故）：巡逻区/社交空间在 manifest 里也有名字，
+  但那是自由漫游不是一局对局 —— 必须按 activityModeTypes 剔除（6=Explore 巡逻、40=社交），
+  见 `_activity_kind`；它们走「不在对局里」的生涯总览卡，不进对局分支。
 - 轨道/组队态：只给队内每人的 **生涯总时长 + 成就点数**（用户口径：不需要多余数据）；
   名单 = Profile 1000 组件 profileTransitoryData.partyMembers（官方实时队伍，隐私会隐藏）。
 - 在活动中：本场名单 = 本场对局 PGCR（历史行里找与当前活动开始时间 ±10 分钟对得上的那场，
@@ -54,7 +57,7 @@ _MEMBER_BUDGET = 12.0
 # （activityTypeHash 73015004 本身也没有名字）。不能拿它去配历史，否则会配上
 # 刚打完的那一场，卡片就变成"还在打某某副本"。
 _ORBIT_HASHES = {82913930}
-_REAL_ACT: dict[int, bool] = {}      # activity hash → 是不是真活动（查一次缓存）
+_KIND_CACHE: dict[int, str] = {}     # activity hash → match/patrol/social/none（查一次缓存）
 
 
 def _parse_dt(s: str) -> datetime | None:
@@ -134,22 +137,52 @@ async def _pgcr(instance: str) -> dict:
     return resp["Response"]
 
 
-async def _is_real_activity(ref: int) -> bool:
-    """currentActivityHash 是不是"真在打活动"：轨道占位 hash 在 manifest 里没有名字。
-    查询失败按已知占位表兜底（宁可判成轨道，也别编出一场没在打的副本）。"""
+async def _activity_kind(ref: int) -> str:
+    """currentActivityHash → 活动类型：'match' | 'patrol' | 'social' | 'none'
+
+    - none：轨道占位 hash，或 manifest 里没有名字的（不是真活动）；
+    - patrol：自由漫游区（modeType 6「Explore」= 涅索斯/欧洲无人区…）——不是一局对局；
+    - social：社交空间（modeType 40 = 高塔/农庄/蛛王藏身处）；
+    - match：raid/地牢/打击/熔炉/智谋等真正的一局对局。
+
+    实测 2026-10-03 事故：玩家在涅索斯巡逻区，204 的 hash 是巡逻区（manifest 有名字，
+    所以旧判据放行），再被 ±10 分钟的宽松匹配配上「上一次巡逻」那条 2 分钟的历史行，
+    卡片就成了「不稳定半人马座 已结束 / 对局时长 2 分钟」——而他其实正在打「移民号的坠毁」
+    打击（已进行 22 分钟）。自由漫游/社交空间不是对局，必须在进对局分支前拦下。
+    查询失败按「was 真活动」兜底（宁可不动，也别编出一场没在打的副本）。"""
     if not ref:
-        return False
-    hit = _REAL_ACT.get(ref)
-    if hit is not None:
+        return "none"
+    hit = _KIND_CACHE.get(ref)
+    if hit:
         return hit
-    real = ref not in _ORBIT_HASHES
-    try:
-        d = await _entity("DestinyActivityDefinition", ref)
-        real = bool((((d.get("displayProperties") or {}).get("name")) or "").strip())
-    except Exception:  # noqa: BLE001
-        pass
-    _REAL_ACT[ref] = real
-    return real
+    kind = "match"
+    if ref in _ORBIT_HASHES:
+        kind = "none"
+    else:
+        try:
+            d = await _entity("DestinyActivityDefinition", ref)
+            if not (((d.get("displayProperties") or {}).get("name")) or "").strip():
+                kind = "none"
+            else:
+                mts = {int(x) for x in (d.get("activityModeTypes") or [])}
+                if not mts:
+                    for mh in (d.get("activityModeHashes") or []):
+                        md = await _entity("DestinyActivityModeDefinition", int(mh))
+                        if md.get("modeType") is not None:
+                            mts.add(int(md["modeType"]))
+                if 6 in mts:
+                    kind = "patrol"
+                elif 40 in mts:
+                    kind = "social"
+        except Exception:  # noqa: BLE001
+            pass
+    _KIND_CACHE[ref] = kind
+    return kind
+
+
+async def _is_real_activity(ref: int) -> bool:
+    """currentActivityHash 是不是"人在场"（对局/自由漫游/社交空间算；轨道占位 hash 不算）"""
+    return await _activity_kind(ref) != "none"
 
 
 def _current(prof: dict) -> tuple[str, int, datetime] | None:
@@ -188,14 +221,23 @@ def _entry_info(e: dict) -> dict:
 
 
 def _match_entry(hist: list[dict], start: datetime, now: datetime) -> dict | None:
-    """历史里找与当前活动开始时间对得上的一场（±10 分钟）；
+    """历史里找「当前这一局」：开始时间对得上（±10 分钟）**且不是在当前这局开始前就结束的**。
+
+    传进来的 hist 已过滤成真对局（巡逻/社交空间的会话行不算，见 _activity_kind）。
+    `end < start` 这一条是关键：上一把哪怕只比当前这局早一分钟，也不能拿来当本场
+    （实测事故就是上一场巡逻 18:16:27 结束、当前打击 18:16:29 开始，只差 2 秒）。
     返回 {entry, live, period, end}；超过 6 小时前的不算「当前」"""
     best = None
     for e in hist:
         p = _parse_dt(e.get("period", ""))
         if not p or not e.get("instance"):
             continue
-        if abs((p - start).total_seconds()) <= 600 and (best is None or p > best[0]):
+        if abs((p - start).total_seconds()) > 600:
+            continue
+        end = p + timedelta(seconds=int(e.get("duration") or 0))
+        if end < start:
+            continue                      # 本局开始前就结束了 → 是"上一把"
+        if best is None or p > best[0]:
             best = (p, e)
     if not best:
         return None
@@ -390,11 +432,45 @@ async def _retry_twice(call, *args):
             await asyncio.sleep(1)
 
 
+async def _career_brief(member: dict, mtype: int, mid: str, prof: dict, party: list[str], *,
+                        state: str, mode_name: str, activity: str = "") -> dict:
+    """「没在对局里」的卡：轨道 / 自由漫游 / 社交空间 / 不在线。
+    名单 = 官方实时队伍，每人只给 生涯总时长 + 成就点数（用户口径，见 CHANGELOG）。"""
+    last_text = ""
+    if state == "offline":
+        lc = _latest_char((prof.get("characters") or {}).get("data") or {})
+        lp = _parse_dt((lc[1] or {}).get("dateLastPlayed") or "") if lc else None
+        if lp:
+            last_text = f"最后游玩 {_cn(lp)}（UTC+8）"
+    roster = [{"mid": mid, "mtype": mtype, "name": ""}]
+    known = {mid}
+    for pm in party:
+        if pm and pm not in known and len(roster) < _MAX_MEMBERS:
+            roster.append({"mid": pm, "mtype": mtype, "name": ""})
+            known.add(pm)
+    rows = list(await asyncio.gather(*(
+        _row_budget(_career_row(r["mtype"], r["mid"], r["mid"] == mid, r["name"]),
+                    r["mid"], r["mid"] == mid, r["name"]) for r in roster)))
+    return {
+        "name": f"{member['display']}#{d2.fmt_code(member['code'])}",
+        "state": state,
+        "in_activity": False,
+        "live": False,
+        "activity": activity,
+        "bucket": 7,
+        "mode_name": mode_name,
+        "started_text": "",
+        "duration_min": 0,
+        "members": rows,
+        "last_text": last_text,
+    }
+
+
 async def collect(name: str) -> dict:
     """采集「当前在打什么 + 队内成员数据」
 
-    在活动中 → 本场活动 + 同队成员在该模式的生涯数据；
-    轨道/组队中 → 只给队内每人的 生涯总时长 + 成就点数（用户口径，见 CHANGELOG）。
+    在对局中 → 本场活动 + 同队成员在该模式的生涯数据；
+    轨道/自由漫游/社交空间/不在线 → 只给队内每人的 生涯总时长 + 成就点数（用户口径，见 CHANGELOG）。
 
     玩家不存在抛 LookupError。"""
     member = await _retry_twice(d2.resolve_member, name)
@@ -405,7 +481,8 @@ async def collect(name: str) -> dict:
     now = datetime.now(timezone.utc)
 
     cur = _current(prof)
-    if cur and not await _is_real_activity(cur[1]):
+    kind = await _activity_kind(cur[1]) if cur else "none"
+    if kind == "none":
         cur = None                       # 轨道占位 hash ≠ 在打活动
 
     # 官方实时队伍（隐私设置可能隐藏部分成员）
@@ -417,9 +494,20 @@ async def collect(name: str) -> dict:
     tr_act = (tr.get("currentActivity") or {}) if tr else {}
     live_players = int(tr_act.get("numberOfPlayers") or 0) + int(tr_act.get("numberOfOpponents") or 0)
 
+    if cur and kind in ("patrol", "social") and tr:
+        # ---- 自由漫游 / 社交空间：在游戏里但没在对局，给队内生涯总览 ----
+        # （巡逻区在 manifest 里有名字，旧判据会把它当对局，再配上"上一次漫游"的历史行）
+        return await _career_brief(
+            member, mtype, mid, prof, party, state="world",
+            mode_name="自由漫游" if kind == "patrol" else "社交空间",
+            activity=await _activity_label(cur[1]))
+
     if cur and live_players >= 1:
         # ---- 在活动中 ----
-        hist = await d2.activity_history(mtype, mid, cur[0], 0, count=8)
+        raw_hist = await d2.activity_history(mtype, mid, cur[0], 0, count=12)
+        # 只留真对局的历史行：巡逻/社交空间的会话行会冒充"当前这一场"（见 _match_entry）
+        bucket_of = await asyncio.gather(*(_activity_kind(e.get("ref") or 0) for e in raw_hist))
+        hist = [e for e, k in zip(raw_hist, bucket_of) if k == "match"]
         match = _match_entry(hist, cur[2], now)
 
         # 本场名单：优先本场 PGCR（全队/同队），否则退回 Transitory 可见队伍
@@ -497,31 +585,5 @@ async def collect(name: str) -> dict:
     # 退出游戏后 204 会把上一场活动挂一阵子，但 transitory 会先消失/清零——以它为准，
     # 宁可报「不在线」也别把上一场当成"进行中"（2026-10-02 用户实测打回过）。
     state = "orbit" if tr else "offline"
-    last_text = ""
-    if state == "offline":
-        lc = _latest_char((prof.get("characters") or {}).get("data") or {})
-        lp = _parse_dt((lc[1] or {}).get("dateLastPlayed") or "") if lc else None
-        if lp:
-            last_text = f"最后游玩 {_cn(lp)}（UTC+8）"
-    roster = [{"mid": mid, "mtype": mtype, "name": ""}]
-    known = {mid}
-    for pm in party:
-        if pm and pm not in known and len(roster) < _MAX_MEMBERS:
-            roster.append({"mid": pm, "mtype": mtype, "name": ""})
-            known.add(pm)
-    rows = list(await asyncio.gather(*(
-        _row_budget(_career_row(r["mtype"], r["mid"], r["mid"] == mid, r["name"]),
-                    r["mid"], r["mid"] == mid, r["name"]) for r in roster)))
-    return {
-        "name": f"{member['display']}#{d2.fmt_code(member['code'])}",
-        "state": state,
-        "in_activity": False,
-        "live": False,
-        "activity": "",
-        "bucket": 7,
-        "mode_name": "轨道待机" if state == "orbit" else "不在线",
-        "started_text": "",
-        "duration_min": 0,
-        "members": rows,
-        "last_text": last_text,
-    }
+    return await _career_brief(member, mtype, mid, prof, party, state=state,
+                               mode_name="轨道待机" if state == "orbit" else "不在线")
