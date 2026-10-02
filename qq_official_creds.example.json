@@ -1,0 +1,5 @@
+{
+  "_说明": "复制本文件为 qq_official_creds.json 并填入真值；该文件已在 .gitignore 里，不要外发/提交/贴到聊天里",
+  "appid": "填你的 AppID（开放平台 → 你的机器人 → 开发设置）",
+  "secret": "填你的 AppSecret（同上）"
+}

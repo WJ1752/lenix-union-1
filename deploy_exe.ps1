@@ -55,22 +55,16 @@ Get-ChildItem $srcInt -Recurse -File | ForEach-Object {
 }
 if ($skipped -gt 0) { Write-Output ("_internal 有 $skipped 个文件被占用未覆盖，请核对是否只能是被 NapCat 锁住的那 17 个") }
 
-# 3) sync external modules (these live outside the exe)
-$ext = @("bot_cards.py", "card_render.py", "weapon_filter.py", "weapon_usage.py", "raid_loot.py",
-         "nonebot_plugins\destiny2.py")
+# 3) sync external modules.
+#    注意：bot_cards/card_render/bot_platform 等在 spec hiddenimports 里，已被打进 exe
+#    归档，运行时 FrozenImporter 优先 —— 这里同步的外置副本**不会生效**，只是留档；
+#    改这些模块必须 build_exe.bat 重打包（2026-10-03 实证）。
+$ext = @("bot_cards.py", "bot_platform.py", "bot_fireteam.py", "card_render.py", "weapon_filter.py", "weapon_usage.py",
+         "raid_loot.py", "nonebot_plugins\destiny2.py")
 foreach ($f in $ext) {
   $s = Join-Path $root $f
   $d = Join-Path $dst  $f
   if (Test-Path $s) { Copy-Item $s $d -Force; Write-Output "sync $f" }
-}
-
-# 3.5) sync the bundled DIM build (dim_app lives outside the exe, ~100MB static site)
-$dimSrc = Join-Path $root "dim_app"
-$dimDst = Join-Path $dst "dim_app"
-if (Test-Path (Join-Path $dimSrc "index.html")) {
-  if (-not (Test-Path $dimDst)) { New-Item -ItemType Directory -Path $dimDst | Out-Null }
-  Copy-Item (Join-Path $dimSrc "*") $dimDst -Recurse -Force
-  Write-Output "sync dim_app"
 }
 
 # 3.6) sync NapCat runtime files into dist's napcat_shell (that dir is created once by

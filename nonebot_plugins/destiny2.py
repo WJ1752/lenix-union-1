@@ -3,22 +3,29 @@
 **输出全部是小日向式图片卡片**（HTML 排版 + 无头浏览器截图，见 bot_cards.py / card_render.py），
 不再回纯文本；只有当渲染器彻底不可用时才退回文本。
 
+**双通道**：同一份插件的指令同时服务 NapCat（OneBot v11，个人号）和 QQ 官方机器人
+（nonebot-adapter-qq）。所有平台差异都在 bot_platform.py（bp）里，本文件不直接引用任何
+适配器类型：NapCat 群里裸写 `/指令` 即可；官方群只推送 @机器人 的消息，所以官方群里
+任何指令都得先 @ 机器人（`@雷尼克斯联合-1 /raid`）。官方通道没有 QQ 号、只有 openid，
+绑定表按 openid 另存；被动回复窗口 5 分钟/5 条（长任务见 `_working` 的说明）。
+
 触发词对齐小日向（`/中文` 形式），**必须带 `/` 前缀**，且命令词后要紧跟空白或直接结束
 （`pve是顺手写的` 这种连写不会被当成指令）；旧 `d2` 系列保留为别名：
   /绑定 玩家名#1234   → 绑定自己的账号（之后玩家查询可省去名字）
   /解绑                → 解除绑定
   /我的                → 查看当前绑定账号（别名 账号）
   /玩家 玩家名#1234    → 基础信息（最高光能、各角色）      别名 d2；已绑定可省略名字
-  /生涯 玩家名#1234    → 生涯统计（击杀/死亡/KD/场次）      别名 d2周报、周报；已绑定可省略名字
+  /生涯 玩家名#1234    → 生涯面板（逐赛季等级 + 分职业分模式时长 + 三模式）别名 d2周报、周报；已绑定可省略名字
   /raid                → 突袭战绩（通关/无暇/大师/单人双人三人/无暇）别名 突袭、d2raid
   /地牢                → 地牢战绩                          别名 dungeon、d2地牢
   /pvp                 → 熔炉：生涯统计 + 近期战绩 + 模式细分  别名 熔炉、d2pvp
   /pve                 → PVE：生涯统计 + 近期战绩 + 模式细分   别名 d2pve
   /智谋                → 智谋战绩                          别名 gambit、d2智谋
-  /历史                → 最近对局流（全模式）                别名 战绩、最近对局、d2历史
+  /战绩                → 最近对局流（全模式）                别名 历史、最近对局、d2历史
   /热力图              → 按赛季分组的全历史活跃日历           别名 活跃、d2热力图
   /锻造                → 武器锻造图案进度                   别名 图案、d2锻造
   /称号                → 称号进度（含镀金）                 别名 d2称号
+  /队伍                → 当前活动队友简报（突袭/地牢/PvP/智谋通用）别名 队友、fireteam
   /常用武器 [范围]     → PVP 武器排名 + 爆头率（默认全生涯）      别名 生涯武器、pvp生涯武器、武器统计、mvp
                          范围可写 s27 / 赛季27 / 全生涯，例：/pvp生涯武器 s27
   /武器查询 <名称>     → 武器 perk 池（特性/枪管/弹匣/枪托）别名 d2武器
@@ -30,7 +37,7 @@
   @机器人 <名称>       → 群里直接 @ 机器人接武器名/护甲名/perk名，自动出对应卡片（小日向式）
   /帮助                → 指令一览                          别名 help、菜单
 
-玩家类指令（/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /锻造 /称号
+玩家类指令（/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /锻造 /称号
 /生涯武器 /pve生涯武器）后面可以跟一个 `@某人`：对方绑定过账号就直接查 TA 的，
 例 `/生涯 @小明`、`/pve生涯武器 @小明 s27`。**@ 必须放在指令后面**；对方没绑定时
 提示「TA 还没绑定」，不会悄悄退回发起人自己的账号。
@@ -40,15 +47,13 @@
 唯一例外是上面这条：`/指令 @某人` 里的 @ 在指令**之后**，那是查询目标、不是对别的 bot 说话。
 """
 import asyncio
-import base64
 import html as _html
 import json
 import re
 import time
 
 from nonebot import on_command, on_message, on_type
-from nonebot.adapters import Event
-from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
+from nonebot.adapters import Event, Message
 from nonebot.exception import FinishedException, IgnoredException, SkippedException
 from nonebot.internal.matcher import Matcher
 from nonebot.message import event_preprocessor, run_postprocessor
@@ -56,6 +61,8 @@ from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
 import bot_cards
+import bot_fireteam
+import bot_platform as bp
 
 try:
     import weapon_usage
@@ -67,26 +74,41 @@ import destiny_data as d2
 import raid_loot
 import weapon_filter as wf
 
+# 启动时后台把渲染用的浏览器/页面先起好：首条查询不用再等浏览器冷启动（~1.8s）
+from nonebot import get_driver as _get_driver  # noqa: E402
+
+
+@_get_driver().on_startup
+async def _prewarm_render():
+    import asyncio
+
+    async def _warm():
+        try:
+            await card_render.prewarm()
+        except Exception as exc:  # noqa: BLE001  起不来也不影响后面每条各自重试
+            print(f"[cards] 渲染预热失败（不影响查询）：{exc}")
+
+    asyncio.create_task(_warm())
+
 
 def _allowed_group(event: Event) -> bool:
-    """群开关：bot_config.json 里 enabled_groups 为空 = 全部响应"""
-    gid = getattr(event, "group_id", None)
-    if gid is None:
-        return True  # 私聊始终允许
+    """群开关（bot_config.json）：NapCat 看 enabled_groups（QQ 群号），
+    官方通道看 official_groups（group_openid）；为空 = 全部响应，私聊始终允许"""
+    if not bp.is_group(event):
+        return True
+    if bp.is_official(event):
+        return bp.official_groups_allow(event)
     try:
         cfg = json.load(open("bot_config.json", encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return True
     en = cfg.get("enabled_groups") or []
-    return not en or str(gid) in en
+    return not en or bp.group_key(event) in en
 
 
 # ---------- 消息日志（面板可见：哪个群说了什么、机器人回了什么） ----------
 def _nickname(event: Event) -> str:
-    sender = getattr(event, "sender", None)
-    if sender is None:
-        return ""
-    return getattr(sender, "card", "") or getattr(sender, "nickname", "") or ""
+    return bp.nickname(event)
 
 
 def _is_cmd(text: str) -> bool:
@@ -96,67 +118,28 @@ def _is_cmd(text: str) -> bool:
 
 def _who(event: Event) -> str:
     """后台任务由谁发起，显示在面板进度条上"""
-    nick = _nickname(event) or str(getattr(event, "user_id", "") or "?")
-    gid = getattr(event, "group_id", None)
-    return f"群 {gid} · {nick}" if gid else f"私聊 · {nick}"
+    return bp.who(event)
 
 
-def _at_other_only(event: MessageEvent, msg: Message) -> bool:
-    """消息里 @ 了别人、却唯独没 @ 我 → 这条不是发给我的，整条丢掉。
-
-    群里同时挂着别的查询 bot（比如小日向 3889001007）时，用户对着它发的
-    `/raid`、`/pvp`、`/锻造` 我们也会跟着回一遍（NapCat 日志里 17:51、18:03 各一次），
-    群里看到的就是「一条指令两个 bot 同时回」。on_command 在 nonebot 2.5 里**不带**
-    to_me 规则（裸写指令也要响应），所以这个判定只能自己做。
-
-    「有没有 @ 我」只看 `event.to_me`：适配器的 `_check_at_me` 在消息预处理阶段就把
-    开头的 `@我` 段**摘掉了**，再在这里扫 qq 是扫不到的（踩过这个坑）。剩下的 at 段
-    要么是 @ 别人，要么协议端没解析出号码（qq=0，例如 @ 机器人的群名片），后者按
-    「不是别人」放行。
-
-    区分靠 **@ 在指令的前面还是后面**：`@小日向 /raid`（@ 在前）是对着别的 bot 说话，
-    丢掉；`/raid @某人`（@ 在后）是「查这个人」，放行给指令响应器（见 `_at_target`）。
-    """
-    if getattr(event, "group_id", None) is None:
-        return False  # 私聊不会有 at
-    if getattr(event, "to_me", False):
-        return False  # @ 了我，就算还 @ 了别人也照样响应
-    self_id = str(getattr(event, "self_id", "") or "")
-    cmd_at = None  # 指令文本段的下标：它之后的 @ 都是查询目标
-    for i, seg in enumerate(msg):
-        if seg.is_text() and str((seg.data or {}).get("text") or "").lstrip().startswith("/"):
-            cmd_at = i
-            break
-    for i, seg in enumerate(msg):
-        if seg.type != "at":
-            continue
-        qq = str((seg.data or {}).get("qq") or "")
-        if qq in ("", "0", self_id):
-            continue
-        if cmd_at is None or i < cmd_at:
-            return True  # 指令之前（或压根没指令）@ 了别的 QQ
-    return False
-
-
-def _as_command(event: MessageEvent):
-    """把开头的 引用 / 表情 等非文本段去掉（@机器人 由适配器自己处理）。
+def _as_command(event: Event):
+    """把开头的 引用 / 表情 / @提及 等非文本段去掉（@机器人 由适配器自己处理）。
 
     NoneBot 解析指令前缀（TrieRule）发生在「事件预处理之后、响应器之前」，
     所以这一步必须挂在事件预处理上：否则「引用某条消息再发 /pve」在 Trie 解析时
     第一段是 reply、不是文本，前缀直接为空 → 所有指令都不匹配，表现为静默丢消息。
 
-    顺带在**段还没被裁掉之前**做「@ 的是别人吗」判定：裁掉 at 段之后就看不出来了，
-    而事件预处理是并发跑的（nonebot 里存的是 set，没有先后顺序），所以不能另开一个
-    预处理函数去读原始消息。
+    顺带在**段还没被裁掉之前**做「@ 的是别人吗」判定（bp.at_other_only，只有
+    NapCat 通道会用得上——官方通道只推送 @机器人 的消息）：裁掉 at 段之后就看不
+    出来了，而事件预处理是并发跑的（nonebot 里存的是 set，没有先后顺序），所以
+    不能另开一个预处理函数去读原始消息。
     """
-    if event.get_type() != "message":
+    if not bp.is_message_event(event):
         return
     msg = event.get_message()
-    if _at_other_only(event, msg):
+    if bp.at_other_only(event, msg):
         # 不处理，但要留痕：面板上看得到「为什么这条没回」
-        bot_log.add("in", text=msg.extract_plain_text().strip(), 
-                    group_id=getattr(event, "group_id", "") or "",
-                    user_id=str(getattr(event, "user_id", "") or ""),
+        bot_log.add("in", text=msg.extract_plain_text().strip(),
+                    group_id=bp.group_key(event), user_id=bp.uid(event),
                     nickname=_nickname(event),
                     extra={"enabled": _allowed_group(event), "skip": "@了别人"})
         raise IgnoredException("消息 @ 的是其他 QQ，不是本机器人")
@@ -168,44 +151,43 @@ event_preprocessor(_as_command)
 
 
 def _log_out(event: Event, text: str):
-    bot_log.add("out", text=text,
-                group_id=getattr(event, "group_id", "") or "",
-                user_id=getattr(event, "self_id", ""), nickname="Bot")
+    bot_log.add("out", text=text, group_id=bp.group_key(event),
+                user_id=bp.self_id(event), nickname="Bot")
 
 
-def _mention(event: Event) -> Message | None:
-    """群里回复时 @ 一下发起人（小日向同款：不然对方不知道是回给自己的）；私聊不加"""
-    uid = getattr(event, "user_id", None)
-    if not uid or getattr(event, "group_id", None) is None:
-        return None
-    return Message([MessageSegment.at(str(uid)), MessageSegment.text(" ")])
-
-
-def _at_sender(event: Event, seg):
-    """把回复内容前面接上 @发起人（群聊）；私聊原样返回"""
-    head = _mention(event)
-    return head + seg if head is not None else seg
+def _at_sender(event: Event, *segs):
+    """回复内容按平台打包：NapCat 群聊前缀 @发起人，官方通道见 bp.at_back_enabled"""
+    return bp.reply_msg(event, *segs)
 
 
 async def _reply(matcher, event: Event, text: str):
-    """文本回复（仅渲染失败时的兜底）"""
+    """文本回复（仅渲染失败时的兜底）；发送层异常只记日志，理由见 _reply_image"""
     _log_out(event, text)
-    await matcher.finish(_at_sender(event, MessageSegment.text(text)))
+    try:
+        await matcher.finish(_at_sender(event, bp.text_seg(event, text)))
+    except FinishedException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log_out(event, f"[发送失败] {text[:24]}：{exc}")
 
 
 async def _reply_image(matcher, event: Event, png: bytes, label: str):
     """图片回复：面板日志记一行说明，QQ 里发图（群里顺手 @ 发起人）
 
-    发送失败（协议端掉线/重连中）单独记一行，否则这种「回复丢失」在面板上看不出来"""
+    NapCat 走 base64 直发；官方通道走富媒体上传（file_image），且被动回复
+    窗口只有 5 分钟——超窗口这条会发失败，日志里有记录，让用户重发一次即可。
+
+    发送失败（协议端掉线/重连中）单独记一行，否则这种「回复丢失」在面板上看不出来。
+    **不再向上抛**：QQ 侧 sendMsg 超时（retcode 1200）时卡片往往其实已送达，
+    抛出去只会触发兜底后处理器再补一张「查询失败」卡 —— 同一指令两张卡。"""
     _log_out(event, f"[图片] {label}")
-    seg = MessageSegment.image("base64://" + base64.b64encode(png).decode())
+    seg = bp.image_seg(event, png, f"{label}.png" if label else "card.png")
     try:
         await matcher.finish(_at_sender(event, seg))
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
         _log_out(event, f"[发送失败] {label}：{exc}")
-        raise
 
 
 async def _send_card(matcher, event: Event, html: str, label: str, fallback: str):
@@ -236,6 +218,10 @@ async def _unhandled_error(matcher: Matcher, event: Event, exception: Exception)
     此前 /raid 在网络抖动时就是「收了指令毫无回复」，用户以为机器人挂了"""
     if isinstance(exception, (FinishedException, SkippedException, IgnoredException)):
         return
+    if type(exception).__name__ == "ActionFailed":
+        # 发送层问题（各适配器同名）：_reply_image 已记日志并吞掉；漏到这里也应是
+        # 「消息其实已送达」的超时，再补一张「查询失败」卡反而让用户收到两张卡
+        return
     try:
         await _notice(matcher, event, "查询失败",
                       [f"指令处理出错：{type(exception).__name__}",
@@ -262,7 +248,8 @@ def _save_bindings(d: dict):
 
 
 def _uid(event: Event) -> str:
-    return str(getattr(event, "user_id", "") or "")
+    """绑定表主键：NapCat=QQ 号，官方=member_openid（同一个人两个通道各存一份）"""
+    return bp.uid(event)
 
 
 def _bound_name(event: Event) -> str:
@@ -270,21 +257,8 @@ def _bound_name(event: Event) -> str:
 
 
 def _at_target(args: Message | None, event: Event) -> str:
-    """参数里 `@某人` → 那个人的 QQ（空串＝没 @ 别人）
-
-    群里 `/生涯 @小明` 就是查小明的号（用小明的绑定），比 `/生涯 小明#1234` 少打字。
-    @ 机器人自己被适配器摘掉了；qq=0（协议端没解析出号码）不算数。
-    """
-    if not args:
-        return ""
-    self_id = str(getattr(event, "self_id", "") or "")
-    for seg in args:
-        if seg.type != "at":
-            continue
-        qq = str((seg.data or {}).get("qq") or "")
-        if qq and qq not in ("0", self_id):
-            return qq
-    return ""
+    """参数里 `@某人` → 那个人的标识（空串＝没 @ 别人）；平台差异见 bp.at_target"""
+    return bp.at_target(args, event)
 
 
 async def _resolve_name(matcher, event: Event, raw: str,
@@ -368,22 +342,22 @@ def _split_scope(text: str) -> tuple[str, str]:
     return text, ""
 
 
-msg_logger = on_type(MessageEvent, priority=1, block=False)
+msg_logger = on_type(Event, rule=Rule(bp.is_message_event), priority=1, block=False)
 
 
 @msg_logger.handle()
-async def _log_incoming(event: MessageEvent):
+async def _log_incoming(event: Event):
     """记录指令消息与私聊消息（含被群开关挡下的，便于排查“为什么没回”）"""
     msg = event.get_message()
     text = msg.extract_plain_text().strip()
     if not text:
         kinds = "/".join(sorted({seg.type for seg in msg})) or "空"
         text = f"[{kinds}消息]"
-    gid = getattr(event, "group_id", None) or ""
+    gid = bp.group_key(event)
     if not _is_cmd(text) and gid:
         return  # 群里非指令消息不记，避免刷屏
     bot_log.add("in", text=text, group_id=gid,
-                user_id=str(event.user_id), nickname=_nickname(event),
+                user_id=bp.uid(event), nickname=_nickname(event),
                 extra={"enabled": _allowed_group(event)})
 
 
@@ -472,13 +446,13 @@ async def _(event: Event, args: Message = CommandArg()):
     if not name:
         return
     try:
-        data = await d2.full_report(name)
+        data = await d2.career_report(name)
     except LookupError:
         await _notice(career_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
                       kind="warn", fallback=f"没找到玩家 {name}")
         return
     await _send_card(career_query, event, bot_cards.career_card(data),
-                     f"生涯卡片 {data['display']}", f"【{data['display']}】的生涯统计")
+                     f"生涯面板 {data['display']}", f"【{data['display']}】的生涯面板")
 
 
 weapon_query = on_command("武器查询", aliases={"d2武器"}, priority=8, block=True,
@@ -489,6 +463,9 @@ armor_query = on_command("护甲套装", aliases={"套装效果", "d2套装", "�
                          block=True, force_whitespace=True)
 dust_query = on_command("每日光尘", aliases={"光尘商店", "d2光尘", "eververse", "光尘"},
                         priority=8, block=True, force_whitespace=True)
+xur_query = on_command("老九", aliases={"仄", "d2老九", "xur", "Xur", "XUR",
+                                       "老九商品", "老九在哪"},
+                       priority=8, block=True, force_whitespace=True)
 rot_query = on_command("轮换", aliases={"本周轮换", "d2轮换", "突袭轮换", "raid轮换"},
                        priority=8, block=True, force_whitespace=True)
 filter_query = on_command("武器筛选", aliases={"d2武器筛选", "d2筛选", "筛选武器"},
@@ -666,22 +643,31 @@ def _armor_data() -> list[dict] | None:
 
 
 def _armor_match(items: list[dict], q: str) -> tuple[list[dict], list[dict]]:
-    """按 名字/英文名/别名 匹配异域护甲：返回 (精确命中, 模糊命中)"""
+    """按 名字/英文名/别名 匹配异域护甲：返回 (精确命中, 模糊命中)。
+    两者都为空时，再用无符号归一化键（去 ·/'/- 等符号）兜底一遍。"""
     q_low = (q or "").strip().lower()
-    exact, fuzzy, seen = [], [], set()
-    for it in items:
-        names = {str(it.get("name") or ""), str(it.get("en") or "")}
-        names |= {str(a) for a in (it.get("aliases") or [])}
-        names = {n.strip().lower() for n in names if n.strip()}
-        if q_low in names:
-            exact.append(it)
-        elif any(q_low in n or n in q_low for n in names):
-            h = it.get("hash")
-            if h in seen:  # 同一件护甲多个名字都命中时只留一条
-                continue
-            seen.add(h)
-            fuzzy.append(it)
-    return exact, fuzzy
+
+    def _pass(norm, qk: str) -> tuple[list[dict], list[dict]]:
+        exact, fuzzy, seen = [], [], set()
+        for it in items:
+            names = {str(it.get("name") or ""), str(it.get("en") or "")}
+            names |= {str(a) for a in (it.get("aliases") or [])}
+            names = {norm(n) for n in names if n.strip()}
+            if qk in names:
+                exact.append(it)
+            elif any(qk in n or n in qk for n in names):
+                h = it.get("hash")
+                if h in seen:  # 同一件护甲多个名字都命中时只留一条
+                    continue
+                seen.add(h)
+                fuzzy.append(it)
+        return exact, fuzzy
+
+    exact, fuzzy = _pass(lambda n: n.strip().lower(), q_low)
+    if exact or fuzzy or not q_low:
+        return exact, fuzzy
+    nk = d2.norm_key(q)  # 用户打不出物品名里的符号时（「阿尔法·鲁皮之脊」→「阿尔法鲁皮之脊」）
+    return _pass(d2.norm_key, nk) if nk else (exact, fuzzy)
 
 
 async def _armor_reply(matcher, event: Event, q: str, source: str = "护甲查询"):
@@ -745,6 +731,26 @@ async def _(event: Event):
                      "光尘商店", "光尘商店数据获取失败")
 
 
+@xur_query.handle()
+async def _(event: Event):
+    if not _allowed_group(event):
+        return
+    try:
+        stock = await d2.xur_stock()
+    except d2.BungieAuthRequired:
+        await _notice(xur_query, event, "老九商品需要先授权 Bungie 账号",
+                      ["老九的货单是「登录后才能读」的接口。",
+                       "请到 Bot 面板（<code>http://127.0.0.1:8900/panel</code>）点 "
+                       "<b>授权 Bungie 账号</b>，登录一次即可。"],
+                      kind="warn", fallback="老九商品需要先在 Bot 面板授权 Bungie 账号")
+    except Exception as exc:  # noqa: BLE001
+        await _notice(xur_query, event, "老九商品获取失败",
+                      [f"Bungie 接口暂时不可用：{_exc_msg(exc)}"],
+                      kind="err", fallback=f"老九商品获取失败：{_exc_msg(exc)}")
+    await _send_card(xur_query, event, bot_cards.xur_card(stock),
+                     "老九商品", "老九商品数据获取失败")
+
+
 @rot_query.handle()
 async def _(event: Event):
     if not _allowed_group(event):
@@ -755,7 +761,18 @@ async def _(event: Event):
         await _notice(rot_query, event, "本周轮换获取失败",
                       [f"Bungie 里程碑接口暂时不可用：{_exc_msg(exc)}"],
                       kind="err", fallback=f"本周轮换获取失败：{_exc_msg(exc)}")
-    await _send_card(rot_query, event, bot_cards.rotation_card(rot, d2.distortion_now()),
+    # 宗师 / 遗失区域是第三方页抓取，各自独立容错：单边失败不拖垮整卡
+    # （失败在 destiny_data 的 ✘ 日志里可见，卡片里会显示「没抓到」缺省行）
+    gm = ls = None
+    try:
+        gm = await d2.gm_this_week()
+    except Exception:  # noqa: BLE001
+        gm = {"ok": False}
+    try:
+        ls = await d2.lost_sectors_today()
+    except Exception:  # noqa: BLE001
+        ls = {"ok": False}
+    await _send_card(rot_query, event, bot_cards.rotation_card(rot, d2.distortion_now(), ls, gm),
                      "本周轮换", "本周轮换数据获取失败")
 
 
@@ -798,10 +815,22 @@ async def _(event: Event, args: Message = CommandArg()):
                       [f"「{raid_loot.chart_display(key)}」的图片没有随包分发，检查 raid_images_proc 目录。"],
                       kind="err", fallback="掉落图缺失")
     _log_out(event, f"[图片] 掉落表 {raid_loot.chart_display(key)} ×{len(files)}")
-    segs = [MessageSegment.image("base64://" + base64.b64encode(open(f, "rb").read()).decode())
+    segs = [bp.image_seg(event, open(f, "rb").read(), f"{raid_loot.chart_display(key)}.jpg")
             for f in files]
     try:
-        await drop_query.finish(_at_sender(event, Message(segs)))
+        if bp.multi_media_ok(event):
+            await drop_query.finish(_at_sender(event, *segs))
+        else:
+            # 官方通道一条消息只能带一个媒体（适配器只取最后一个媒体段），必须拆条发；
+            # 被动回复上限 5 条 → 最多 4 张图 + 1 条说明，其余让用户去网页看。
+            # 实测每个副本只有 1 张切块图，这里纯属兜底。
+            for seg in segs[:4]:
+                await drop_query.send(_at_sender(event, seg))
+            if len(segs) > 4:
+                await drop_query.send(_at_sender(event, bp.text_seg(
+                    event, f"（共 {len(segs)} 张，官方通道一条消息只能带一张图，"
+                           "其余请在网页端查看）")))
+            await drop_query.finish()
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -812,26 +841,8 @@ async def _(event: Event, args: Message = CommandArg()):
 # ---------- 群里 @机器人 + 名字 = 直接查武器 / perk（小日向式） ----------
 # 小日向不用打指令，@ 一下接名字就出卡片；这里对齐：@机器人 秋风 → 武器卡，
 # @机器人 热力四射 → perk 卡。**只认真 @**：仅仅"引用/回复机器人的消息"不算。
-async def _at_me_only(event: Event) -> bool:
-    """直查的触发条件：被 @（nonebot 的 to_me）且是群聊。
-
-    注意 nonebot 的 to_me 有三条来源，其中两条会误伤：
-      - 「引用/回复机器人的消息」→ 适配器 _check_reply 会把 to_me 置真（没 @ 也会真）；
-      - 私聊 → 恒为真。
-    这里把"只是引用了机器人的消息"排除掉，只留真正的 @；私聊也不做直查。
-    """
-    if not getattr(event, "to_me", False):
-        return False
-    if getattr(event, "group_id", None) is None:
-        return False
-    reply = getattr(event, "reply", None)
-    sender = getattr(reply, "sender", None) if reply is not None else None
-    if sender is not None and str(getattr(sender, "user_id", "")) == str(getattr(event, "self_id", "")):
-        return False  # 只是引用机器人自己的消息，没有 @
-    return True
-
-
-at_lookup = on_message(rule=Rule(_at_me_only), priority=12, block=False)
+# 两个通道的判定差异（官方通道只推送 @机器人 的消息）都在 bp.at_me_only 里。
+at_lookup = on_message(rule=Rule(bp.at_me_only), priority=12, block=False)
 
 
 # 显式路由前缀：@bot 后先认指令词（顺带吃掉不带斜杠的指令别名，如「@bot d2武器 秋风」）
@@ -841,7 +852,7 @@ _AT_ARMOR_PREFIX = re.compile(r"^(?:护甲查询|d2护甲|护甲(?!套装))[\s:�
 
 
 @at_lookup.handle()
-async def _(event: MessageEvent):
+async def _(event: Event):
     if not _allowed_group(event):
         return
     # 剥 at 段与空白：开头的 @我 适配器预处理时已摘掉，这里兜底再清（含零宽空格）
@@ -907,7 +918,7 @@ pve_query = on_command("pve", aliases={"d2pve"}, priority=8, block=True,
                        force_whitespace=True)
 gambit_query = on_command("智谋", aliases={"gambit", "d2智谋"}, priority=8, block=True,
                           force_whitespace=True)
-history_query = on_command("历史", aliases={"战绩", "最近对局", "d2历史"}, priority=8,
+history_query = on_command("战绩", aliases={"历史", "最近对局", "d2历史"}, priority=8,
                            block=True, force_whitespace=True)
 heat_query = on_command("热力图", aliases={"活跃", "d2热力图"}, priority=8, block=True,
                         force_whitespace=True)
@@ -942,11 +953,10 @@ async def _working(matcher, event: Event, title: str, lines: list[str]):
     try:
         png = await card_render.html_to_png(bot_cards.notice(title, lines))
     except Exception:  # noqa: BLE001  渲染器起不来就退回纯文本，别把这一步变成阻塞
-        await matcher.send(_at_sender(event, MessageSegment.text(f"{title}\n" + "\n".join(lines))))
+        await matcher.send(_at_sender(event, bp.text_seg(event, f"{title}\n" + "\n".join(lines))))
         return
     _log_out(event, f"[图片] {title}")
-    await matcher.send(_at_sender(event, MessageSegment.image(
-        "base64://" + base64.b64encode(png).decode())))
+    await matcher.send(_at_sender(event, bp.image_seg(event, png, f"{title}.png")))
 
 
 async def _wait_job(jid: str, timeout: float = 1200.0) -> dict:
@@ -1191,8 +1201,8 @@ async def _(event: Event, args: Message = CommandArg()):
                      f"宗师战绩 {name}")
 
 
-HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /历史 /热力图 /称号 /锻造 "
-              "/生涯武器 /pve生涯武器 /宗师 /武器查询 /perk查询 /护甲查询 /护甲套装 /每日光尘 /轮换 /绑定 /我的 /解绑")
+HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /称号 /锻造 "
+              "/生涯武器 /pve生涯武器 /宗师 /队伍 /武器查询 /perk查询 /护甲查询 /护甲套装 /每日光尘 /老九 /轮换 /绑定 /我的 /解绑")
 
 
 @help_query.handle()
@@ -1201,3 +1211,30 @@ async def _(event: Event, args: Message = CommandArg()):
         return
     await _send_card(help_query, event, bot_cards.help_card(),
                      "指令一览", HELP_PLAIN)
+
+
+# ---------- /队伍：当前活动队友简报 ----------
+fireteam_query = on_command("队伍", aliases={"队友", "fireteam", "d2队伍"}, priority=8,
+                            block=True, force_whitespace=True)
+
+
+@fireteam_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    name = await _need_player(fireteam_query, event, args)
+    if not name:
+        return
+    try:
+        data = await bot_fireteam.collect(name)
+    except LookupError:
+        await _not_found(fireteam_query, event, name)
+        return
+    except Exception as exc:  # noqa: BLE001  接口/网络异常给提示卡，不静默
+        msg = _html.escape(_exc_msg(exc)[:80])   # 超时类 str() 为空，必须带类型名
+        await _notice(fireteam_query, event, "队伍查询失败",
+                      [f"接口异常：<code>{msg}</code>，稍后再试"],
+                      kind="warn", fallback=f"队伍查询失败：{_exc_msg(exc)}")
+        return
+    await _send_card(fireteam_query, event, bot_cards.fireteam_card(data),
+                     f"当前队伍 {data['name']}", f"{data['name']} · 队伍简报")

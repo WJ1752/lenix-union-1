@@ -1,11 +1,13 @@
 """Bungie API 数据层：查询玩家档案与历史统计"""
 import asyncio
 import datetime
+import functools
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import weakref
 
 import httpx
@@ -48,17 +50,192 @@ _CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClien
 
 
 def client() -> httpx.AsyncClient:
-    """当前事件循环专用的 httpx 客户端（同一循环内复用连接池）"""
+    """当前事件循环专用的 httpx 客户端（同一循环内复用连接池）
+
+    外面套一层响应缓存：同一份数据在短时间里会被反复拉（同一条指令连点、一次
+    /队伍 要拉 6 个人的角色级 Stats、面板与机器人都查同一个玩家…），Bungie 这边
+    单次要 1~3 秒，缓存掉重复的那些是响应速度上最大的一块。"""
     loop = asyncio.get_running_loop()
     c = _CLIENTS.get(loop)
     if c is None or c.is_closed:
-        c = httpx.AsyncClient(base_url=BASE, headers=HEADERS, timeout=15, follow_redirects=True,
-                              transport=httpx.AsyncHTTPTransport(retries=2))
+        raw = httpx.AsyncClient(base_url=BASE, headers=HEADERS, timeout=15,
+                                follow_redirects=True,
+                                transport=httpx.AsyncHTTPTransport(retries=2))
+        c = _CachedClient(raw)
         _CLIENTS[loop] = c
     return c
 
+
+# ---------- GET 响应缓存 ----------
+# TTL 按"这份数据多久才算过期"分档：
+#   · 15 秒：实时态（204 在打什么、1000 队伍）—— 刚打完就查也基本反映得过来
+#   · 180 秒：生涯/角色/成就（100/200/900/1100）—— 数字本来就按场次慢慢涨
+#   · 45 秒：对局历史（翻页/多角色查询会连着拉同一页）
+#   · 5~6 小时：对局 PGCR（打完就不会变）、manifest 实体（版本更新才变）
+# 只缓存 HTTP 200；表是普通 dict（exe 里三个事件循环共用，最坏只是重复拉一次）。
+_RESP: dict[str, tuple[float, bytes]] = {}
+_RESP_MAX = 400
+
+
+def _ttl_for(url: str, params: dict | None) -> float:
+    if "/Profile/" in url:
+        comps = str((params or {}).get("components") or "")
+        if "204" in comps or "1000" in comps:
+            return 15          # 实时态：在打什么 / 队伍
+        if "1100" in comps:
+            return 600         # 突袭指标砖（完成数/导师）：只有通关才会变
+        return 180
+    if "PostGameCarnageReport" in url:
+        return 6 * 3600
+    if "/Stats/Activities/" in url:
+        return 45
+    if "/Character/" in url and "/Stats/" in url:
+        return 300
+    if "/Manifest/" in url:
+        return 6 * 3600
+    if "SearchDestinyPlayer" in url:
+        return 300
+    return 60
+
+
+class _CachedClient:
+    """httpx.AsyncClient 的薄包装：GET/POST 走 TTL 缓存 + 读超时重试，其余原样转发"""
+
+    def __init__(self, inner: httpx.AsyncClient):
+        self._inner = inner
+
+    @staticmethod
+    def _key(url: str, params: dict | None, body: dict | None) -> str:
+        tail = ""
+        if params:
+            tail += "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        if body:
+            tail += "#" + "&".join(f"{k}={v}" for k, v in sorted(body.items()))
+        return url + tail
+
+    def _hit(self, key: str, url: str):
+        ent = _RESP.get(key)
+        if ent is not None and ent[0] > time.time():
+            return httpx.Response(200, content=ent[1], request=httpx.Request("GET", url))
+        return None
+
+    def _save(self, key: str, ttl: float, r) -> None:
+        if not key or r.status_code != 200:
+            return
+        _RESP[key] = (time.time() + ttl, r.content)
+        if len(_RESP) > _RESP_MAX:
+            for k in list(_RESP)[: _RESP_MAX // 4]:   # 先扔最早进来的四分之一
+                _RESP.pop(k, None)
+
+    async def _call(self, method: str, url, **kw):
+        params = kw.get("params") or {}
+        body = kw.get("json") if isinstance(kw.get("json"), dict) else None
+        ttl = _ttl_for(url, params)
+        key = self._key(url, params, body) if ttl else ""
+        if key:
+            hit = self._hit(key, url)
+            if hit is not None:
+                return hit
+        for attempt in (1, 2):
+            t_req = time.perf_counter()
+            try:
+                r = await getattr(self._inner, method)(url, **kw)
+                break
+            except httpx.TimeoutException:
+                # 只重试"很快就失败"的那种（连接被掐、瞬时抖动）；真等满超时的
+                # 说明链路正堵着，再重试一次只会让用户多等一整个超时
+                if attempt == 2 or time.perf_counter() - t_req > 6:
+                    raise
+                await asyncio.sleep(0.5)
+                kw = {**kw, "timeout": 8}
+        self._save(key, ttl, r)
+        return r
+
+    async def get(self, url, **kw):
+        return await self._call("get", url, **kw)
+
+    async def post(self, url, **kw):
+        # 只有按名字查账号（SearchDestinyPlayerByBungieName）走这里，POST 本身不带副作用
+        return await self._call("post", url, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
 CLASS_NAMES = {0: "泰坦", 1: "猎人", 2: "术士", 3: "守卫者"}
 RACE_NAMES = {0: "人类", 1: "觉醒者", 2: "EXO"}
+
+
+def _used_text(sec: float) -> str:
+    """耗时显示：秒级给 0.8s（短任务一眼看出），上了分钟给 1:23 / 1:02:03"""
+    if sec < 60:
+        return f"{sec:.1f}s"
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _traced(label):
+    """公开查询入口的统一「开始 / 结束（实际耗时）」日志。
+
+    一两次请求就完事的入口（对局详情 / 轮换 / 光尘 / 玩家搜索…）靠它补上
+    `▶ 开始` 与 `✔ 完成，实际耗时 X`；多步 / 翻页的入口内部另有 log_progress
+    的进度条与预计剩余，这里只补首尾两行。
+
+    label 可以是字符串，也可以是 callable(*args, **kwargs) -> str（要带玩家名 / 模式时用）。
+    不改变被装饰函数的签名、返回值与异常行为：异常原样抛出（LookupError 也不会被吞），
+    只在抛出前多打一行「✘ 失败 · 实际耗时」。同步 / 异步函数都能用。
+    """
+    def deco(fn):
+        def _text(args, kwargs):
+            if callable(label):
+                try:
+                    return str(label(*args, **kwargs))
+                except Exception:  # noqa: BLE001 标签算不出来也不能把主流程带崩
+                    return getattr(fn, "__name__", "查询")
+            return str(label)
+
+        def _begin(args, kwargs):
+            txt = _text(args, kwargs)
+            print(f"[进度] {time.strftime('%H:%M:%S')} ▶ {txt}", flush=True)
+            return txt
+
+        def _finish(txt, t0, exc):
+            used = _used_text(time.time() - t0)
+            if exc is None:
+                print(f"[进度] {time.strftime('%H:%M:%S')} ✔ {txt} 完成，实际耗时 {used}",
+                      flush=True)
+            else:
+                print(f"[进度] {time.strftime('%H:%M:%S')} ✘ {txt} 失败，实际耗时 {used}"
+                      f"（{type(exc).__name__}: {exc}）", flush=True)
+
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def awrap(*args, **kwargs):
+                txt = _begin(args, kwargs)
+                t0 = time.time()
+                try:
+                    out = await fn(*args, **kwargs)
+                except BaseException as exc:  # noqa: BLE001 原样抛，只补一行日志
+                    _finish(txt, t0, exc)
+                    raise
+                _finish(txt, t0, None)
+                return out
+            return awrap
+
+        @functools.wraps(fn)
+        def swrap(*args, **kwargs):
+            txt = _begin(args, kwargs)
+            t0 = time.time()
+            try:
+                out = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 原样抛，只补一行日志
+                _finish(txt, t0, exc)
+                raise
+            _finish(txt, t0, None)
+            return out
+        return swrap
+
+    return deco
 
 
 def fmt_code(code) -> str:
@@ -72,6 +249,17 @@ def fmt_code(code) -> str:
         return f"{int(code):04d}"
     except (TypeError, ValueError):
         return str(code or "")
+
+
+def norm_key(s: str) -> str:
+    """无符号归一化键：NFKC 折叠全角/特殊形态 → 小写 → 剔除所有非文字字符。
+
+    中文/字母/数字保留，·、'、-、空格、全角括号、# 等符号全部去掉，
+    用于用户打不出物品名里的特殊符号时的兜底匹配
+    （「阿尔法·鲁皮之脊」↔「阿尔法鲁皮之脊」双向都能对上）。
+    """
+    s = unicodedata.normalize("NFKC", str(s or "")).lower()
+    return re.sub(r"[^\w]+", "", s)
 
 # 赛季定义（build 时从 Manifest DestinySeasonDefinition 拉取缓存）
 try:
@@ -175,6 +363,7 @@ def search_seen(prefix: str) -> list[tuple[str, int, str]]:
             if k.rsplit("#", 1)[0].lower().startswith(p)]
 
 
+@_traced(lambda q: f"玩家搜索 {q}")
 async def search_players_fuzzy(q: str) -> list[dict]:
     """不带 #编号 的模糊搜索：Bungie 公开接口已不支持前缀搜索，
     这里只在本地索引（绑定 + PGCR 采集）里找，返回候选玩家列表"""
@@ -225,6 +414,7 @@ def _sum(stats_list: list[dict], mode: str) -> dict:
     return out
 
 
+@_traced(lambda name: f"/玩家 {name}")
 async def full_report(name: str) -> dict:
     """玩家全量数据：档案 + 各角色 PVP/PVE/智谋 合并统计"""
     member = await resolve_member(name)
@@ -237,19 +427,27 @@ async def full_report(name: str) -> dict:
         raise LookupError(f"{member['display']} 档案下没有角色")
 
     chars_meta, pvp_list, pve_list, gmb_list = [], [], [], []
-    for cid, c in chars.items():
+    nchars = len(chars)
+    fdisp = f"{member['display']}#{fmt_code(member['code'])}"
+    log_progress(f"full:{mid}", 0, nchars, label=f"/玩家 {fdisp}", force=True,
+                 extra=f"拉取 {nchars} 个角色的 PVP/PVE/智谋生涯统计")
+    for ci, (cid, c) in enumerate(chars.items(), 1):
         chars_meta.append({
             "id": cid, "class": CLASS_NAMES.get(c["classType"], "?"),
             "race": RACE_NAMES.get(c["raceType"], "?"), "light": c["light"],
             "playtime_min": int(c.get("minutesPlayedTotal", 0)),
-            "last_played": c["dateLastPlayed"][:16].replace("T", " "),
+            "last_played": _cn8(c["dateLastPlayed"][:16].replace("T", " ")),
             "emblem": BASE + c.get("emblemPath", ""),
             "emblem_bg": BASE + c.get("emblemBackgroundPath", ""),
         })
         st = await char_stats(mtype, mid, cid, "101,103,104")
         pvp_list.append(st); pve_list.append(st); gmb_list.append(st)
+        log_progress(f"full:{mid}", ci, nchars, label=f"/玩家 {fdisp}",
+                     extra=f"角色 {ci}/{nchars} 统计完成")
 
     # 智谋：官方聚合接口已下线，从对局历史聚合（跨角色，去重）
+    log_progress(f"full:{mid}", nchars, nchars, label=f"/玩家 {fdisp}", force=True,
+                 extra="聚合智谋对局历史（每人最近 100 场）")
     gkilled = gdeaths = gcount = gwins = 0
     seen_g = set()
     for cid in chars:
@@ -287,6 +485,7 @@ def esc_err(exc: BaseException) -> str:
     return txt[:200]
 
 
+@_traced(lambda name, group="allPvP": f"生涯统计 {name}")
 async def lifetime_stats(name: str, group: str = "allPvP") -> dict:
     """Bungie 官方**生涯**统计（跨角色求和）；group: allPvP / allPvE / gambit"""
     member = await resolve_member(name)
@@ -297,6 +496,318 @@ async def lifetime_stats(name: str, group: str = "allPvP") -> dict:
     chars = profile.get("characters", {}).get("data", {})
     lst = [await char_stats(mtype, mid, cid, "101,103,104") for cid in chars]
     return _sum(lst, group)
+
+
+# ---------- 生涯面板（分赛季 / 分职业 / 分模式时长） ----------
+
+# 历史统计接口返回的键名基本等于模式定义的 friendlyName 归一化（见 build_modes.py 的 key），
+# 但聚合模式的键名对不上，这里补一张兜底表（键名 → modeType）。
+_MODE_KEY_FIX = {5: "allPvP", 7: "allPvE", 18: "allStrikes", 63: "pvecomp_gambit",
+                 64: "allPvECompetitive", 75: "pvecomp_mamba"}
+
+
+def _mode_key_map() -> dict:
+    m: dict = {}
+    for k, v in MODES.items():
+        if v.get("key"):
+            m.setdefault(v["key"], int(k))
+    for mt, key in _MODE_KEY_FIX.items():
+        m[key] = mt
+    return m
+
+
+# 请求哪些模式：全量都带上，没有数据的模式返回体里直接没有键，UI 再按阈值过滤
+# （MODES 在文件下方才建好，这里延迟到用的时候再算）
+_CAREER_MODES: tuple | None = None
+
+
+def _career_modes() -> tuple:
+    global _CAREER_MODES
+    if _CAREER_MODES is None:
+        _CAREER_MODES = tuple(sorted(int(k) for k in MODES))
+    return _CAREER_MODES
+
+# 赛季等级：progressionHash → (赛季号, 是否声望档, pass条目下标)。
+# 玩家看到的「赛季等级」= 奖励档 + 声望档；S27（溯回，2025-07）起通行证改版为统一轨
+# （一个 progression 一路往上数、可超 100，声望档成迁移遗留），且 seasonPassList 里
+# 混入活动 pass（铁旗余灰/凯旋 等）——按「pass 名 ⊆ 赛季名」挑主条目（build_seasons.py）。
+_SEASON_PROG: dict[int, tuple] = {}
+_SEASON_PASS_MAIN: dict[int, int] = {}
+for _s in SEASONS:
+    _ps = _s.get("passes") or [{"rew": _s.get("prog"), "pres": _s.get("pres"), "name": ""}]
+    _pick = 0
+    _nm = _s.get("name") or ""
+    for _i, _p in enumerate(_ps):
+        if _p.get("rew"):
+            _SEASON_PROG[int(_p["rew"])] = (int(_s["number"]), False, _i)
+        if _p.get("pres"):
+            _SEASON_PROG[int(_p["pres"])] = (int(_s["number"]), True, _i)
+        if _p.get("name") and _p["name"] in _nm and _pick == 0 and _i > 0:
+            _pick = _i
+    _SEASON_PASS_MAIN[int(_s["number"])] = _pick
+
+
+def _season_days(s: dict) -> int:
+    """赛季持续天数；end 是 2099 哨兵（当前赛季）时算到今天"""
+    import datetime
+    try:
+        st = datetime.date.fromisoformat(s["start"][:10])
+    except (KeyError, ValueError):
+        return 0
+    end = (s.get("end") or "")[:10]
+    if not end or end >= "2099":
+        en = datetime.date.today()
+    else:
+        try:
+            en = datetime.date.fromisoformat(end)
+        except ValueError:
+            en = datetime.date.today()
+    return max((en - st).days, 0)
+
+
+# ---------- 每赛季游玩时长（每日历史统计 + 本地缓存） ----------
+# 口径（实测核实）：每日统计里 allPvE / allPvP / allPvECompetitive(智谋) 三大类互斥且
+# 并起来覆盖全部活动；细分键（patrol/raid/story…）会漏（打击只挂 allStrikes、部分活动
+# 无细分键），所以只认这三类，别拿细分键求和。
+# 接口限制（Wj#8984 实测）：单次 daystart..dayend 相差 ≤31 天（32 天打回 ErrorCode 18），
+# 所以按自然月分块；每日数据官方约保留 2 年半，2019 年（S8/S9）已查不到 → 计 0。
+_TIME_DAY_KEYS = ("allPvE", "allPvP", "allPvECompetitive")
+_TIME_CACHE_FILE = "season_time_cache.json"
+_TIME_TAIL_DAYS = 10                # 最近 N 天官方还会回填，不封存
+_time_cache: dict[str, dict] = {}   # mid|cid → {"days": {日期: 秒}, "done": 封存到的日期}
+_time_cache_ready = False
+
+
+def _load_time_cache():
+    global _time_cache_ready
+    if _time_cache_ready:
+        return
+    _time_cache_ready = True
+    try:
+        with open(_writable_path(_TIME_CACHE_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _time_cache.update(data)
+    except Exception:  # noqa: BLE001 首次运行/文件损坏都不影响统计
+        pass
+
+
+def _save_time_cache():
+    try:
+        with open(_writable_path(_TIME_CACHE_FILE), "w", encoding="utf-8") as f:
+            json.dump(_time_cache, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 写不进去就算了，只是下次重拉
+        pass
+
+
+async def _fetch_daily_secs(mtype: int, mid: str, cid: str,
+                            day0: str, day1: str) -> dict[str, float]:
+    """一段窗口（≤31 天）的 {日期: 在场秒数}；接口报错（角色已删等）返回空表"""
+    r = await client().get(
+        f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{cid}/Stats/",
+        params={"periodType": "Daily", "groups": "General",
+                "daystart": day0, "dayend": day1})
+    resp = r.json()
+    if resp.get("ErrorCode") != 1:
+        return {}
+    out: dict[str, float] = {}
+    R = resp.get("Response") or {}
+    for key in _TIME_DAY_KEYS:
+        for dv in (R.get(key) or {}).get("daily", []):
+            sp = ((dv.get("values") or {}).get("secondsPlayed") or {}).get("basic", {})
+            d = (dv.get("period") or "")[:10]
+            if d and sp.get("value"):
+                out[d] = out.get(d, 0) + float(sp["value"])
+    return out
+
+
+def _month_chunks(day0: str, day1: str):
+    """[day0, day1] 按自然月切块（每月一个请求，≤31 天符合接口上限）"""
+    import datetime
+    d0, d1 = datetime.date.fromisoformat(day0), datetime.date.fromisoformat(day1)
+    while d0 <= d1:
+        nxt = (d0.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)  # 下月 1 号
+        yield d0.isoformat(), min(nxt - datetime.timedelta(days=1), d1).isoformat()
+        d0 = nxt
+
+
+async def _char_day_secs(mtype: int, mid: str, cid: str) -> dict[str, float]:
+    """角色全史 {日期: 秒数}：已封存日期走缓存，只补抓封存点前 ~10 天到今天的窗口"""
+    import datetime
+    _load_time_cache()
+    ent = _time_cache.setdefault(f"{mid}|{cid}", {"days": {}, "done": ""})
+    days: dict = ent.setdefault("days", {})
+    today = datetime.date.today()
+    start = min((s["start"][:10] for s in SEASONS), default=today.isoformat())
+    done = ent.get("done") or ""
+    if done:
+        back = (datetime.date.fromisoformat(done)
+                - datetime.timedelta(days=_TIME_TAIL_DAYS)).isoformat()
+        fetch_from = max(start, back)
+    else:
+        fetch_from = start
+    for a, b in _month_chunks(fetch_from, today.isoformat()):
+        days.update(await _fetch_daily_secs(mtype, mid, cid, a, b))
+        # 封存点推进到「窗口结束」与「今天-10 天」的较早者（当前月只封到今天-10）
+        seal = min(datetime.date.fromisoformat(b), today - datetime.timedelta(days=_TIME_TAIL_DAYS))
+        if seal.isoformat() > (ent.get("done") or ""):
+            ent["done"] = seal.isoformat()
+        _save_time_cache()
+    return days
+
+
+def _season_hours(s: dict, day_maps: list[dict]) -> float:
+    """把各角色日表按赛季窗口合计成小时；end 是 2099 哨兵（当前赛季）时算到今天"""
+    import datetime
+    st = (s.get("start") or "")[:10]
+    en = (s.get("end") or "")[:10]
+    if not en or en >= "2099":
+        en = datetime.date.today().isoformat()
+    sec = sum(v for dm in day_maps for d, v in dm.items() if st <= d <= en)
+    return sec / 3600.0
+
+
+async def _char_stats_full(mtype: int, mid: str, cid: str, on_batch=None) -> dict:
+    """单角色的历史统计总表（合并多次分批请求后的 Response）。
+
+    modes 参数一次塞太多会被官方接口打回（ErrorCode 3），按 15 个一组分批再去重合并。
+    合并后的 Response 既含各模式的 allTime.secondsPlayed（算时长），
+    也含 allPvP / allPvE / pvecomp_gambit 等聚合条目（算击杀 / KD）。
+    on_batch: 每批回调 on_batch(已完成批数, 总批数)
+    """
+    modes = list(_career_modes())
+    out: dict = {}
+    batches = list(range(0, len(modes), 15))
+    for bi, i in enumerate(batches, 1):
+        r = await client().get(
+            f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{cid}/Stats/",
+            params={"groups": "General",
+                    "modes": ",".join(str(m) for m in modes[i:i + 15])})
+        resp = r.json()
+        if resp.get("ErrorCode") != 1:
+            continue
+        for key, v in (resp.get("Response") or {}).items():
+            out.setdefault(key, v)
+        if on_batch:
+            on_batch(bi, len(batches))
+    return out
+
+
+def _mode_hours(stats: dict) -> dict:
+    """合并后的统计表 → {modeType: 小时}（只保留有时长的模式）"""
+    key2mt = _mode_key_map()
+    out: dict = {}
+    for key, v in (stats or {}).items():
+        mt = key2mt.get(key)
+        if mt is None or mt in out:
+            continue
+        sp = (((v.get("allTime") or {}).get("secondsPlayed") or {})
+              .get("basic", {}).get("value"))
+        if sp:
+            out[mt] = sp / 3600.0
+    return out
+
+
+@_traced(lambda name: f"/生涯 {name}")
+async def career_report(name: str) -> dict:
+    """生涯面板数据：分赛季等级 + 分职业 / 分模式时长 + 三模式生涯聚合。
+
+    全程只打 GetProfile / GetHistoricalStats，不逐场拉 PGCR，所以是秒级出图。
+    """
+    member = await resolve_member(name)
+    if not member:
+        raise LookupError(f"没找到玩家 {name}")
+    mtype, mid = member["mtype"], member["mid"]
+    r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/",
+                           params={"components": "100,200,202"})
+    resp = r.json()
+    if resp.get("ErrorCode") != 1:
+        raise RuntimeError(resp.get("Message", "Bungie API 错误"))
+    R = resp["Response"]
+    chars_raw = (R.get("characters") or {}).get("data") or {}
+    if not chars_raw:
+        raise LookupError(f"{member['display']} 档案下没有角色")
+    prog_raw = (R.get("characterProgressions") or {}).get("data") or {}
+    pdata = (R.get("profile") or {}).get("data") or {}
+
+    chars, stat_list = [], []
+    day_maps: list[dict] = []
+    season_rank: dict[int, int] = {}
+    rank_entries: dict[int, dict[int, list]] = {}  # 赛季号 → pass条目下标 → [奖励档, 声望档]
+    # 每个角色要把「全部分模式」的 General 统计分 15 个一批拉完，是本地/生涯里
+    # 最耗时的一段（3 角色 × 5 批），日志里给条进度 + 预估。
+    nchars = len(chars_raw)
+    nb = max(1, (len(_career_modes()) + 14) // 15)
+    total_steps = nchars * nb
+    disp = f"{member['display']}#{fmt_code(member['code'])}"
+    log_progress(f"career:{mid}", 0, total_steps, label=f"/生涯 {disp}", force=True,
+                 extra=f"拉取 {nchars} 个角色的分模式历史统计（每角色 {nb} 批）")
+    for ci, (cid, c) in enumerate(chars_raw.items(), 1):
+        st = await _char_stats_full(
+            mtype, mid, cid,
+            on_batch=lambda bi, bn, ci=ci: log_progress(
+                f"career:{mid}", (ci - 1) * nb + bi, total_steps,
+                label=f"/生涯 {disp}", extra=f"角色 {ci}/{nchars} · 第 {bi}/{bn} 批"))
+        stat_list.append(st)
+        # 每日在场秒数（首跑要分月补抓全史，之后只补最近 ~10 天）
+        day_maps.append(await _char_day_secs(mtype, mid, cid))
+        chars.append({
+            "class": CLASS_NAMES.get(c["classType"], "?"),
+            "light": c["light"],
+            "minutes": int(c.get("minutesPlayedTotal", 0)),
+            "emblem": BASE + c.get("emblemPath", ""),
+            "emblem_bg": BASE + c.get("emblemBackgroundPath", ""),
+            "modes": _mode_hours(st),
+        })
+        prog = ((prog_raw.get(cid) or {}).get("progressions")) or {}
+        for h, v in prog.items():
+            hit = _SEASON_PROG.get(int(h))
+            if not hit:
+                continue
+            num, is_pres, pidx = hit
+            lvl = int(v.get("level") or 0)
+            b = rank_entries.setdefault(num, {}).setdefault(pidx, [0, 0])
+            b[1 if is_pres else 0] = max(b[1 if is_pres else 0], lvl)
+
+    for num, entries in rank_entries.items():
+        def _rank_of(rp, _num=int(num)):
+            # S27 起统一轨：奖励档一路往上数（可超 100），声望档是迁移遗留不再另加
+            rew, pres = rp
+            return rew if (_num >= 27 and rew > 100) else rew + pres
+
+        main = _SEASON_PASS_MAIN.get(num, 0)
+        if main in entries:
+            rk = _rank_of(entries[main])
+        else:
+            rk = max(_rank_of(rp) for rp in entries.values())
+        season_rank[num] = max(season_rank.get(num, 0), rk)
+
+    chars.sort(key=lambda c: -c["minutes"])
+    # 只加字段不删字段：旧调用方（角色卡等）拿 dict(s) 依旧兼容
+    seasons = [dict(s, days=_season_days(s), rank=season_rank.get(int(s["number"]), 0),
+                    time_h=round(_season_hours(s, day_maps), 1))
+               for s in SEASONS]
+
+    pvp = _sum(stat_list, "allPvP")
+    pve = _sum(stat_list, "allPvE")
+    gambit = _sum(stat_list, "pvecomp_gambit")
+    gambit.pop("kd", None)
+    if gambit.get("deaths"):
+        gambit["kd"] = gambit["kills"] / gambit["deaths"]
+
+    return {
+        "display": f"{member['display']}#{fmt_code(member['code'])}",
+        "guardian_rank": pdata.get("currentGuardianRank") or 0,
+        "max_guardian_rank": pdata.get("lifetimeHighestGuardianRank") or 0,
+        "last_played": _cn8((pdata.get("dateLastPlayed") or "")[:16].replace("T", " ")),
+        "max_light": max(c["light"] for c in chars),
+        "total_playtime": sum(c["minutes"] for c in chars),
+        "emblem_bg": chars[0]["emblem_bg"],
+        "chars": chars,
+        "seasons": seasons,
+        "pvp": pvp, "pve": pve, "gambit": gambit,
+    }
+
 
 
 # ---------- Manifest 索引 ----------
@@ -414,7 +925,14 @@ def weapon_versions_by_name(name: str) -> list[dict]:
 def search_weapons_full(q: str, limit: int = 24) -> list[dict]:
     q = q.lower().strip()
     out = [dict(w, hash=h) for h, w in _weapons_full.items() if q in w["name"].lower()]
-    out.sort(key=lambda w: (not w["name"].lower().startswith(q), w["name"]))
+    if out or not q:
+        out.sort(key=lambda w: (not w["name"].lower().startswith(q), w["name"]))
+    else:  # 原始遍历无命中 → 无符号归一化键重跑同一逻辑（· / ' / - 等符号可省略）
+        nk = norm_key(q)
+        if nk:
+            out = [dict(w, hash=h) for h, w in _weapons_full.items()
+                   if nk in norm_key(w["name"])]
+            out.sort(key=lambda w: (not norm_key(w["name"]).startswith(nk), w["name"]))
     return out[:limit]
 
 
@@ -427,6 +945,15 @@ def search_weapons(q: str, limit: int = 12) -> list[dict]:
             out.insert(0, {"hash": h, **w})
         elif q in n:
             out.append({"hash": h, **w})
+    if not out and q:  # 无符号归一化兜底：精确优先于子串，顺序与原逻辑一致
+        nk = norm_key(q)
+        if nk:
+            for h, w in _weapons.items():
+                n = norm_key(w["name"])
+                if n == nk:
+                    out.insert(0, {"hash": h, **w})
+                elif nk in n:
+                    out.append({"hash": h, **w})
     return out[:limit]
 
 
@@ -443,6 +970,15 @@ def search_perks(q: str, limit: int = 20) -> list[dict]:
             exact.append({"hash": h, **p})
         elif q in n:
             part.append({"hash": h, **p})
+    if not exact and not part and q:  # 无符号归一化兜底
+        nk = norm_key(q)
+        if nk:
+            for h, p in _perks.items():
+                n = norm_key(p["name"])
+                if n == nk:
+                    exact.append({"hash": h, **p})
+                elif nk in n:
+                    part.append({"hash": h, **p})
     out = (exact + part)[:limit]
     for p in out:  # 附上社区数值/说明
         pc = _perk_ci.get(p["hash"])
@@ -459,8 +995,9 @@ def all_armor_sets() -> list[dict]:
 
 
 def _norm_set(q: str) -> str:
-    """套装搜索归一化：小写、去空格、去掉结尾的 套/套装"""
-    q = re.sub(r"\s+", "", q).lower()
+    """套装搜索归一化：NFKC、小写、剔除符号/空白（查询与套装名两侧同规则，
+    「·」「-」等符号省略也能对上）、去掉结尾的 套/套装"""
+    q = re.sub(r"[^\w]+", "", unicodedata.normalize("NFKC", str(q or "")).lower())
     return re.sub(r"(套装|套)$", "", q)
 
 
@@ -602,6 +1139,7 @@ async def player_suggest(q: str, limit: int = 6) -> list[dict]:
     return [{"n": member["display"], "code": fmt_code(member["code"]), "icon": icon}]
 
 
+@_traced("对局详情")
 async def get_pgcr(instance_id: str) -> dict:
     """对局详情：全场玩家数据"""
     r = await client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance_id}/")
@@ -641,6 +1179,7 @@ async def get_pgcr(instance_id: str) -> dict:
     return {
         "name": activity_name(ad.get("referenceId", 0))["name"],
         "period": (d.get("period") or "")[:16].replace("T", " "),
+        "period_cn": _cn8((d.get("period") or "")[:16].replace("T", " ")),
         "entries": entries,
         "instance": instance_id,
     }
@@ -660,6 +1199,269 @@ def split_activity(name: str) -> tuple[str, str]:
     return name, ""
 
 
+def _cn8(s: str) -> str:
+    """UTC 'YYYY-MM-DD HH:MM' → 北京时间同格式（非法串原样返回）"""
+    import datetime
+    try:
+        return (datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")
+                + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return s
+
+
+def _ts_shift(ts: str, secs: int) -> str:
+    import datetime
+    try:
+        return (datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M")
+                + datetime.timedelta(seconds=secs)).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
+
+
+# 突袭/地牢按发售先后排序（/raid /地牢 卡片的展示顺序）
+_RAID_ORDER: tuple[str, ...] = (
+    # —— 突袭 ——
+    "利维坦", "世界吞噬者，利维坦", "利维坦，星之塔", "最后一愿", "救赎花园",
+    "忧愁王冠", "深岩墓室", "玻璃拱顶", "门徒誓约", "国王的陨落", "梦魇根源",
+    "克洛塔的末日", "救赎的边缘", "永恒沙漠", "永恒沙漠（史诗）",
+    # —— 地牢 ——
+    "破碎王座", "异端深渊", "预言", "贪婪之握", "二象性", "守望者尖塔",
+    "深渊机灵", "战争领主的废墟", "晚星之主", "分离教义", "平衡",
+)
+_RAID_ORDER_IDX = {n: i for i, n in enumerate(_RAID_ORDER)}
+
+# 首日/首周判定用的发售时刻（UTC 'YYYY-MM-DD HH:MM'，Bungie 常规 17:00 上线；
+# 地牢多为 18:00）。没把握的时刻宁缺毋滥：不在此表里的副本不出首日/首周徽章。
+_RAID_RELEASE_UTC: dict[str, str] = {
+    "利维坦": "2017-09-13 17:00",
+    "世界吞噬者，利维坦": "2018-05-11 17:00",
+    "利维坦，星之塔": "2018-07-14 17:00",
+    "最后一愿": "2018-09-14 17:00",
+    "救赎花园": "2019-10-05 17:00",
+    "忧愁王冠": "2019-06-04 23:00",
+    "深岩墓室": "2020-11-21 17:00",
+    "玻璃拱顶": "2021-05-22 17:00",
+    "门徒誓约": "2022-03-05 17:00",
+    "国王的陨落": "2022-08-26 17:00",
+    "梦魇根源": "2023-03-10 17:00",
+    "克洛塔的末日": "2023-09-01 17:00",
+    "救赎的边缘": "2024-06-07 17:00",
+    "永恒沙漠": "2025-07-19 17:00",
+    "永恒沙漠（史诗）": "2025-09-27 17:00",
+    "破碎王座": "2018-12-14 18:00",
+    "异端深渊": "2019-11-05 18:00",
+    "预言": "2020-06-09 18:00",
+    "贪婪之握": "2021-12-07 17:00",
+    "二象性": "2022-05-27 17:00",
+    "守望者尖塔": "2022-12-09 17:00",
+    "深渊机灵": "2023-05-26 17:00",
+    "战争领主的废墟": "2023-12-01 17:00",
+    "晚星之主": "2024-10-11 17:00",
+    "分离教义": "2025-02-07 17:00",
+    "平衡": "2025-12-13 17:00",
+}
+
+
+# 首日排名数据源：raid.report / dungeon.report 的后端 api.raidreport.dev（无 CF，可直接 HTTP）。
+# 前端枚举里挖出来的 worldsfirst 首日榜：/raid|dungeon/leaderboard/worldsfirst/{slug}[/版本]
+# ？membershipId=... → 该玩家首日通关的名次（404=没打过首日）。API 慢（冷启动 ~20s+）、
+# 连续快查会吃 CF 403 —— 所以结果落盘缓存（首日名次永不变化）+ 进程内去重 + 失败不缓存。
+_RR_BASE = "https://api.raidreport.dev"
+_RR_SLUG: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    # 副本名: (kind, slug, 版本候选)  版本候选依次试，命中即缓存（''=不带版本段）
+    "利维坦": ("raid", "leviathan", ("",)),
+    "世界吞噬者，利维坦": ("raid", "eaterofworlds", ("",)),
+    "利维坦，星之塔": ("raid", "spireofstars", ("",)),
+    "最后一愿": ("raid", "lastwish", ("",)),
+    "救赎花园": ("raid", "gardenofsalvation", ("",)),
+    "忧愁王冠": ("raid", "crownofsorrow", ("",)),
+    "深岩墓室": ("raid", "deepstonecrypt", ("",)),
+    "玻璃拱顶": ("raid", "vaultofglass", ("",)),
+    "门徒誓约": ("raid", "vowofthedisciple", ("",)),
+    "国王的陨落": ("raid", "kingsfall", ("",)),
+    "梦魇根源": ("raid", "rootofnightmares", ("",)),
+    "克洛塔的末日": ("raid", "crotasend", ("",)),
+    "救赎的边缘": ("raid", "salvationsedge", ("",)),
+    "永恒沙漠": ("raid", "desertperpetual", ("",)),
+    "永恒沙漠（史诗）": ("raid", "desertperpetual", ("epic", "epiccontest")),
+    "破碎王座": ("dungeon", "shatteredthrone", ("",)),
+    "异端深渊": ("dungeon", "pitofheresy", ("",)),
+    "预言": ("dungeon", "prophecy", ("",)),
+    "贪婪之握": ("dungeon", "graspofavarice", ("",)),
+    "二象性": ("dungeon", "duality", ("",)),
+    "守望者尖塔": ("dungeon", "spireofthewatcher", ("",)),
+    "深渊机灵": ("dungeon", "ghostsofthedeep", ("",)),
+    "战争领主的废墟": ("dungeon", "warlordsruin", ("",)),
+    "晚星之主": ("dungeon", "vespershost", ("",)),
+    "分离教义": ("dungeon", "sundereddoctrine", ("",)),
+    "平衡": ("dungeon", "equilibrium", ("",)),
+}
+_RR_RANK_PATH = os.path.join("raidreport_ranks.json")
+_RR_RANKS: dict | None = None
+_RR_INFLIGHT: set[str] = set()
+# 大师组的版本段（有大师首日赛的副本才有数据，404 就是没有）
+_RR_MASTER_VERSIONS: tuple[str, ...] = ("master",)
+
+
+def _rr_ranks() -> dict:
+    global _RR_RANKS
+    if _RR_RANKS is None:
+        try:
+            _RR_RANKS = json.load(open(_RR_RANK_PATH, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _RR_RANKS = {}
+    return _RR_RANKS
+
+
+def _rr_save() -> None:
+    try:
+        json.dump(_rr_ranks(), open(_RR_RANK_PATH, "w", encoding="utf-8"),
+                  ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_NOT_RANKED = {"rank": 0}   # 确认没打过首日（也缓存，省得反复打 API）
+
+
+async def _rr_fetch_json(url: str, mid: str) -> tuple[dict | None, bool]:
+    """api.raidreport.dev GET：先直连 httpx；被 CF 盾拦/网络错时借用户的调试 Edge
+    （weapon_usage 同款 CDP 通道，9222 在线才走）。返回 (json, 是否为 API 明确的 404)。
+
+    注意 CDP 路径必须「先开 raid.report 页、再页内 fetch」：直接 goto API 地址是顶层导航，
+    缺 Origin/sec-fetch 头，对方 Lambda 会回 Bad Request。
+    (None, False) = 两条通道都不通，调用方不要缓存结果。"""
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            r = await c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 404:
+                return None, True
+            if r.status_code == 200:
+                try:
+                    return r.json(), False
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            b = await p.chromium.connect_over_cdp("http://127.0.0.1:9222", timeout=15000)
+            try:
+                ctx = b.contexts[0] if b.contexts else await b.new_context()
+                page = await ctx.new_page()
+                try:
+                    await page.goto("https://raid.report/steam/" + mid,
+                                    timeout=60000, wait_until="commit")
+                    # 过盾：中英文挑战页标题都认（真实浏览器托管挑战一般几秒自动过）
+                    for _ in range(45):
+                        t = await page.title()
+                        if t and "moment" not in t.lower() and "请稍候" not in t:
+                            break
+                        await page.wait_for_timeout(1000)
+                    raw = await page.evaluate(
+                        """async u => { const r = await fetch(u, {credentials:'omit'});
+                           return {status: r.status, body: await r.text()}; }""", url)
+                finally:
+                    await page.close()
+            finally:
+                await b.close()   # 只断开 CDP，不杀浏览器
+        if raw["status"] == 404:
+            return None, True
+        if raw["status"] != 200:
+            return None, False
+        return json.loads(raw["body"]), False
+    except Exception:  # noqa: BLE001
+        return None, False
+
+
+async def _day_one_rank(mtype: int, mid: str, base: str, is_master: bool) -> dict | None:
+    """查首日名次 → {"rank": n, "total": 总队数}；没打过首日/查询失败 → None。
+
+    200 里找到本号条目、或 API 明确 404（没在 24h 内通关）→ 落盘永久缓存；
+    403（CF）/超时/其它网络错 → 不缓存，下次再试。"""
+    info = _RR_SLUG.get(base)
+    if not info:
+        return None
+    kind, slug, ver_cands = info
+    if is_master:
+        ver_cands = _RR_MASTER_VERSIONS
+    ent = _rr_ranks().get(f"{mtype}:{mid}", {})
+    inflight = f"{mtype}:{mid}:{kind}:{slug}:{'M' if is_master else 'S'}"
+    if inflight in _RR_INFLIGHT:
+        return None
+    # 各版本候选：缓存里有名次直接用；缓存过「无排名」的跳过；剩下的才打 API
+    need = []
+    for ver in ver_cands:
+        hit = ent.get(f"{base}|{ver}" if ver else base)
+        if hit is not None and hit.get("rank"):
+            return hit
+        if hit is None:
+            need.append(ver)
+    if not need:
+        return None
+    _RR_INFLIGHT.add(inflight)
+    try:
+        for ver in need:
+            k = f"{base}|{ver}" if ver else base
+            path = f"/{kind}/leaderboard/worldsfirst/{slug}" + (f"/{ver}" if ver else "")
+            url = f"{_RR_BASE}{path}?membershipId={mid}"
+            d, not_found = await _rr_fetch_json(url, str(mid))
+            if d is None:
+                if not_found:
+                    # API 的明确回答：该号没在首日窗口内通关（也是终态，缓存）
+                    _rr_ranks().setdefault(f"{mtype}:{mid}", {})[k] = _NOT_RANKED
+                    _rr_save()
+                    continue
+                return None
+            resp = (d.get("response") or {})
+            mine = None
+            for e in resp.get("entries") or []:
+                for u in e.get("destinyUserInfos") or []:
+                    if str(u.get("membershipId")) == str(mid):
+                        mine = e
+                        break
+                if mine:
+                    break
+            if not mine:
+                # 有条目但没本号：拿不准（分页/跨平台），不缓存
+                return None
+            out = {"rank": int(mine.get("rank") or 0),
+                   "total": int((resp.get("metadata") or {}).get("totalResults") or 0)}
+            _rr_ranks().setdefault(f"{mtype}:{mid}", {})[k] = out
+            _rr_save()
+            return out
+        return None
+    finally:
+        _RR_INFLIGHT.discard(inflight)
+
+
+async def _pgcr_run_info(instance: str) -> dict:
+    """PGCR 局面信息：fresh=是否从头开始打、accounts=全程出现过的账号数、private=私局。
+
+    尾王检查点进去的局官方直接给 activityWasStartedFromBeginning=False；
+    字段缺失/拉取失败返回 {}（上层按「未知」处理，维持旧口径不瞎扣）。"""
+    try:
+        r = await client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance}/")
+        d = json.loads(r.content.decode("utf-8-sig"))
+        if d.get("ErrorCode") != 1:
+            return {}
+        resp = d.get("Response") or {}
+        accs = set()
+        for e in resp.get("entries") or []:
+            mid_ = str(((e.get("player") or {}).get("destinyUserInfo") or {}).get("membershipId") or "")
+            if mid_:
+                accs.add(mid_)
+        return {
+            "fresh": resp.get("activityWasStartedFromBeginning"),
+            "accounts": len(accs) or len(resp.get("entries") or []),
+            "private": bool((resp.get("activityDetails") or {}).get("isPrivate")),
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+@_traced(lambda name, mode: (f"/地牢 {name}" if mode == 82 else f"/raid {name}"))
 async def raid_report(name: str, mode: int) -> dict:
     """Raid(4)/地牢(82) 报告：跨角色合并对局，按副本分组统计（标准与大师各成一组）"""
     member = await resolve_member(name)
@@ -670,10 +1472,15 @@ async def raid_report(name: str, mode: int) -> dict:
     chars = profile.get("characters", {}).get("data", {})
 
     seen, matches = set(), []
-    for cid in chars:
-        # 翻页拿全：只取最近 100 场会让"去年打的大师"排不进窗口，看起来像记录缺失
+    rname = "地牢" if mode == 82 else "raid"
+    disp = f"{member['display']}#{fmt_code(member['code'])}"
+    nchars = len(chars) or 1
+    log_progress(f"raid:{mid}:{mode}", 0, nchars * 40, label=f"/{rname} {disp}", force=True,
+                 extra="翻取副本对局历史（每人最多 40 页 × 250 场）")
+    for ci, cid in enumerate(chars, 1):
+        # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
         page = 0
-        while page < 3:
+        while page < 40:
             acts = await activity_history(mtype, mid, cid, mode, count=250, page=page)
             for m in acts:
                 key = m["instance"] or f"{m['ref']}{m['period']}"
@@ -683,7 +1490,37 @@ async def raid_report(name: str, mode: int) -> dict:
             if len(acts) < 250:
                 break
             page += 1
+            log_progress(f"raid:{mid}:{mode}", (ci - 1) * 40 + page, nchars * 40,
+                         label=f"/{rname} {disp}",
+                         extra=f"角色 {ci}/{nchars} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
+    log_progress(f"raid:{mid}:{mode}", nchars * 40, nchars * 40, label=f"/{rname} {disp}",
+                 force=True, extra=f"历史翻取完成，共 {len(matches)} 场，开始统计")
     matches.sort(key=lambda m: m["period"], reverse=True)
+    # 展示用北京时间（period 保留 UTC 原值给首日/首周判定）
+    for m in matches:
+        m["period_cn"] = _cn8(m["period"])
+        m["full_run"], m["private"], m["low_accounts"] = True, False, m["player_count"]
+
+    # 特殊通关复核：0 死亡通关 / 低人通关才拉 PGCR —— 判断「是否从头开始打」。
+    # 尾王检查点进去通掉尾王（哪怕 0 死）官方 PGCR 给 activityWasStartedFromBeginning=False，
+    # 不算全程无暇（用户 2026-10-02 指定口径）；私局（自定义装载）也不进特殊徽章。
+    cand = [m for m in matches if m["completed"] and (m["deaths"] == 0 or 0 < m["player_count"] <= 3)]
+    if cand:
+        log_progress(f"raid:{mid}:{mode}", 0, len(cand), label=f"/{rname} {disp}", force=True,
+                     extra=f"复核 {len(cand)} 场特殊通关（全程 / 低人口径）")
+        for i in range(0, len(cand), 6):
+            chunk = cand[i:i + 6]
+            infos = await asyncio.gather(*[_pgcr_run_info(m["instance"]) for m in chunk])
+            for m, info in zip(chunk, infos):
+                if info:
+                    m["full_run"] = info["fresh"] is not False
+                    m["private"] = info["private"]
+                    # 账号数取 PGCR 全程出现过的账号 与 场上人数 的较大者：
+                    # 6 人团中途退到剩 2 人通关，靠 PGCR 账号数戳穿不算双人；
+                    # 老对局 PGCR 被官方裁剪只剩 1 条时，回落历史 player_count
+                    m["low_accounts"] = max(info["accounts"], m["player_count"])
+            log_progress(f"raid:{mid}:{mode}", min(i + 6, len(cand)), len(cand),
+                         label=f"/{rname} {disp}")
 
     # 大师单独成组：标准/普通与大师的 无暇/单人/双人/三人 口径不该混在一起算
     groups: dict[tuple[str, bool], dict] = {}
@@ -691,53 +1528,77 @@ async def raid_report(name: str, mode: int) -> dict:
         base, diff = split_activity(m["name"])
         m["base"], m["diff"] = base, diff
         is_master = diff == "大师"
+        rel = _RAID_RELEASE_UTC.get(base) or ""
         g = groups.setdefault((base, is_master), {
             "name": base, "master_mode": is_master, "ref": m["ref"], "pgcr": m["pgcr"],
             "plays": 0, "clears": 0, "best": None, "last": "",
             "flawless": 0, "solo": 0, "duo": 0, "trio": 0,
             "solo_fl": 0, "duo_fl": 0, "trio_fl": 0, "master": 0, "diffs": [],
+            "day_one": 0, "week_one": 0,
+            "rel_d1": _ts_shift(rel, 24 * 3600) if rel else "",
+            "rel_w1": _ts_shift(rel, 7 * 24 * 3600) if rel else "",
         })
         if diff and diff not in g["diffs"]:
             g["diffs"].append(diff)
         g["plays"] += 1  # 参与次数：含没打完的（中途退、卡机制、只打到一半）
         if m["completed"]:
             g["clears"] += 1
+            # 最近 = 最后一次【通关】的时间。对局是倒序遍历的，必须取 max，
+            # 直接赋值会把最旧一场通关留在最后（老版本「最近」一直显示成最早通关就是这个坑）
+            g["last"] = max(g["last"], m["period_cn"])
             pc = m["player_count"]
-            fl = m["deaths"] == 0
+            accs = m["low_accounts"]
+            # 全程无暇：0 死亡 + 从头开始 + 非私局
+            fl = m["deaths"] == 0 and m["full_run"] and not m["private"]
             if fl:
                 g["flawless"] += 1
-            if pc:
-                if pc == 1:
+            if pc and not m["private"]:
+                # 低人 = 全程出现过的账号数（raid.report 的 accountCount 口径）
+                if accs == 1:
                     g["solo"] += 1
-                if pc <= 2:
+                if accs <= 2:
                     g["duo"] += 1
-                if pc <= 3:
+                if accs <= 3:
                     g["trio"] += 1
                 if fl:
-                    if pc == 1:
+                    if accs == 1:
                         g["solo_fl"] += 1
-                    if pc <= 2:
+                    if accs <= 2:
                         g["duo_fl"] += 1
-                    if pc <= 3:
+                    if accs <= 3:
                         g["trio_fl"] += 1
             if is_master:
                 g["master"] += 1
+            # 首日/首周：以对局开始时刻（UTC）落在发售窗口内为准（私局不算）
+            if rel and not m["private"]:
+                if g["rel_d1"] >= m["period"] >= rel:
+                    g["day_one"] += 1
+                if g["rel_w1"] >= m["period"] >= rel:
+                    g["week_one"] += 1
             if g["best"] is None or m["duration"] < g["best"]:
                 g["best"] = m["duration"]
-            g["last"] = m["period"]
     done = [m for m in matches if m["completed"]]
+    _unk = len(_RAID_ORDER_IDX)
     std = sorted((g for g in groups.values() if not g["master_mode"]),
-                 key=lambda g: (-g["clears"], -g["plays"]))
+                 key=lambda g: (_RAID_ORDER_IDX.get(g["name"], _unk), g["name"]))
     mst = sorted((g for g in groups.values() if g["master_mode"]),
-                 key=lambda g: (-g["clears"], -g["plays"]))
+                 key=lambda g: (_RAID_ORDER_IDX.get(g["name"], _unk), g["name"]))
+    _mfl = lambda m: m["deaths"] == 0 and m["full_run"] and not m["private"]
+    # 首日排名：只查真的在首日窗口里有通关的组（API 慢且限流，靠磁盘缓存兜底）
+    for g in (*std, *mst):
+        if g["day_one"] > 0:
+            try:
+                g["d1_rank"] = await _day_one_rank(mtype, mid, g["name"], g["master_mode"])
+            except Exception:  # noqa: BLE001
+                g["d1_rank"] = None
     return {
         "display": f"{member['display']}#{fmt_code(member['code'])}",
         "total_clears": len(done),
         "total_plays": len(matches),
-        "flawless": sum(1 for m in done if m["deaths"] == 0),
-        "solo_fl": sum(1 for m in done if m["deaths"] == 0 and m["player_count"] == 1),
-        "duo_fl": sum(1 for m in done if m["deaths"] == 0 and m["player_count"] == 2),
-        "trio_fl": sum(1 for m in done if m["deaths"] == 0 and 0 < m["player_count"] <= 3),
+        "flawless": sum(1 for m in done if _mfl(m)),
+        "solo_fl": sum(1 for m in done if _mfl(m) and m["low_accounts"] == 1),
+        "duo_fl": sum(1 for m in done if _mfl(m) and m["low_accounts"] <= 2),
+        "trio_fl": sum(1 for m in done if _mfl(m) and 0 < m["low_accounts"] <= 3),
         "master": sum(1 for m in done if m["diff"] == "大师"),
         "matches": matches,
         "raids": std,
@@ -745,6 +1606,7 @@ async def raid_report(name: str, mode: int) -> dict:
     }
 
 
+@_traced(lambda name, per_char=50: f"/战绩 {name}")
 async def history_report(name: str, per_char: int = 50) -> dict:
     """全模式最近对局流（合并所有角色）"""
     member = await resolve_member(name)
@@ -754,9 +1616,17 @@ async def history_report(name: str, per_char: int = 50) -> dict:
     profile = await get_profile(mtype, mid)
     chars = profile.get("characters", {}).get("data", {})
     matches = []
-    for cid in chars:
+    disp = f"{member['display']}#{fmt_code(member['code'])}"
+    nch = len(chars) or 1
+    log_progress(f"history:{mid}", 0, nch, label=f"/战绩 {disp}", force=True,
+                 extra=f"拉取每个角色最近 {per_char} 场对局历史")
+    for ci, cid in enumerate(chars, 1):
         matches += await activity_history(mtype, mid, cid, 0, count=per_char)
+        log_progress(f"history:{mid}", ci, nch, label=f"/战绩 {disp}",
+                     extra=f"角色 {ci}/{nch} 完成 · 已收 {len(matches)} 场")
     matches.sort(key=lambda m: m["period"], reverse=True)
+    for m in matches:
+        m["period_cn"] = _cn8(m["period"])
     return {"display": f"{member['display']}#{fmt_code(member['code'])}", "matches": matches}
 
 
@@ -768,11 +1638,101 @@ def filter_matches(matches: list[dict], month: str = "", base: str = "",
     if diff:
         out = [m for m in out if m.get("diff") == diff]
     if month:
-        out = [m for m in out if m["period"].startswith(month)]
+        # 月份按北京时间算（raid 链路的对局带 period_cn；旧数据没有该字段退回 UTC period）
+        out = [m for m in out if (m.get("period_cn") or m["period"]).startswith(month)]
     return out
 
 
 # ---------- 后台任务（PVP 生涯武器，带进度） ----------
+
+# ---------- 耗时任务的进度日志 ----------
+# 需要拉接口、要跑一会儿的活儿，光在面板进度条上看不见——控制台/日志文件里也要能一眼
+# 看出跑到哪了、还剩多久。统一走下面这几个函数输出「进度条 + 已用 + 预估剩余」。
+_PROG_T0: dict[str, float] = {}   # key → 上次打印时刻（节流用）
+_PROG_PCT: dict[str, float] = {}  # key → 上次打印的百分比
+
+
+def log_progress(key: str, done: int, total: int, label: str = "",
+                 extra: str = "", force: bool = False, min_gap: float = 2.0,
+                 min_pct: float = 2.0) -> None:
+    """打一行进度日志：`[进度] 标签 [████░░░░] 62.0% (312/503) · 已用 0:48 · 预计剩余 0:29（约 12:34:56 完成）`
+
+    key 同一个任务复用（用于记录起始时刻与节流）；done/total 为 0 时不算百分比，
+    只报「已用」。默认「距上次 ≥2 秒 或 百分比涨了 ≥2」才打印，避免刷屏；
+    force=True 时无条件打印（阶段开始/结束用）。
+    """
+    now = time.time()
+    t0 = _PROG_T0.setdefault(key + "#t0", now)
+    pct = (done * 100.0 / total) if total else 0.0
+    if not force:
+        last_t = _PROG_T0.get(key, 0.0)
+        last_p = _PROG_PCT.get(key, -999.0)
+        if pct < 100 and now - last_t < min_gap and pct - last_p < min_pct:
+            return
+    _PROG_T0[key] = now
+    _PROG_PCT[key] = pct
+    if len(_PROG_T0) > 400:  # 长跑实例里别让这两个 dict 一直涨
+        _PROG_T0.clear()
+        _PROG_PCT.clear()
+        _PROG_T0[key + "#t0"] = t0
+        _PROG_T0[key] = now
+        _PROG_PCT[key] = pct
+
+    el = now - t0
+    head = f"{label} " if label else ""
+    if total:
+        filled = int(round(max(0.0, min(100.0, pct)) / 100 * 22))
+        bar = "█" * filled + "░" * (22 - filled)
+        if done:
+            eta = el / done * (total - done)
+            tail = (f" · 已用 {_hm(el)} · 预计剩余 {_sec_text(eta)}"
+                    f"（约 {time.strftime('%H:%M:%S', time.localtime(now + eta))} 完成）"
+                    + (f" · 速度 {el / done:.1f}s/项" if el >= 3 else ""))
+        else:  # 刚拿到总量、还没跑第一条，给不出预估
+            tail = f" · 已用 {_hm(el)} · 预估中"
+        line = f"[进度] {head}[{bar}] {pct:5.1f}% ({done}/{total}){tail}"
+    else:
+        line = f"[进度] {head}已用 {_hm(el)}"
+    if extra:
+        line += f" · {extra}"
+    print(line, flush=True)
+
+
+def log_stage(key: str, text: str) -> None:
+    """阶段性提示（开始拉某个接口 / 翻到第几页），无百分比时用"""
+    print(f"[进度] [{time.strftime('%H:%M:%S')}] {text}", flush=True)
+    _PROG_T0.setdefault(key + "#t0", time.time())
+
+
+def _sec_text(sec: float) -> str:
+    """0:29 / 1:05 / 12:30，便于在日志里扫一眼"""
+    return _hm(sec)
+
+
+def _hm(sec: float) -> str:
+    sec = max(0, int(sec))
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# 全历史翻页扫描（热力图这类「翻到 2019-06 为止」的任务）没有天然总量：
+# 按「已经扫到多早」相对 2019-06 → 今天 的跨度折算成百分比，进度条与预估才有意义。
+_SCAN_FLOOR = "2019-06-01"
+
+
+def _scan_pct(oldest: str) -> float:
+    import datetime
+    try:
+        o = datetime.date.fromisoformat(oldest[:10])
+        f = datetime.date.fromisoformat(_SCAN_FLOOR)
+        t = datetime.date.today()
+    except (ValueError, TypeError):
+        return 0.0
+    span = (t - f).days or 1
+    return max(0.0, min(100.0, (t - o).days * 100.0 / span))
+
+
 JOBS: dict[str, dict] = {}
 _JOB_KEEP = 80
 
@@ -823,6 +1783,37 @@ def _job_ts(jid: str) -> float:
     return float((JOBS.get(jid) or {}).get("ts") or 0)
 
 
+def _job_label(jid: str) -> str:
+    j = JOBS.get(jid) or {}
+    name = j.get("name") or ""
+    return f"{j.get('label') or '任务'} {name}".strip()
+
+
+def _job_log(jid: str, extra: str = "", force: bool = False) -> None:
+    """后台任务 → 进度日志（done/total 直接取自 JOBS）"""
+    j = JOBS.get(jid) or {}
+    log_progress(jid, int(j.get("done") or 0), int(j.get("total") or 0),
+                 label=_job_label(jid), extra=extra, force=force)
+
+
+def _job_start_log(jid: str, note: str = "") -> None:
+    j = JOBS.get(jid) or {}
+    pos = queue_position(jid)
+    tail = f"（前面还有 {pos - 1} 位在排队）" if pos > 0 else ""
+    print(f"[任务] {time.strftime('%H:%M:%S')} ▶ 开始：{_job_label(jid)}"
+          f"{' · ' + note if note else ''}{tail}", flush=True)
+    _PROG_T0[jid + "#t0"] = time.time()
+    _PROG_PCT.pop(jid, None)
+
+
+def _job_end_log(jid: str, ok: bool = True, note: str = "") -> None:
+    t0 = _PROG_T0.get(jid + "#t0")
+    used = f" · 总用时 {_hm(time.time() - t0)}" if t0 else ""
+    mark = "✔ 完成" if ok else "✘ 失败"
+    print(f"[任务] {time.strftime('%H:%M:%S')} {mark}：{_job_label(jid)}{used}"
+          f"{' · ' + note if note else ''}", flush=True)
+
+
 # 生涯武器 / 热力图都要逐场拉 PGCR，多个一起跑会被 Bungie 限流拖慢，整体反而更慢，
 # 所以排成一条队逐个跑；排队中的任务能查到自己是第几位。
 _JOB_QUEUE: list[tuple] = []  # [(jid, factory), ...] 等待中（不含正在跑的）
@@ -847,6 +1838,7 @@ def _pump_jobs():
     jid, factory = _JOB_QUEUE.pop(0)
     _JOB_RUNNING = jid
     JOBS.get(jid, {})["status"] = "running"
+    _job_start_log(jid)
     asyncio.get_event_loop().create_task(_run_queued(jid, factory))
 
 
@@ -856,6 +1848,9 @@ async def _run_queued(jid: str, factory):
         await factory()
     except Exception as exc:  # noqa: BLE001  兜底：别让队列卡死
         JOBS.get(jid, {}).update(status="error", error=str(exc))
+        _job_end_log(jid, ok=False, note=str(exc))
+    else:
+        _job_end_log(jid)
     finally:
         JOBS.get(jid, {})["ended"] = time.time()  # 复用窗口从这个时刻算起
         _JOB_RUNNING = None
@@ -1097,13 +2092,15 @@ async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
 
 async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
                            since: str, until: str, cap: int,
-                           skip_modes: frozenset = frozenset()) -> list[dict]:
+                           skip_modes: frozenset = frozenset(),
+                           on_page=None) -> list[dict]:
     """收集对局（跨角色去重，新→旧）；since/until 为空串表示不限时间
 
     mode: 5=所有PVP 7=所有PVE；skip_modes 里的具体玩法会被丢掉
+    on_page: 每翻完一页回调一次 on_page(已翻页数, 已收集场次)，用于打进度日志
     """
     seen, matches = set(), []
-    for cid in chars:
+    for ci, cid in enumerate(chars):
         page = 0
         while page < 60 and len(matches) < cap:  # 60页×250 ≈ 1.5万场/角色的兜底
             acts = await activity_history(mtype, mid, cid, mode, count=250, page=page)
@@ -1130,6 +2127,8 @@ async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
             if stop or len(acts) < 250:
                 break
             page += 1
+            if on_page:
+                on_page(ci + 1, len(chars), page, len(matches))
     matches.sort(key=lambda m: m["period"], reverse=True)
     return matches
 
@@ -1209,13 +2208,24 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
              "cached": base_matches if reuse else 0, "added": 0,
              "weapons": sorted(agg.values(), key=lambda x: -x["kills"]), **tot}
     try:
-        matches = await _collect_matches(mtype, mid, chars, mode, eff_since, until, cap, skip_modes)
+        def _on_page(ci, cn, page, n):
+            log_progress(f"{jid}#collect", page, 0,
+                         label=f"{_job_label(jid)} · 翻取对局历史",
+                         extra=f"角色 {ci}/{cn} · 第 {page} 页 · 已收集 {n} 场",
+                         min_gap=1.5, min_pct=0)
+
+        log_stage(f"{jid}#collect", f"{_job_label(jid)}：开始翻取对局历史…")
+        matches = await _collect_matches(mtype, mid, chars, mode, eff_since, until, cap,
+                                         skip_modes, on_page=_on_page)
         if reuse and base_newest_full:  # 边界那天会重复枚举，按完整时间戳只留更新的
             matches = [m for m in matches if m["period"] > base_newest_full]
         if not matches:  # 没有新对局：有缓存就直接返回上次排名，否则返回空态
+            log_stage(f"{jid}#collect", f"{_job_label(jid)}：没有新对局，直接出图")
             JOBS[jid].update(status="done", total=1, done=1, result=empty)
             return
         JOBS[jid].update(total=len(matches))
+        log_progress(jid, 0, len(matches), label=_job_label(jid), force=True,
+                     extra="开始逐场拉取对局明细")
         missed = 0
         sem = asyncio.Semaphore(_PVP_CONCURRENCY)
         lock = asyncio.Lock()
@@ -1230,6 +2240,7 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
             if not c:
                 missed += 1
                 JOBS[jid]["done"] += 1
+                _job_log(jid)
                 return
             async with lock:
                 for k in tot:
@@ -1244,6 +2255,7 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                     a["precision"] += w["precision"]
                     a["matches"] += 1
                 JOBS[jid]["done"] += 1
+                _job_log(jid)
 
         await asyncio.gather(*(one(m) for m in matches))
         save_seen_players()
@@ -1319,7 +2331,7 @@ def _gm_bucket(matches: list[dict]) -> list[dict]:
             "attempts": 0, "clears": 0, "fastest": 0, "avg": 0,
             "last": ""})
         g["attempts"] += 1
-        g["last"] = max(g["last"], m["period"])
+        g["last"] = max(g["last"], _cn8(m["period"]))
         if m["completed"]:
             g["clears"] += 1
             dur = m["duration"]
@@ -1371,10 +2383,17 @@ async def start_gm_report(name: str, scope: str = "current", who: str = "") -> s
 async def _run_gm_job(jid: str, mtype: int, mid: str, chars: list[str],
                       since: str, until: str, label: str, profile: dict):
     try:
-        JOBS[jid].update(status="running", total=2, done=0)
+        JOBS[jid].update(status="running", total=3, done=0)
+        log_progress(jid, 0, 3, label=_job_label(jid), force=True, extra="第 1/3 步：翻取活动历史")
         # 征服是独立模式，mode=0 全量历史再按活动名筛（历史页自带 completed/duration）
-        matches = await _collect_matches(mtype, mid, chars, 0, since, until, 5000, frozenset())
+        matches = await _collect_matches(
+            mtype, mid, chars, 0, since, until, 5000, frozenset(),
+            on_page=lambda ci, cn, page, n: log_progress(
+                f"{jid}#collect", page, 0, label=f"{_job_label(jid)} · 翻取活动历史",
+                extra=f"角色 {ci}/{cn} · 第 {page} 页 · 已收集 {n} 场", min_gap=1.5, min_pct=0))
         JOBS[jid].update(done=1)
+        log_progress(jid, 1, 3, label=_job_label(jid), force=True,
+                     extra=f"第 2/3 步：读取成就记录（已扫 {len(matches)} 场）")
         rr = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/",
                                 params={"components": "900"})
         pr = _merged_records({"profileRecords": (_parse(rr).get("Response") or {}).get("profileRecords")})
@@ -1400,7 +2419,9 @@ async def _run_gm_job(jid: str, mtype: int, mid: str, chars: list[str],
                 "gilds": gild},
             "added": len(gm), "cached": 0, "missed": 0, "capped": False,
         }
-        JOBS[jid].update(status="done", total=2, done=2, result=result)
+        JOBS[jid].update(status="done", total=3, done=3, result=result)
+        log_progress(jid, 3, 3, label=_job_label(jid), force=True,
+                     extra=f"第 3/3 步：汇总出图（扫 {len(matches)} 场，命中 {len(gm)} 场）")
     except Exception as exc:  # noqa: BLE001
         JOBS[jid].update(status="error", error=str(exc))
 
@@ -1435,6 +2456,8 @@ def _merged_records(prof: dict) -> dict:
     return pr
 
 
+@_traced(lambda name, kind: (f"武器锻造图案 {name}" if kind == "patterns"
+                            else f"称号进度 {name}"))
 async def node_report(name: str, kind: str) -> dict:
     """称号(kind=titles)/锻造图案(kind=patterns)：基于记录状态"""
     member = await resolve_member(name)
@@ -1677,8 +2700,11 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
     cutoff = (base.get("newest_full") or "") if reuse else ""
     newest_full = cutoff
     counted = 0
+    oldest = ""
     try:
-        for cid in chars:
+        log_progress(jid, 0, 1, label=_job_label(jid), force=True,
+                     extra="从最近往 2019-06 翻（翻到哪算哪，预估按时间跨度折算）")
+        for ci, cid in enumerate(chars):
             page = 0
             while page < 60:  # 60页×250 ≈ 上限1.5万场/角色
                 acts = await activity_history(mtype, mid, cid, 0, count=250, page=page)
@@ -1698,12 +2724,20 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
                     counted += 1
                     if p > newest_full:
                         newest_full = p
+                    if not oldest or d < oldest:
+                        oldest = d
                     if d < "2019-06":  # 赛季纪元前，不再翻页
                         break
                 else:
                     page += 1
                     JOBS[jid]["total"] = page + 1
                     JOBS[jid]["done"] = page
+                    # 翻页本身说不清总量，这里按「已扫到多早」折算进度条：
+                    # 从今天倒着扫到 2019-06 算 100%，预估时间才有意义
+                    log_progress(f"{jid}#scan", int(_scan_pct(oldest)), 100,
+                                 label=f"{_job_label(jid)} · 翻页扫描",
+                                 extra=f"角色 {ci + 1}/{len(chars)} · 第 {page} 页 · "
+                                       f"已计 {counted} 场 · 已扫到 {oldest or '—'}")
                     continue
                 break
         total_n = sum(v["matches"] for v in days.values())
@@ -1719,6 +2753,7 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
                                             gate=gate, newest_full=newest_full))
     except Exception as exc:  # noqa: BLE001
         JOBS[jid].update(status="error", error=str(exc))
+@_traced(lambda name, mode=5, count=100: f"战绩查询 {name}")
 async def mode_report(name: str, mode: int, count: int = 100) -> dict:
     """基于对局历史聚合某模式战绩（跨角色合并 + 细分模式 + 胜率）"""
     member = await resolve_member(name)
@@ -1729,13 +2764,19 @@ async def mode_report(name: str, mode: int, count: int = 100) -> dict:
     chars = profile.get("characters", {}).get("data", {})
 
     seen, matches = set(), []
-    for cid in chars:
+    mdisp = f"{member['display']}#{fmt_code(member['code'])}"
+    nch = len(chars) or 1
+    log_progress(f"mode:{mid}:{mode}", 0, nch, label=f"战绩 {mdisp}", force=True,
+                 extra=f"拉取每个角色最近 {count} 场对局历史")
+    for ci, cid in enumerate(chars, 1):
         for m in await activity_history(mtype, mid, cid, mode, count=count):
             key = m["instance"] or f"{m['ref']}{m['period']}"
             if key in seen:
                 continue
             seen.add(key)
             matches.append(m)
+        log_progress(f"mode:{mid}:{mode}", ci, nch, label=f"战绩 {mdisp}",
+                     extra=f"角色 {ci}/{nch} 完成 · 已收 {len(matches)} 场")
     matches.sort(key=lambda m: m["period"], reverse=True)
 
     done = [m for m in matches if m["completed"]]
@@ -1965,13 +3006,17 @@ async def _ev_vendor_responses() -> list:
     if not chars:
         raise RuntimeError("该 Bungie 账号没有命运2角色")
     out = []
-    for cid in chars:
+    nch = len(chars)
+    for ci, cid in enumerate(chars, 1):
         out.append(await bungie_auth.authorized_get(
             f"/Platform/Destiny2/{mt}/Profile/{mid}/Character/{cid}/Vendors/",
             {"components": "400,401,402"}))
+        log_progress("eververse", ci, nch, label="每日光尘商店",
+                     force=(ci == 1), extra=f"角色 {ci}/{nch} 商店数据")
     return out
 
 
+@_traced("每日光尘商店")
 async def eververse_store(force: bool = False) -> dict:
     """游戏内**当前上架**的光尘商品，按「主要光尘 / 其他光尘」分节。
 
@@ -1995,6 +3040,294 @@ async def eververse_store(force: bool = False) -> dict:
     data["day"] = day
     _EV_CACHE.update(at=now, day=day, data=data)
     _ev_cache_save(day, data)
+    return data
+
+
+# ---------- 老九（仄 / Xûr）每周商品 ----------
+# 数据源：官方 GetVendors（OAuth，与光尘同管线）。官方中文名就叫「仄」（vendor 展示
+# 物品 3329627384）。他每周六凌晨 1 点到高塔、周三凌晨 1 点随维护离场（周五/周二
+# 17:00 UTC）。实测：未到场时全量接口也带他的 saleItems（异域护甲等已预上架、hash
+# 是真的）；单店接口到场才开，且只有它给 perks/stats（随机卷）组件。
+XUR_VENDOR_HASH = "2190858386"
+_XUR_CACHE: dict = {"at": 0.0, "data": None}
+_VI_INDEX = None
+
+_XUR_CLASS_ZH = {-1: "通用", 0: "泰坦", 1: "猎人", 2: "术士", 3: "通用"}
+
+# 武器插槽类别（DestinySocketCategoryDefinition，稳hash）：武器特性组 / 固有特性。
+# 模组(2685412949)与外观(2048875504：皮肤/击杀记录器)不展示。
+_SOCKET_WEAPON_PERKS = 4241085061
+_SOCKET_INTRINSIC = 3956125808
+_SOCK_TYPES: dict | None = None
+_DEF_CACHE: dict = {}
+
+
+def _sock_types() -> dict:
+    """socketTypeHash → socketCategoryHash（raw_sockettypes.json 懒加载）。"""
+    global _SOCK_TYPES
+    if _SOCK_TYPES is None:
+        try:
+            raw = json.load(open(_idx_file("raw_sockettypes.json"), encoding="utf-8"))
+            _SOCK_TYPES = {h: (v or {}).get("socketCategoryHash") for h, v in raw.items()}
+        except Exception:  # noqa: BLE001
+            _SOCK_TYPES = {}
+    return _SOCK_TYPES
+
+
+async def _item_def(hash_int: int) -> dict:
+    """单件物品定义（公开实体接口，client 自带 6 小时 /Manifest/ 缓存）。"""
+    h = str(hash_int)
+    if h not in _DEF_CACHE:
+        try:
+            r = await client().get(
+                f"/Platform/Destiny2/Manifest/DestinyInventoryItemDefinition/{h}/")
+            resp = r.json()
+            _DEF_CACHE[h] = (resp.get("Response") or {}) \
+                if resp.get("ErrorCode") == 1 else {}
+        except Exception:  # noqa: BLE001
+            _DEF_CACHE[h] = {}
+    return _DEF_CACHE[h]
+
+
+async def _weapon_socket_plugs(item_hash: int, live: list) -> tuple[dict | None, list, bool]:
+    """武器插槽按类别抽取：→ (固有特性, 特性组插值, 是否带随机卷)。
+
+    定义 socketEntries 与组件 sockets 按下标对齐；插值优先用实盘 plugHash
+    （隼月的随机卷真值），没有再用定义默认值。随机槽 = 定义里带
+    randomizedPlugSetHash 的特性槽。"""
+    d = await _item_def(item_hash)
+    ents = ((d.get("sockets") or {}).get("socketEntries")) or []
+    st = _sock_types()
+    intr, plugs, rolled = None, [], False
+    for i, e in enumerate(ents):
+        cat = st.get(str(e.get("socketTypeHash") or ""))
+        if cat not in (_SOCKET_WEAPON_PERKS, _SOCKET_INTRINSIC):
+            continue
+        live_h = live[i].get("plugHash") if i < len(live) else 0
+        val = live_h or e.get("singleInitialItemHash") or 0
+        if not val:
+            continue
+        if cat == _SOCKET_INTRINSIC:
+            if intr is None or live_h:
+                intr = {"h": int(val)}
+        else:
+            rnd = bool(e.get("randomizedPlugSetHash"))
+            plugs.append({"h": int(val), "rnd": rnd})
+            rolled = rolled or rnd
+    # 插件 hash 是物品空间，perks.json（perk 定义空间）多半没有 → 拉插件定义补名
+    for d in ([intr] if intr else []) + plugs:
+        p = _perks.get(str(d["h"]))
+        if p:
+            d["name"], d["icon"] = p.get("name"), p.get("icon")
+    for d in ([intr] if intr else []) + plugs:
+        if d.get("name") or d.get("icon"):
+            continue
+        od = await _item_def(d["h"])
+        dp = od.get("displayProperties") or {}
+        d["name"] = dp.get("name") or ""
+        d["icon"] = (BASE + dp["icon"]) if dp.get("icon") else ""
+    # 击杀记录器这类槽在老武器的特性组里，不是 perk
+    plugs = [p for p in plugs
+             if not any(k in (p.get("name") or "") for k in ("记录器", "计数器"))]
+    return intr, plugs, rolled
+
+
+def _vi_index() -> dict:
+    """vendor_items.json 懒加载（build_vendor_items.py 产出，约 4MB）。"""
+    global _VI_INDEX
+    if _VI_INDEX is None:
+        try:
+            _VI_INDEX = json.load(open(_idx_file("vendor_items.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _VI_INDEX = {}
+    return _VI_INDEX
+
+
+def _xur_present(ts: float) -> bool:
+    """在场窗口：周六 01:00 → 周三 01:00（维护重置离场），本机时间=北京时间。"""
+    t = datetime.datetime.fromtimestamp(ts)
+    wd, hm = t.weekday(), (t.hour, t.minute)
+    if wd == 5:                       # 周六：1 点后算到场
+        return hm >= (1, 0)
+    if wd in (6, 0, 1):               # 周日/周一/周二：全天在
+        return True
+    if wd == 2:                       # 周三：1 点离场
+        return hm < (1, 0)
+    return False                      # 周四/周五：不在
+
+
+def _xur_next_arrival(ts: float) -> float:
+    """下次抵达 = 下一个周六 01:00（含今天周六但还没到 1 点的情况）。"""
+    t = datetime.datetime.fromtimestamp(ts)
+    d = t.replace(hour=1, minute=0, second=0, microsecond=0)
+    d += datetime.timedelta(days=(5 - d.weekday()) % 7)   # 周六 weekday()==5
+    if d.timestamp() <= ts:
+        d += datetime.timedelta(days=7)
+    return d.timestamp()
+
+
+def _xur_item(sale: dict, perks_by_idx: dict, sockets_by_idx: dict) -> dict | None:
+    idx = _vi_index()
+    h = str(sale.get("itemHash") or "")
+    rec = idx.get(h)
+    if not rec:
+        return None
+    name, ty, tier, icon, cls, shot = (list(rec) + [""] * 6)[:6]
+    cost = None
+    for c in (sale.get("costs") or []):
+        crec = idx.get(str(c.get("itemHash") or "")) or []
+        cost = {"n": int(c.get("quantity") or 0),
+                "cur": crec[0] if crec else "？",
+                "icon": (BASE + crec[3]) if len(crec) > 3 and crec[3] else ""}
+        break
+    if cost is None and tier != "异域":
+        return None                   # 没标价又非异域 = 分节门/占位（如「奇异装备优惠」）
+    perks = []
+    p = perks_by_idx.get(str(sale.get("vendorItemIndex"))) if perks_by_idx else None
+    for pk in ((p or {}).get("perks") or []):
+        if pk.get("visible") and pk.get("perkHash"):
+            perks.append({"h": pk["perkHash"],
+                          "icon": (BASE + pk["iconPath"]) if pk.get("iconPath") else ""})
+    # 武器插槽原始值先挂在 _live，xur_stock 里对武器再按类别抽取（需拉物品定义）
+    so = (sockets_by_idx or {}).get(str(sale.get("vendorItemIndex"))) or {}
+    return {"hash": h, "idx": sale.get("vendorItemIndex") or 0, "n": name, "ty": ty,
+            "tier": tier, "cls": _XUR_CLASS_ZH.get(cls if isinstance(cls, int) else -1, "通用"),
+            "icon": (BASE + icon) if icon else "", "shot": (BASE + shot) if shot else "",
+            "cost": cost, "status": sale.get("saleStatus"), "perks": perks,
+            "_live": [s for s in (so.get("sockets") or []) if isinstance(s, dict)],
+            "sec": _xur_sec(tier, ty, name)}
+
+
+def perk_meta(h) -> tuple:
+    """perkHash → (中文名, 绝对图标 URL)（perks.json 里没有就给空串）。"""
+    p = _perks.get(str(h)) or {}
+    return p.get("name") or "", p.get("icon") or ""
+
+
+_XUR_ARMOR_KW = ("护甲", "头盔", "臂甲", "披风", "猎戏", "印记", "臂环")
+
+
+def _xur_sec(tier: str, ty: str, name: str) -> str:
+    """卡片分节：异域护甲(按职业) → 职业金(一横列) → 异域武器 → 异域武器催化 →
+    传说武器 → 传说护甲 → 材料 → 任务 → 其他。催化任务（竞技催化）不算武器催化。"""
+    if "任务" not in ty and (name.endswith("催化") or "催化" in ty):
+        return "异域武器催化"
+    if "记忆水晶" in ty:
+        return "异域印痕"
+    if tier == "异域" and any(k in ty for k in ("披风", "猎戏", "印记")):
+        return "职业金"
+    armor = any(k in ty for k in _XUR_ARMOR_KW)
+    if tier == "异域":
+        if armor:
+            return "异域护甲"
+        return "任务" if "任务" in ty else "异域武器"
+    if tier == "传说" and not armor:
+        if "材料" in ty or "可兑换" in ty:
+            return "材料"
+        return "任务" if "任务" in ty else "传说武器"
+    if armor:
+        return "传说护甲"
+    if "材料" in ty or "可兑换" in ty:
+        return "材料"
+    if "任务" in ty:
+        return "任务"
+    return "其他"
+
+
+@_traced("老九商品")
+async def xur_stock(force: bool = False) -> dict:
+    """仄（老九 / Xûr）的每周商品。
+
+    到场窗口内缓存 2 小时，未到场 10 分钟查一次。逐角色查一遍再合并：职业臂/
+    职业传说甲只发给对应职业的角色（133/134/135 三格各归各职业）。未到场时
+    全量接口也带预上架商品，照常出卡并在卡头标注；单店接口（随机卷 perks）
+    到场才开（未到场 404 DestinyVendorNotFound），失败自动退回全量兜底。
+    未授权抛 BungieAuthRequired（上层提示去面板授权）。
+    """
+    import bungie_auth
+    if not bungie_auth.authorized():
+        raise BungieAuthRequired("还没有授权 Bungie 账号")
+    now = time.time()
+    if not force:
+        c = _XUR_CACHE
+        if c["data"] and now - c["at"] < (7200 if c["data"].get("present") else 600):
+            return c["data"]
+    mem = await bungie_auth.membership()
+    if not mem or not mem.get("membership_id"):
+        # membership() 失败会吞掉真实原因，直接调一次把异常透传出去
+        await bungie_auth.authorized_get("/Platform/User/GetMembershipsForCurrentUser/")
+        raise BungieAuthRequired("Bungie 授权信息无效，请在面板重新授权")
+    mt, mid = mem["membership_type"], mem["membership_id"]
+    prof = await bungie_auth.authorized_get(
+        f"/Platform/Destiny2/{mt}/Profile/{mid}/", {"components": "200"})
+    chars = ((prof.get("characters") or {}).get("data")) or {}
+    if not chars:
+        raise RuntimeError("该 Bungie 账号没有命运2角色")
+
+    present = _xur_present(now)
+    raw = []          # 每角色一份 (sales_map, perks_by_idx, sockets_by_idx)
+    if present:
+        # 单店接口只有到场才开（未到场 404 DestinyVendorNotFound），一次拿全
+        # sales + itemComponents（perks 随机卷 / sockets 插槽实际卷值）。逐角色
+        # 查：职业臂/职业传说甲只发给对应职业的角色（133/134/135 三格各归各职业）。
+        for cid in chars:
+            try:
+                one = await bungie_auth.authorized_get(
+                    f"/Platform/Destiny2/{mt}/Profile/{mid}/Character/{cid}/"
+                    f"Vendors/{XUR_VENDOR_HASH}/",
+                    {"components": "400,401,402,300,302,304,305"})
+                ic = one.get("itemComponents") or {}
+                raw.append((((one.get("sales") or {}).get("data")) or {},
+                            ((ic.get("perks") or {}).get("data")) or {},
+                            ((ic.get("sockets") or {}).get("data")) or {}))
+            except Exception:  # noqa: BLE001
+                raw.append(({}, {}, {}))
+        if not any(s for s, _, _ in raw):
+            raw = []      # 单店全挂（Bungie 刷新迟到等）→ 退回全量兜底
+    if not raw:
+        for cid in chars:
+            resp = await bungie_auth.authorized_get(
+                f"/Platform/Destiny2/{mt}/Profile/{mid}/Character/{cid}/Vendors/",
+                {"components": "400,401,402"})
+            group = (((resp.get("sales") or {}).get("data") or {}).get(XUR_VENDOR_HASH) or {})
+            raw.append((((group.get("saleItems") or {})
+                         if isinstance(group, dict) else {}), {}, {}))
+    items, seen = [], set()
+    for sales_map, perks_by_idx, sockets_by_idx in raw:
+        for s in sales_map.values():
+            if not isinstance(s, dict):
+                continue
+            it = _xur_item(s, perks_by_idx, sockets_by_idx)
+            # 三角色合并：同 hash 去重；职业限定货 hash 不同各留一份；
+            # 同名双 hash 变体（异色/高光版）只留第一份（键带分节，防跨类撞名互杀）
+            if it and it["hash"] not in seen and (it["sec"], it["n"]) not in seen:
+                seen.add(it["hash"])
+                seen.add((it["sec"], it["n"]))
+                items.append(it)
+    if not present:
+        items = [it for it in items if it.get("status") == 0]
+    order = {s: i for i, s in enumerate(("异域护甲", "职业金", "异域武器",
+                                         "异域武器催化", "传说武器", "传说护甲",
+                                         "材料", "任务", "其他"))}
+    items.sort(key=lambda it: (order.get(it["sec"], 9), it["idx"]))
+    # 武器：按类别抽插槽（固有特性 / 特性组真值 / 是否带随机卷），要拉物品定义
+    for it in items:
+        if it.get("sec") in ("异域武器", "传说武器"):
+            try:
+                intr, plugs, rolled = await _weapon_socket_plugs(
+                    int(it["hash"]), it.get("_live") or [])
+            except Exception:  # noqa: BLE001
+                intr, plugs, rolled = None, [], False
+            it["intr"], it["plugs"], it["rolled"] = intr, plugs, rolled
+        it.pop("_live", None)
+    arr = 0.0 if present else _xur_next_arrival(now)
+    at = datetime.datetime.fromtimestamp(arr) if arr else None
+    data = {"present": present, "items": items, "updated": now,
+            "arrives": arr,
+            "arrives_txt": (f"{['周一', '周二', '周三', '周四', '周五', '周六', '周日'][at.weekday()]}"
+                            f" {at:%H:%M}") if at else "",
+            "in_min": max(0, int((arr - now) // 60)) if arr else 0}
+    _XUR_CACHE.update(at=now, data=data)
     return data
 
 
@@ -2062,6 +3395,7 @@ def _rot_week_label(start: str, end: str) -> str:
     return f"{a:%m月%d日} - {b:%m月%d日}"
 
 
+@_traced("本周轮换")
 async def rotation_week(force: bool = False) -> dict:
     """本周突袭①②/地牢①②（每周三凌晨 1 点换）。按周缓存。
 
@@ -2183,3 +3517,195 @@ def _rot_cache_path() -> str:
     base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, ROT_CACHE_FILE)
+
+
+# ---------- 今日遗失区域 / 当前宗师（第三方轮换页 + 本地中英映射） ----------
+# 官方里程碑接口里没有这两样（GetPublicMilestones 实测只有突袭/公会/赛季活动）：
+#   · 遗失区域：2025-07 起改为每个目的地各自每日轮换。d2lostsector.report 首页是
+#     服务端直渲染的当日 9 区全量数据——卡片背景图 URL 里就带活动 hash，
+#     勇士/护盾在图标 alt 文本里；中文名用 manifest_index/rotation_zh.json
+#     （build_rotation_zh.py 生成：hash→zh / 目的地→zh / 奖励套装→zh）。
+#   · 宗师：lfcarry 周轮换页（固定 URL）声明本周 Grandmaster，英文副本名过同一份映射。
+# 各自按 天/周 缓存落盘（刷新点同商店：北京时间凌晨 1 点）；抓取失败回退当日缓存。
+LS_CACHE_FILE = "lost_sector_cache.json"
+GM_CACHE_FILE = "gm_cache.json"
+_LS_CACHE_VER = 2     # v2：奖励套装名剥部位后缀（旧缓存里是单件名）
+_ROT_ZH: dict | None = None
+_WEB_CLIENTS: dict = {}
+
+# d2lostsector.report 的目的地短名 → rotation_zh.json dest 表的键（manifest 用全称）
+_DEST_ALIAS = {"edz": "european dead zone", "moon": "the moon",
+               "dreaming city": "the dreaming city", "pale heart": "the pale heart",
+               "throne world": "savathûn's throne world",
+               "tangled shore": "the tangled shore"}
+# dest 表里没有的短名直接给中文名
+_DEST_ZH_FIX = {"nessus": "涅索斯"}
+_CHAMP_ZH = {"barrier": "壁垒", "overload": "过载", "unstoppable": "不可阻挡"}
+_ELEM_ZH = {"solar": "烈日", "arc": "电弧", "void": "虚空", "stasis": "冰影",
+            "strand": "缠绕"}
+
+
+def _rot_zh() -> dict:
+    global _ROT_ZH
+    if _ROT_ZH is None:
+        try:
+            _ROT_ZH = json.load(open(_idx_file("rotation_zh.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _ROT_ZH = {}
+    return _ROT_ZH
+
+
+def _gm_week_key(ts: float | None = None) -> str:
+    """每周缓存键：周三凌晨 1 点（=周二 17:00 UTC）刷新，1 点前算上一周。"""
+    t = datetime.datetime.fromtimestamp(ts if ts is not None else time.time())
+    t -= datetime.timedelta(hours=1)
+    mon = (t.weekday() - 2) % 7          # 周三=2，往回退到本周三
+    return (t - datetime.timedelta(days=mon)).strftime("%G-W%V")
+
+
+async def _web_get_text(url: str) -> str:
+    """第三方页面抓取（独立客户端，不把 Bungie API Key 带出去）"""
+    loop = asyncio.get_running_loop()
+    c = _WEB_CLIENTS.get(loop)
+    if c is None or c.is_closed:
+        c = httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) D2Query/1.0"},
+            timeout=20, follow_redirects=True)
+        _WEB_CLIENTS[loop] = c
+    r = await c.get(url)
+    r.raise_for_status()
+    return r.text
+
+
+def _json_cache(base: str, name: str, ver: int, key: str):
+    try:
+        d = json.load(open(os.path.join(base, name), encoding="utf-8"))
+        if d.get("ver") == ver and d.get("key") == key:
+            return d.get("data")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _json_cache_save(base: str, name: str, ver: int, key: str, data):
+    try:
+        json.dump({"ver": ver, "key": key, "at": time.time(), "data": data},
+                  open(os.path.join(base, name), "w", encoding="utf-8"),
+                  ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _parse_ls_html(html: str) -> list[dict]:
+    """d2lostsector.report 首页 → 当日遗失区域列表（中文名就地映射，缺映射回退英文）
+
+    卡片结构：<div style="background-image:url(…/for-website/<hash>/<hash>.jpg…)">
+    <div class="card-header…"><a href="/sector/<slug>"><h2>英名</h2><p>目的地</p></a>
+    …奖励套装图标… 勇士/护盾/强化图标（信息都在 alt 文本里）——hash 在卡片开头。"""
+    import html as _html
+    rz = _rot_zh()
+    dest_map = rz.get("dest") or {}
+    out = []
+    pat = re.compile(
+        r'for-website/(\d{6,12})/\1\.[a-z]+[^>]*>\s*<div class="card-header[^"]*">'
+        r'<a[^>]*href="/sector/([a-z0-9_]+)"(.*?)(?=for-website/\d{6,12}/|\Z)', re.S)
+    for m in pat.finditer(html):
+        h, slug, seg = m.group(1), m.group(2), m.group(3)
+        mm = re.search(r"<h2[^>]*>(.*?)</h2>", seg)
+        en = _html.unescape(mm.group(1)).strip() if mm else ""
+        mm = re.search(r"<p[^>]*>(.*?)</p>", seg)
+        dest_en = _html.unescape(mm.group(1)).strip() if mm else ""
+        if not en:
+            continue
+        set_en, set_icon = "", ""
+        sm = re.search(r'alt="([^"]+?) set"', seg)
+        if sm:
+            set_en = _html.unescape(sm.group(1))
+            im = re.search(r'icons/([a-f0-9]{32}\.(?:jpg|png))', seg)
+            if im:
+                set_icon = BASE + "/common/destiny2_content/icons/" + im.group(1)
+        rec = (rz.get("ls") or {}).get(h) or {}
+        zh = rec.get("zh") or re.sub(r"[:：]\s*(专家|大师)\s*$", "",
+                                     (_activities.get(h) or {}).get("name") or "") or en
+        set_zh = (rz.get("sets") or {}).get(set_en.lower(), "")
+        if set_zh:  # 「第七炽天使斗篷」→「第七炽天使 套装」（图标反查到的是单件名）
+            stripped = re.sub(r"(之胄|风帽|面具|斗篷|胄盔|胸甲|臂铠|腿甲)$", "", set_zh)
+            if stripped and stripped != set_zh:
+                set_zh = stripped + " 套装"
+        dl = dest_en.lower()
+        dest_zh = (_DEST_ZH_FIX.get(dl)
+                   or dest_map.get(_DEST_ALIAS.get(dl, dl)) or dest_en)
+        out.append({
+            "hash": h, "slug": slug, "en": en, "zh": zh,
+            "dest_en": dest_en, "dest_zh": dest_zh,
+            "set_en": set_en, "set_zh": set_zh,
+            "set_icon": set_icon,
+            "champs": [_CHAMP_ZH.get(x, x) for x in re.findall(r'alt="Champion type: (\w+)"', seg)],
+            "shields": [_ELEM_ZH.get(x, x) for x in re.findall(r'alt="Shield type: (\w+)"', seg)],
+        })
+    return out
+
+
+@_traced("今日遗失区域")
+async def lost_sectors_today(force: bool = False) -> dict:
+    """当日各目的地遗失区域（每日缓存，北京时间凌晨 1 点换天）。"""
+    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+    day = _ev_day()
+    if not force:
+        disk = _json_cache(base, LS_CACHE_FILE, _LS_CACHE_VER, day)
+        if disk:
+            return disk
+    html = await _web_get_text("https://d2lostsector.report/")
+    sectors = _parse_ls_html(html)
+    if not sectors:
+        raise RuntimeError("页面里解析不到遗失区域卡片")
+    data = {"ok": True, "day": day, "sectors": sectors}
+    _json_cache_save(base, LS_CACHE_FILE, _LS_CACHE_VER, day, data)
+    return data
+
+
+@_traced("当前宗师")
+async def gm_this_week(force: bool = False) -> dict:
+    """本周宗师夜袭（每周缓存）。lfcarry 固定页声明本周 GM，映射成中文+横图。"""
+    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+    wk = _gm_week_key()
+    if not force:
+        disk = _json_cache(base, GM_CACHE_FILE, 1, wk)
+        if disk:
+            return disk
+    html = await _web_get_text("https://lfcarry.com/guides/destiny-2-weekly-rotation")
+    import html as _html
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.S)
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", text))
+    text = re.sub(r"\s+", " ", text)
+    gm_map = _rot_zh().get("gm") or {}
+    en, dest_en, fallback = "", "", ""
+    for m in re.finditer(r"Grandmaster\s*[:\-]?\s*([A-Z][^,.\n{]{2,48})", text):
+        raw = m.group(1).strip()
+        cand, _, rest = raw.partition("(")
+        cand = cand.strip()
+        if cand.lower() in gm_map:            # 只认映射里认识的活动名，防抓到导航标题
+            en = cand
+            dest_en = rest.replace(")", "").strip()
+            break
+        if not fallback or len(cand) < len(fallback):
+            fallback = cand                   # 映射全没中时兜底取最短候选（多半是副本名）
+    if not en:
+        en = fallback
+    if not en:
+        raise RuntimeError("页面里解析不到本周宗师")
+    if not dest_en:                           # 「It is the Nessus strike」句式补目的地
+        dm = re.search(r"the ([A-Z][a-zA-Z' ]{2,24}?) strike", text)
+        if dm:
+            dest_en = dm.group(1).strip()
+    rec = gm_map.get(en.lower()) or {}
+    dl = dest_en.lower()
+    dest_zh = (_DEST_ZH_FIX.get(dl) or (_rot_zh().get("dest") or {}).get(
+        _DEST_ALIAS.get(dl, dl)) or dest_en)
+    data = {"ok": True, "week": wk, "en": en, "zh": rec.get("zh") or en,
+            "hash": str(rec.get("hash") or ""), "pgcr": rec.get("pgcr") or "",
+            "dest_en": dest_en, "dest_zh": dest_zh}
+    _json_cache_save(base, GM_CACHE_FILE, 1, wk, data)
+    return data

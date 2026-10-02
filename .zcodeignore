@@ -13,7 +13,6 @@ bungie_token.json
 # ===== 运行期状态（每个部署实例各自生成，不入库）=====
 bot_config.json
 user_bindings.json
-dim_user.json
 *_cache.json
 *cache.json
 
@@ -65,9 +64,7 @@ _rtest/**/*.png
 _rtest/**/*.log
 _rtest/js/
 _rtest/*.html
-_rtest/dimtree.json
 _rtest/_page.js
-dim_app/
 
 # ===== 临时/中间产物 =====
 _*.png

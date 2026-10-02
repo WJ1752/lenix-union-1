@@ -46,8 +46,11 @@ async def main():
         try:
             data = await d2.full_report(PLAYER)
             await shot("player", bot_cards.player_card(data))
-            await shot("career", bot_cards.career_card(data))
             print("  玩家卡数据:", data["display"], data["max_light"])
+            career = await d2.career_report(PLAYER)
+            await shot("career", bot_cards.career_card(career))
+            print("  生涯卡数据:", career["display"], "赛季", len(career["seasons"]),
+                  "角色", len(career["chars"]))
         except Exception as exc:  # noqa: BLE001
             print("  玩家卡跳过（Bungie 接口）:", exc)
     await card_render.close()

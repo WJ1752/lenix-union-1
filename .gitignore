@@ -13,10 +13,10 @@ bungie_token.json
 # ===== 运行期状态（每个部署实例各自生成，不入库）=====
 bot_config.json
 user_bindings.json
-dim_user.json
 *_cache.json
 *cache.json
 /weapon_usage_cache.json
+/raidreport_ranks.json
 # light.gg 解析失败的 HTML 调试转储（weapon_usage.py 生成）
 /logs/usage_debug/
 
@@ -34,6 +34,7 @@ dist_build/
 
 # ===== 大数据索引 / 第三方程序（由构建脚本生成或另行下载）=====
 manifest_index/
+icon_cache/
 napcat_shell/
 node_modules/
 
@@ -68,9 +69,7 @@ _rtest/**/*.png
 _rtest/**/*.log
 _rtest/js/
 _rtest/*.html
-_rtest/dimtree.json
 _rtest/_page.js
-dim_app/
 
 # ===== 临时/中间产物 =====
 _*.png
@@ -87,3 +86,12 @@ _preview/
 
 # v2 皮肤改造的预览产物与工具
 _rtest/v2/
+
+# 官方 QQ 机器人凭证（AppSecret，绝不入库）
+qq_official_creds.json
+
+# 指令面板/菜单改动前的线上配置备份（可能含 group_openid）
+qq_official_menu_backup.json
+
+# 模糊搜索的玩家索引（运行期生成，含玩家名）
+/seen_players.json

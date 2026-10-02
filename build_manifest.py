@@ -3,7 +3,8 @@
   weapons.json   hash → {name,type,icon,ammo,desc}
   perks.json     hash → {name,desc,icon}          (SandboxPerk)
   activities.json hash → {name,icon,pgcrImage}    (Activity)
-  modes.json     modeType → {name,cat,parents,order,agg}  (ActivityMode，见 build_modes.py)
+  modes.json     modeType → {name,cat,parents,order,agg,key}  (ActivityMode，见 build_modes.py)
+  seasons.json   [{number,name,start,end,bg,prog}]           (Season，见 build_seasons.py)
 """
 import json
 import os
@@ -12,6 +13,7 @@ import re
 import httpx
 
 from build_modes import build_modes
+from build_seasons import build_seasons
 
 os.makedirs("manifest_index", exist_ok=True)
 c = httpx.Client(timeout=120, headers={"X-API-Key": os.environ.get("BUNGIE_API_KEY", "")})
@@ -87,4 +89,9 @@ print("活动条目:", len(acts))
 print("下载活动模式定义...")
 modes = build_modes(c, base, paths)
 print("模式条目:", len(modes))
+
+# ---------- 赛季 ----------
+print("下载赛季定义...")
+seasons = build_seasons(c, base, paths)
+print("赛季条目:", len(seasons))
 print("完成")

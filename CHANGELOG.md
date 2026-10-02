@@ -2,6 +2,458 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-03 老九（仄/Xûr）每周商品查询 `/老九`
+
+- **指令**：`/老九`（别名 `/仄` `/d2老九` `/xur` `/老九商品` `/老九在哪`）。官方中文名
+  就叫「仄」（vendor 展示物品 3329627384）。出卡内容：异域装备 / 异域护甲（按职业）/
+  异域印痕 / 材料 / 任务，价格=奇异硬币（图标走本地索引）。
+- **数据**：官方 GetVendors（OAuth，复用光尘管线；`bungie_auth.authorized_get`）。
+  2190858386 = 仄。**实测他未到场（周六 01:00 前）全量接口也带预上架 saleItems**
+  （异域护甲等，hash 为真、可解名），单店 `Vendors/{hash}/` 到场才开（未到场
+  `DestinyVendorNotFound`），且只有单店给 `itemComponents.perks`（随机卷）——所以
+  到场优先单店一次拿全（components 400,401,402,300,302,304），失败退回全量兜底。
+  单角色即可：全职业护甲在同一份返回里。
+- **在场窗口/缓存**：周六 01:00 → 周三 01:00（维护离场）；在场缓存 2 小时、不在场
+  10 分钟（`_XUR_CACHE` 内存缓存）。未到场时只显示 `saleStatus==0` 的预上架商品，
+  卡头出抵达倒计时（`_xur_next_arrival` 算下一个周六 01:00）。
+- **名称解析**：新索引 `manifest_index/vendor_items.json`（`build_vendor_items.py`
+  从 raw_items.json 裁出，29126 条 / 4.3MB，懒加载）——保留可装备金紫蓝（不要求
+  equippable，异域职业臂是 False）+ 印痕/记忆水晶/货币/材料/任务/可兑换/阵营奖励。
+  换赛季后如果商人货解不出名，重跑一遍该脚本即可。
+- **验证方式**：探针在 `_rtest/xur_probe*.py`。跑探针要把 `bungie_auth.TOKEN_FILE`
+  直接指到**真文件** `dist_new/D2Query/bungie_token.json`（刷新写回同一份，exe 也读
+  这份，这才是对的）。**千万别拷贝副本做实验**——refresh_token 一次性，副本刷新会
+  把真文件里的作废掉（本次踩过：副本刷掉 R0 后 exe 下次刷新必 400，幸而同轮把新
+  token 写回了真文件修复）。仓库根目录的 bungie_token.json 是占位符（'x'/'y'），
+  指到它会报同样的 400 Base-64 错。
+- **当日二次改版（对齐用户参照稿，即小日向商人页风格）**：三角色各查一遍再合并——
+  职业栏位按角色发（实测 idx 133/134/135 分别只给猎人/泰坦/术士的职业臂），单角色
+  会缺另外两个职业；同名双 hash 变体（异色版）只留第一份。卡片改藏青渐变底 + 橙色
+  分节条 + 稀有度框图标 + 「币上数下」价格列；**异域护甲按 泰坦/猎人/术士 分节**；
+  perk 直接带中文名（perks.json 图标+名）。**带随机卷的异域武器（如隼月）单独大卡**：
+  大图背景 + 「本周随机卷」角标 + 可见 perk 逐个图标+名（可见 perk≥2 判定为有卷）。
+  新增分节：异域武器 / 异域武器催化 / 传说武器 / 传说护甲。
+- **重要发现：武器/催化/传说栏被账号解锁门槛挡住**——未解锁账号（我们）的接口返回
+  只有 17 件（异域甲+印痕+任务+材料），购买游戏内「更多奇异优惠 / 奇异装备优惠」
+  （或异域等级达标）后同一接口才会吐出武器/传说装备；卡上已加提示行。vendor 定义
+  的 sales 为空、displayCategories 只有 identifier（category_exotic_weapons 等），
+  定义里预埋不了每周货单。异域武器催化物品 tier/ty 双空，索引靠名字后缀「催化」抓
+  （build_vendor_items.py 已加规则，29318 条）。
+- **当日三次修正（用户对照游戏内实况反馈）**：
+  - 职业金（泰坦印记/猎人披风/术士猎环）从各职业节抽出，单独「职业金」一横列
+    （xugrid3 三列）；金装卡不显示 perk 芯片，只有武器显示。
+  - 武器 perk 来源重做：按 socketType→类别 抽槽（WEAPON PERKS=4241085061、
+    INTRINSIC=3956125808；模组/外观/击杀记录器类剔除——老武器定义把记录器塞在
+    特性组里，按插件名含「记录器/计数器」过滤）。实盘 sockets 与定义 socketEntries
+    按下标对齐取真值，物品单件定义走公开实体接口（client 自带 6h /Manifest/ 缓存）。
+    **插件 hash 是物品空间，perks.json 是 perk 定义空间，两套不通用**——名字一律
+    现拉插件定义补（perks.json 命中就直接用）。隼月判定=特性槽带
+    randomizedPlugSetHash；大卡=固有特性+全部特性槽；传说武器小卡=特性槽末两个
+    （游戏 3/4 号位）；固定卷异域（蒙特卡洛）小卡=固有特性（蒙特卡洛法则在
+    INTRINSIC 类里，不在特性组）。
+  - 异域记忆水晶（印痕）不出卡；mock 构造器（_rtest/xur_render.py）与线上逻辑
+    同源，从定义插槽池取样例卷，专验隼月大卡排版。
+
+## 2026-10-03 扭曲星球板块改版：压缩时间表 + 侧边武器掉落/套装名
+
+- **改版内容**（用户拍板的预览方案）：`/轮换` 卡扭曲板块从「当前时段 + 24 格全天表」
+  改为左右两栏——左栏保留绿色当前时段框（下一个目的地/整点倒计时），全天表压缩成
+  **7 格「未来一轮」**（现在 →+6 小时，当前格绿高亮、次格淡绿描边，格内标注
+  `现在·剩X分` / `+N 小时`）；右栏新增**本时段掉落面板**：目的地武器池逐把列出
+  （图标+官方中文名+类型，双列小卡）+ 金色「奖励 · XX 套装」行，随整点目的地切换。
+- **数据**：`manifest_index/distortion_loot.json`（新）——武器池 = Monument of Triumph
+  更新后的目的地武器池（7 区域 48 把，抄录 blueberries.gg 2026-10 版，区域↔套装对应
+  GameRant），中文名/图标/类型全部走本地 manifest 解析（raw_items_en_lite 找 hash →
+  raw_items 取 zh），套装中文名复用 rotation_zh.json sets（去件类后缀）。
+  spec 的 manifest_index 是 glob 自动收集，该 json 以后重打包自动带上。
+- **接线**：bot_cards.py `_dist_block` 换新版（`_dist_block_basic` 保留为兜底：
+  掉落 json 缺失或轮换环算不出时自动退回旧版 24 格全天表，不炸卡）。
+- **重要踩坑——「外置模块同步」对这几个模块根本不生效**：D2Query.spec 的
+  `hiddenimports` 里显式列了 bot_cards/card_render/bot_platform 等，它们被
+  **打进 exe 压缩归档**，运行时 FrozenImporter 优先于 exe 同目录的外置 .py。
+  实证：第一轮部署只同步了外置 bot_cards.py（未重打包），QQ 卡仍是旧版；
+  build_exe.bat 重打包后才生效。**改这些模块必须重打包**，deploy_exe.ps1 的
+  「sync external modules」一步只是摆设（webui.py 不在 hiddenimports 里，
+  同样在归档内，同理）。
+- **验证路径**：webui `/rotation` 页调用 `rotation_card(rot)` 单参数，本来就不渲染
+  扭曲板块，不能用它验证；页面 `<style>` 里出现新类名（rd2-*）可反证 exe 内
+  bot_cards 已是新版。QQ 端发 `d2 轮换` 看实际效果。
+- 渲染自测脚本：`_rtest/preview_distortion_side.py`（可传区域名拨时针出任意区域预览）、
+  `_rtest/test_dist_block_live.py`（渲染真实 `_dist_block` 输出）。
+
+## 2026-10-03 副本口径修正：全程无暇 + 首日排名 + 时间审计
+
+- **无暇/低人口径重算**（用户 2026-10-03：只通尾王的不算无暇）：官方 PGCR 顶层有
+  `activityWasStartedFromBeginning`——检查点（尾王）进局为 `false`，从头打为 `true`。
+  `raid_report()` 现在对每场 0 死亡通关 / 低人通关补拉 PGCR（并发 6，走 5~6h TTL 缓存），
+  只有 **从头开始 + 0 死亡 + 非私局** 才计 无暇/单人无暇/双人无暇/三人无暇。
+  实测 Wj#8984 突袭 0 死「通关」137 场里 136 场是检查点/私局，真无暇只有 1（2020-03 救赎花园）。
+  - 低人（单人/双人/三人）改用 **PGCR 全程出现过的账号数**（raid.report 的 accountCount 口径，
+    取 max(账号数, 场上人数) 防老 PGCR 被官方裁剪误判）：6 人团退到剩 2 人通关不再算双人；
+    不要求从头（与 raid.report 低人口径一致）。
+  - 私局（isPrivate，如众神殿自定义装载 2 分钟杀尾王）不进任何特殊徽章（无暇/低人/首日/首周），
+    参与/通关计数维持原样。
+  - 副本详情页（`render_raid_detail`）同步同一套口径，与主卡数字一致。
+- **首日排名**：接入 **api.raidreport.dev**（raid.report/dungeon.report 的后端，无 CF 可直连；
+  前端 JS 枚举里挖出 worldsfirst 首日榜端点与全部副本 slug）。
+  `/raid|dungeon/leaderboard/worldsfirst/{slug}?membershipId=` → 该号首日名次（`entries[].rank`
+  + `metadata.totalResults`）；没打过首日返回 JSON 404（也是终态）。徽章显示 `首日 #12/683`，
+  悬停看「首日通关 ×N · raid.report 首日赛第 12 名」。
+  - 该 API **慢（冷启动 ~20s+）且 CF 风控飘**：连续快查/非浏览器指纹都可能 403 →
+    结果（含「无排名」）落盘 `raidreport_ranks.json` 永久缓存（首日名次不会变），
+    直连失败自动走**调试 Edge CDP 兜底**（weapon_usage 同款 9222 通道；注意必须
+    「先开 raid.report 页、再页内 fetch」——直接 goto API 地址是顶层导航，缺 Origin 头，
+    对方 Lambda 回 Bad Request）。
+  - slug 表 `_RR_SLUG`（destiny_data.py）覆盖全部已收录副本；永恒沙漠（史诗）依次试
+    epic→epiccontest，大师组追加 /master（404 即无此榜）。新副本记得同步这张表。
+- **「最近」修成最后一次通关**：分组循环按时间**倒序**遍历，原代码 `g["last"] = m["period_cn"]`
+  每次通关都被覆盖，最终留下的是**最旧**一场通关（2023-06-03 那种就是首通）——老版本
+  「最近」一直是错的。改 `max()` 取最新；且只统计通关场（打过没通不推进）。
+- **时间审计**（用户 2026-10-03：战绩界面还是 UTC）：战绩卡（webui `render_history_card`）、
+  对局详情页（PGCR 卡头部）、/宗师卡「最后」全部转北京时间（`period_cn`/`_cn8`）；
+  `history_report`/`get_pgcr` 现在都带 `period_cn`。其余位置（raid 行、按月筛选、
+  上次在线）此前已走 period_cn，复核无遗漏。
+- 口径说明：本卡「无暇」= **本人 0 死亡** + 全程；raid.report 官网的 Flawless 是**全队无人死亡**，
+  两边数字天然会差（个人无死全通 > 全队无死），属预期。
+
+## 2026-10-02 赛季等级修复（S27+ 通行证改版）+ `/raid` `/地牢` 报告大修
+
+- **赛季等级错误的根因**：S27（溯回，2025-07）起 Bungie 改版通行证——一个 progression 统一计级
+  （可超 100），且 `DestinySeasonDefinition.seasonPassList` 里出现**多条** pass（赛季 pass + 同一年的
+  另一条，如铁旗余灰/无序）。`build_seasons.py` 原来只取 `seasonPassList[0]`，S28 拿到的是另一条
+  （玩家等级只有 4），而真正的「凯旋」pass 上是 151。修复：
+  - `build_seasons.py` 全量记录 `passes: [{rew, pres, name}]`（prog/pres 仍指第 0 条兼容旧消费方）；
+  - `destiny_data._SEASON_PROG` 三元组 (赛季号, 是否声望档, pass下标) + `_SEASON_PASS_MAIN`
+    按「pass 名 ⊆ 赛季名」选主条目（S28: 无序≠凯旋纪念碑→选凯旋；匹配不到运行时取最大）；
+  - 等级公式 S27+ 且奖励档>100 时**直接取奖励档**（声望档是迁移遗留，两条轨仍并行吃同一条
+    XP 流——段内 progressToNextLevel 只差 528，计入会双算）；S8–S26 维持「奖励+声望」。
+  - 口径经 DIM 源码核对（`SeasonalRank.tsx`: `min(rew, baseLevels) + prestige`，本例 151），
+    DIM 另证实：`Destiny2CoreSettings.currentSeasonPassHash` 才是权威选轨方式。
+- **`/raid` `/地牢` 报告**（用户 2026-10-02 四连反馈）：
+  - **低人/老记录收不全**：对局历史原来每人只翻 3 页×250，现在最多 40 页（实测 Wj#8984 突袭
+    1152→1969 场，最早回到 2020-03，低人通关全部入账；通关场 player_count=0 的为 0，无缺口径）。
+  - **最近一场日期不对**：Bungie 的 period 是 UTC，卡片直出会差 8 小时。raid 链路对局加
+    `period_cn`（北京时间），分组「最近」、按月筛选、对局行、生涯/玩家卡「上次在线」全部转 UTC+8；
+    bot_fireteam 自带 `_cn()` 转换、内部比较逻辑保持 UTC 不动，避免二次平移。
+  - **排序改发售先后**：新增 `_RAID_ORDER`（利维坦→…→永恒沙漠；地牢 破碎王座→…→平衡），
+    收录外的活动（众神殿/安可/探索者等）排在已收录之后按名排；`build_raid_metrics.py` 的
+    RAIDS 表同步改成发售顺序（/队伍 完成数砖顺序一致）。
+  - **首日/首周徽章**：`_RAID_RELEASE_UTC` 发售时刻表（UTC，来源 Destiny2Team/X、Bungie press、
+    destinypedia，见下），通关场次落在发售 24h/7 天窗口内计 首日/首周，金色高亮徽章只在有数时出现。
+    实测命中：克洛塔 首周3、救赎边缘 首周1、深渊机灵 首日1、战争领主废墟 首日2 首周5、
+    晚星之主 首周2、分离教义 首日2 首周3、预言 首周1。
+  - **零值徽章不再灰着占位**（用户指定）：无暇/单人/双人/三人/单人无暇/双人无暇/三人无暇 为 0
+    直接不渲染，只显示已达成的特殊通关；参与/通关恒显。
+- **发售时刻表**（全部核实过，竞赛时长 24h/48h 不影响本判定）：永恒沙漠=The Desert Perpetual
+  2025-07-19 17:00 UTC（史诗版 2025-09-27）、平衡=Equilibrium 2025-12-13、晚星之主=Vesper's Host
+  **2024-10-11**（一开始预填 10-04 差一周会漏首日）、分离教义 2025-02-07、忧愁王冠 2019-06-04
+  **23:00** UTC（当年唯一非 17:00 上线）、其余 17:00/18:00 UTC（夏令时差）。
+- 踩坑：S27+ 双 pass 不是并行双轨而是**年内两次重置**的先后轨道（窗口 2025-12→2026-06→2099），
+  不能按下标也不建议按等级 max 硬猜，跟名字/核心设置走；PvE 模式 4=Raid、82=地牢，
+  众神殿（Pantheon）等活动也挂 raid 模式会进分组，排序时归入「未收录」尾部即可。
+
+## 2026-10-02 `/轮换` 新增「当前宗师」+「今日遗失区域」板块
+
+- **官方 API 没有这两样**（实测 GetPublicMilestones 只有突袭/公会/赛季活动里程碑，
+  manifest 的 DestinyMilestoneDefinition 全量里也没有 Lost Sector 定义），走社区页：
+  - **遗失区域**：2025-07 的 9.0.0.1 改版后不再有全球每日一个，改成 **9 个目的地各自每日轮换**。
+    数据源 [d2lostsector.report](https://d2lostsector.report) 首页是**服务端直渲染**（无需浏览器/无 API），
+    卡片背景图 URL 里就带活动 hash、勇士/护盾/强化武器在图标 alt 文本里，正则整卡提取即可。
+  - **宗师**：lfcarry 的[周轮换页](https://lfcarry.com/guides/destiny-2-weekly-rotation)是固定 URL 每周更新
+    （本周实测 = Exodus Crash，与 Kyber 周报互证），解析"Grandmaster: <副本>"句式，只认映射表里认识的名字防抓到导航标题。
+- **中文名全部本地化**：新 `build_rotation_zh.py` 生成 `manifest_index/rotation_zh.json`——
+  遗失区域 hash→中文名（28 区全映射，如 exodus_garden_2a=黑色移民号花园2A）、宗师池英文名→中文名+宗师变体 hash+pgcr 横图
+  （如 exodus crash=移民号的坠毁）、目的地英文名→中文名（manifest 用全称，短名 EDZ/Moon 走别名表）、
+  奖励套装英文名→中文名（zh 物品清单按图标文件名反查，显示时剥部位后缀：「第七炽天使斗篷」→「第七炽天使 套装」）。
+  **重跑时机：新赛季 / 首页出现新套装名时**；映射缺失运行时回退英文。
+- **缓存**：遗失区域按天（北京时间凌晨 1 点换天）、宗师按周（周三凌晨 1 点），落盘
+  `lost_sector_cache.json` / `gm_cache.json`；抓取失败各自独立容错，卡片出「没抓到」缺省行，不拖垮整卡。
+- 第三方抓取用独立 httpx 客户端（不带 X-API-Key 出门）。卡片布局：突袭/地牢/宗师横图大卡之后
+  插 3×3 遗失区域网格（rotdist 同款面板风格），页脚补数据来源。
+- 踩坑：lfcarry 页目的地在句子里（"It is the Nessus strike"）不在括号里；d2lostsector.report 的
+  勇士图标 URL 也含 `for-website/`，卡片切分 lookahead 必须要求数字 hash。
+
+## 2026-10-02 `/队伍` 三连修：不在线态 + 选人界面误判 + 砖图标口径
+
+- **选人界面/退出游戏不再被当成"进行中"**：退出后 204 组件会把上一场的 currentActivityHash
+  挂好一阵子（真 hash、真开始时间），第二次截图事故「人都停在选人界面了还显示突袭已进行 17 分钟」。
+  现在"真在打"必须同时满足 **真活动 hash + transitory.currentActivity 的 numberOfPlayers+Opponents ≥ 1**
+  （打本时 ≥1，轨道 = 0）。实测样本：打本=6、轨道=0、下线几分钟=transitory 整个消失。
+- **新增「不在线」态**：transitory 没了 → 卡片标 **不在线**（最后游玩时间 UTC+8 + 自己的生涯累计），
+  不再硬编一场没在打的活动。
+- **指标砖图标口径**（用户指定）：**完成数 = metric 自带的通用「突袭/地牢」图标；
+  导师 = 对应副本的成就徽章**（印章 seal 图标）。印章按名字匹配：/称号 两个根（616318467/
+  1881970629）下的一级子节点名与副本名 17/17 全同名，徽章图 = 印章**节点**的 displayProperties.icon
+  （部分印章记录本身没有 icon，不能拿记录图标当准）。`raid_metrics.json` 加 `seal_icon` 字段。
+- **短卡留白修复**：渲染器改复用浏览器页面时视口高度误设 800，卡片 CSS 会撑到视口高度，
+  /帮助 等矮卡下半全空白——改回 200。
+- 遗留已知项：exe 刚重启后的第一波查询若赶上 Bungie 慢窗口，个别成员资料可能 12 秒内没拉到而
+  留空（显示 …mid 尾号），重发一次即可补上（有缓存）。
+
+## 2026-10-02 `/队伍` 轨道态修正 + 响应缓存 / 渲染提速
+
+- **轨道不再被当成"在打活动"**：官方在轨道待机时 204 组件照样给 `currentActivityHash`
+  （实测 82913930，manifest 里查得到实体但没有任何名字）。旧代码把它当真活动，再拿
+  `dateActivityStarted` 去历史里 ±10 分钟配对，正好配上刚打完的那一场 → 卡片显示
+  「在打某某副本 · 已进行 12 分钟」。现在按「这个 hash 在 manifest/本地索引里有没有名字」
+  判定真活动，占位 hash 一律算轨道。
+- **轨道/组队态改成队内生涯总览**（用户口径：轨道不需要多余数据）：名单 = 官方实时队伍
+  （1000 组件 `partyMembers`）；每人只显示 **生涯总时长**（200 组件各角色 `minutesPlayedTotal`
+  求和）+ **成就点数**（900 组件 `profileRecords.score`，即游戏内凯旋分数）。不再抛
+  `NotInActivity`（独自在轨道也照常出卡）。
+- **进行中的活动按 hash 认名**：本场名单还没发布时，活动名与模式直接取 `activity hash`
+  （本地索引中文名 → 线上 manifest），不再拿"上一把"的历史行顶替（实测：人在打救赎花园，
+  卡片却写上一把的"试炼场"）。查不到名字才回退历史。
+- **删掉"12h 内同名突袭名单补齐"**：那正是用户在轨道时凑出 6 人假名单的来源（真实队伍 3 人）。
+  本场名单只认 本场 PGCR + 官方可见队伍，宁缺毋滥；每人的抓取加 12 秒上限，网络卡时宁可这一行留空。
+- **响应缓存**（`destiny_data._CachedClient`）：GET/POST 统一走 TTL 缓存 —— 实时组件
+  （204/1000）15s、突袭指标 1100 600s、生涯/角色 180s、对局历史 45s、PGCR/manifest 6h、
+  按名字搜账号 300s；只缓 HTTP 200，读超时只在"很快就失败"时重试一次（等满超时的说明链路
+  正堵，重试只会让用户多等一整个超时）。实测 `/队伍`（6 人突袭）：冷 34.9s → 7.5s，
+  10 秒内重查 **0.0s**（全部命中缓存）。
+- **卡片渲染提速**（`card_render.py`）：
+  · 复用同一个 BrowserContext + 同一个页面（原来每次 `new_page()` = 每次一个空缓存）：
+    带 6 张远程图的渲染 1190ms → 575ms；
+  · **图标本地化**：渲染前把 bungie.net 图标拉一次存进 `icon_cache/`（URL 内容寻址、重启不失效）
+    并内联成 data URI，浏览器不再等 CDN —— 60 张图标首次 15.0s → 8.0s，第二次 1.2s；
+  · 等图改成「img 全 complete ≤2.5s + networkidle ≤1.2s」，不再死等满 8 秒；
+  · QQ 通道启动时后台 `prewarm()` 预热浏览器/页面（首条查询省 ~1.8s 冷启动）。
+- 实测网络前提：Bungie 从本机时快时慢（同一个接口 0.1~25 秒，还夹读超时），
+  所以"能省的调用全省 + 每条请求都有上限"是这轮提速的主线，而不是加并发（并发 6 与并发 3 实测无差别）。
+
+## 2026-10-02 `/队伍` 突袭卡改版：全队 + 每副本「完成数/导师」指标砖（对齐小日向）
+
+- 突袭模式下每位队员渲染成一块：名字条 + **20 块指标砖**（10 个在役突袭的「完成数」+ 10 个「导师」，
+  3 列网格、带图标与「职业生涯//突袭」来源行），与参考卡一致。
+- 数据源：**官方统计指标（Metric）**——`build_raid_metrics.py` 从线上 manifest 的
+  `DestinyMetricDefinition` 提取 10 个突袭的 clear/sherpa metric hash（同名的「职业生涯/赛季」两个
+  变体取职业生涯），来源行由 `DestinyPresentationNodeDefinition` 祖先链解析（节点名 统计数据→
+  展示为「职业生涯」）；取值走 Profile **组件 1100** 的 `metrics.data.metrics[h].objectiveProgress.progress`，
+  和拉外观的 `100,200` 合并成一次请求。产出 `manifest_index/raid_metrics.json`（3KB）。
+- 名单：进行中的突袭官方还没发布本场名单 → 用 **12 小时内同名突袭的上一场名单**补齐（连着打的
+  概率高）；本场记录存在时（历史行与 `dateActivityStarted` ±10 分钟对上）优先用本场。
+- 卡片状态：进行中 / 已结束 / 进行中·本场名单还没发布（+ 开始时间与已进行时长）。
+- **砖图标 = 副本专属图标**：metric 自带的图标是通用的（20 个只去重出 2 个），活动定义图标也全是
+  同一张「突袭」图；改用**收藏页同名展示节点的 displayProperties.icon**（每个副本一枚专属徽记；
+  地牢的 预言/贪婪之握 没有节点图标，回退 metric 图标）。
+- **地牢同样出砖**（`dungeons` 段）：7 个有「完成数」的地牢（深渊机灵/平衡 没有完成数 metric）
+  + 有「导师」的（晚星之主/分离教义）；来源行「职业生涯//地牢」。
+- **熔炉/智谋改为列全局、按阵营分组**：不再只列同队——按 entry 的 `values.team` 分成
+  「你的阵营 / 对方阵营」两组（你的在前），无队伍信息的可见 party 成员并入你的阵营；每人的
+  数据仍是该模式生涯（场次/胜率/K-D/…），不显示单场结算。
+
+## 2026-10-02 生涯每赛季时长 + S8–S10 徽标 + 无符号触发词 + `/队伍` 指令（含进行中边界）
+
+- **`/生涯` 每个赛季格新增「⏱ x 小时」**（`destiny_data.py` + `bot_cards.py`）：新增按日历史统计
+  （`periodType=Daily&groups=General`，实测**单次窗口上限 31 天** → 按自然月分块）+ `season_time_cache.json`
+  增量缓存（已封存的日期永久缓存，每次只补最近 ~10 天）；`career_report` 的 seasons 每项加 `time_h` 字段。
+  口径 = allPvE + allPvP + allPvECompetitive 三类（实测互斥且完备；细分键会漏打击/智谋）。注意官方只保留
+  约 2.5 年日粒度数据，更早赛季显示 0（Wj 实测 S8 仅剩 1.1h），脚注已注明。
+- **赛季等级核查：验证无误**。21 个赛季逐角色原始「奖励+声望」progression 与卡片汇总全部对上
+  （S21 100+309=409、S23 100+360=460…），prestige 叠加 >100 属篇章赛季长通行证，非取错 hash。
+- **S8–S10 赛季角标换图**（`build_seasons.py` 新增 `_ICON_OVERRIDE`）：这三个赛季的
+  `displayProperties.icon` 不可用——S8/S9 的图被 Bungie 在**同名 URL 上换过内容**（现为 416×416
+  非徽标图），S10 本来就为空。改用各赛季**头衔印记展示节点**的官方 200×200 徽记（URL 带内容 hash，
+  不会再被换内容）：S8 不朽 / S9 黎明 / S10 全知全能，三张都实际下载验证过。
+- **无符号纯文本触发词**（`destiny_data.norm_key()`）：NFKC + 去非 `\w` 字符的归一化键，接入护甲
+  `_armor_match`、武器 `search_weapons_full/search_weapons`、`search_perks`、护甲套装 `_norm_set`
+  四条匹配链的兜底级（原始精确 → 原始子串 → 归一化精确 → 归一化子串，向后兼容）。「阿尔法鲁皮之脊」
+  「鲁皮之脊」可精确命中；374 把带符号武器（希律-C 等）的无符号写法全覆盖；`build_exotic_armor.py`
+  的 ALIASES 同步补了该条并重建 json。
+- **新指令 `/队伍`**（`bot_fireteam.py` + `bot_cards.fireteam_card`，别名 队友/fireteam/d2队伍）：
+  「当前在打什么 + 队内（同队）成员在该模式的生涯数据」——每人一块：徽标/名字/职业/光能 +
+  该模式角色级生涯（突袭/地牢=通关/场次/通关率/击杀/死亡/K-D/时长/场均；PvP=场次/胜率/KD/
+  最佳单场/最长连胜；智谋=场次/胜率/KD/存光尘），**不显示任何单场结算**（击杀/胜负那套已删，
+  修掉「局内显示上一局判负」）。
+  - **名单来源 = 本场对局的 PGCR**：在历史里找与 204 组件 `dateActivityStarted` 对得上的一场
+    （±10 分钟），用它的 entries——突袭/地牢是**全队 6 人**（实测隐私设置不挡历史名单，潘通实测
+    6/6 全员拿到），熔炉/智谋按 entry 的 `values.team` 过滤成**同一阵营**；窗口 +2 分钟外按「已结束」出卡。
+  - **实测边界：匹配局开局时本场还没进历史**（新局 17:46 开局、当刻历史里没有它，对局数据出来
+    才有名单；同样地突袭进行中也没有）→ 该状态给「进行中 · 本场名单还没发布」+ 先显示可见队伍成员。
+  - 拿不到本场记录时的兜底 = Profile 组件 1000 `profileTransitoryData.partyMembers`（含自己、最多
+    6 人，**受隐私限制**，实测 6 人队只见 1-2 人）；不在活动且只看得到自己 → 一条说明（含最后活动）。
+  - 模式桶：优先本场 PGCR 的 `activityDetails.modes`；兜底运行时查 Manifest 实体
+    `DestinyActivityDefinition.activityTypeHash`，实测 Raid=2043403989 / Dungeon=608898761 /
+    Crucible=4088006058 / Gambit=248695599 / Vanguard=3652020199（**82913930 这类占位 hash 线上
+    也没有名字**，所以活动名一律以历史行为准，不用 currentActivityHash 查名）。
+  - 每人的模式数据 = 角色级 `/Character/{cid}/Stats/?groups=101,103&modes=N` 的 allTime
+    （账号级 Account Stats 实测**忽略 mode 参数**）；角色取 `dateLastPlayed` 最近的（在打的人=在玩角色）。
+  - **同一指令出现两张卡（一张正常卡 + 一张「查询失败」）的根因**：QQ 侧 sendMsg 超时
+    （retcode 1200）时卡片其实已送达，但 nonebot 抛 ActionFailed → matcher 失败 → 兜底后处理器
+    又补一张「查询失败」卡。修法：`_reply_image`/`_reply` 的发送层异常改为**只记日志不上抛**，
+    后处理器再对 `ActionFailed` 名加保险丝。
+  - 运维发现：启动器 `webview.start()` 是主线程最后一句 —— **面板窗口一关，进程就退出**（bot 线程是
+    daemon）。今天两次「协议端未连接」（15:34、~17:00）大概率都是窗口被关/崩，NapCat 一直在重连，
+    重开 exe 即自动恢复、无需扫码。
+
+## 2026-10-02 赛季主图补齐 + 赛季角标 + 全量耗时日志 + /战绩 改名
+
+- **S10–S15 的赛季主图补齐**（`build_seasons.py` 新增 `_ART_OVERRIDE` + `manifest_index/seasons.json` 新增 `art` 字段）：
+  这 6 个赛季在 manifest 里**根本没有 `backgroundImagePath`**（`background_season_10..15.*` 全 404，
+  又并发探了 4500 组命名/目录组合，非 404 命中 0；英文 manifest 同样没有；item 表 220MB 里也没有任何
+  `/img/destiny_content/seasons/` 路径），只能用官方 key art 镜像并逐张人工确认：
+  S10 英杰 `SotWCover.jpg`、S11 影临 `Season_of_Arrivals_Banner.jpg`、S12 狂猎 `SotHFullRes.jpg`、
+  S13 天选 `SotC.jpg`、S14 永夜 `SotS.jpg`、S15 神隐 `SotL.jpg`（destiny.wiki.gallery，即 Destinypedia 上
+  注明「from the Bungie.net Season of X page」的那批官方图）。取值规则 `art = 人工表 or bg`，
+  21 条**全部非空**。顺带否掉一个猜想：赛季活动的 `pgcrImage` 是地图/过场截图，**不是** key art。
+- **赛季角标放到每张赛季卡左上角**（`bot_cards.py`）：底图优先级改为 `art → bg → 赛季号派生渐变`
+  （不再把 150×150 的 `icon` 拉成整块底图）；`icon` 改作左上角 22×22 角标（暗底 + 金描边 + 投影，
+  压在任何亮度的 key art 上都看得清），`#号` 与角标并排、`Lv.` 在右上并加深色底片。S10 无 icon，
+  只显示 `#号`，不留空洞。
+- **所有耗时任务都有日志进度**（`destiny_data.py`）：新增通用装饰器 `_traced(label)`（`functools.wraps`，
+  异常原样抛），一次覆盖 `history_report`(/战绩)、`node_report`(/锻造 /称号)、`eververse_store`(每日光尘)、
+  `rotation_week`(轮换)、`get_pgcr`、`search_players_fuzzy`、`lifetime_stats` 等联网入口；
+  `full_report`/`career_report`/`raid_report`/`mode_report` 补上 `▶ 开始` 与 `✔ 完成，实际耗时 X` 首尾行。
+  口径统一为 **开始 → 进度条 → 预计剩余 + 预计完成时刻 → 实际耗时**；多步/翻页/逐场的走
+  `log_progress`，秒级的走 `▶/✔ + 实际耗时`。纯本地索引查询（武器/perk/护甲/掉落图）不联网，不加日志免得刷屏。
+- **`/历史` 改名为 `/战绩`**（`nonebot_plugins/destiny2.py`）：`/战绩` 为主命令，`/历史` 保留为别名，
+  帮助文案（`destiny2.py` / `bot_cards.help_card()`）同步改掉。
+
+## 2026-10-02 耗时接口的日志进度条 + 卡片底图裁切/空白修复
+
+三件事：日志里能看见长任务跑到哪了、职业横幅底图不再只显示一条、"没图"的赛季卡不再空白。
+
+- **后台日志进度条 + 预估时间**（`destiny_data.log_progress()`）：需要拉接口、要跑一会儿的活儿
+  统一打一行 `[进度] 标签 [████░░░░] 62.0% (312/503) · 已用 0:48 · 预计剩余 0:29（约 12:34:56 完成） · 速度 0.3s/项`。
+  - 后台任务（PVP/PVE 生涯武器、热力图、宗师）另加 `[任务] ▶ 开始 / ✔ 完成 · 总用时` 两行；
+    进度条与面板 `/api/bot/jobs` 共用同一份 `JOBS.done/total`，不额外记账。
+  - 逐场拉 PGCR 是主要耗时段：翻页阶段打「翻取对局历史：角色 i/N · 第 p 页 · 已收集 m 场」，
+    拿到总量后按 done/total 给 ETA；`_collect_matches()` 新增 `on_page` 回调供调用方接日志。
+  - 热力图这种「翻到 2019-06 为止」没有天然总量的，按**已扫到多早**相对 2019-06→今天 折算百分比
+    （`_scan_pct()`），进度条与 ETA 才有意义。
+  - 非任务的耗时查询同样接上：`career_report`（3 角色 × 5 批分模式统计）、`full_report`（/玩家）、
+    `mode_report`（/pvp /pve /智谋 近期战绩）、`raid_report`（/raid /地牢 翻页）。
+  - 节流：默认「距上次 ≥2s 或百分比涨 ≥2」才打，避免刷屏；日志走 `print(flush=True)`，
+    即 exe 同目录的 `exe_stdout.log`。
+- **名片（徽章底图）改成完整长条**（`bot_cards.py`）：`emblemBackgroundPath` 是 474×96 的长横条
+  （三个职业徽章 + 立绘），原来放进 ~900×58 的横幅里用 `background-size:cover`，只能看到中间一条，
+  用户看到的「只有一半」就是这个。现在统一用 `.strip`：盒子 `aspect-ratio:474/96` + 底图
+  `background-size:100% 100%`——盒子比例与图完全一致，**既不横向裁切也不拉伸**，整条完整露出；
+  叠字加 `.veil` 暗色渐变保证可读。
+  - `/生涯` 顶部玩家名牌区从纯文字标题改成 `class='namebar strip'` 长条（底图用主玩角色的徽章底图，
+    玩家名 / 守护者等级 / 最高光能 / 总时长 / 上次在线全部叠在条上）；分职业 pane 的 `.cbanner`
+    与 `/玩家` 的角色行 `.char` 同改。
+- **赛季卡主图：不再有空白格**（`build_seasons.py` + `bot_cards._season_bg_style()`）：
+  底图优先级 **官方 `backgroundImagePath` → 赛季 `displayProperties.icon`（150×150 主视觉）→ 赛季号派生渐变**。
+  - 事实：manifest 里 **S10–S15 没有 `backgroundImagePath`**（`background_season_10..15.*` 一律 404，
+    英文 manifest 也一样），但 **S11–S15 有 `displayProperties.icon`**；只有 S10 两者皆空。
+  - `build_seasons.py` 现在把 `icon` 一并写进 `manifest_index/seasons.json`（新增字段，旧字段全保留）。
+  - S10–S15 的真 key art 只存在于 Bungie 的营销素材/新闻页/旧版 manifest，当前接口拿不到；
+    对齐全赛季真 key art 只能人工收集后单独托管。小日向那类 bot 大概率就是自维护了一张 key art 表。
+
+## 2026-10-02 `/生涯` 改版为小日向式生涯面板
+
+`/生涯` 从「三模式汇总」升级成生涯面板：**逐赛季网格 + 分职业分模式时长 + 三模式生涯**，
+排版照小日向、皮肤仍用自有 v2 深灰。
+
+- 新数据层 `destiny_data.career_report()`：只打 GetProfile / GetHistoricalStats，**不跑 PGCR**，
+  比 `full_report()` 快一个量级（本机实测 6~10s 出图）。`/玩家` 仍用 `full_report()`。
+- **分模式时长**：`GetHistoricalStats` 各模式的 `allTime.secondsPlayed`。`modes` 一次最多约 20 个，
+  全 75 个会 ErrorCode 3，代码按 **15 个一批**分段再合并；返回键名 ≈ 模式定义 `friendlyName` 归一化，
+  但聚合模式键名不一致，兜底表见 `destiny_data._MODE_KEY_FIX`。`modes.json` 新增 `key` 字段
+  （`build_modes.py` 生成），键名↔模式号可自动对上。
+- **赛季等级 = 奖励等级 + 声望等级**：赛季定义的 `seasonPassProgressionHash` 常年为 0，
+  真正的 hash 在 `DestinySeasonPassDefinition`（经 `seasonPassList[0].seasonPassHash` 关联）。
+  该口径与用户给的小日向截图**逐条吻合**（深渊 100+309=409、终愿 460、异端 231…）。
+- **历史赛季的游玩时长官方拿不到**：`periodType` 只认 AllTime / Daily，Daily 仅保留最近 6 天，
+  故赛季卡只显示赛季名 / 起止 / 天数 / 等级，不显示时长。
+- 新增 `build_seasons.py`：生成 `manifest_index/seasons.json`（中文赛季名 / 起止 / 背景图 / prog / pres），
+  `build_manifest.py` 一并调用。旧的英文赛季名与缺失的背景图一并修好。
+- 卡片新增 `.sgrid/.scard/.cpane/.chips` 样式；分模式标签按 PvE（绿）/ PvP（红）/ 智谋（蓝）左侧色区分。
+- 已知差异：当前赛季（manifest 里的 28 凯旋纪念碑）数值与用户截图的小日向快照对不上，
+  属 manifest 与对方赛季边界漂移，非映射错误。
+
+## 2026-10-02 下线 DIM 板块（背包 / 配装 / 配装器 / 管理器）
+
+不再需要自建 DIM 页面，整块移除；本记录以下的 DIM 相关条目仅作历史留档。
+
+- 删除源码：`dim_data.py` / `dim_web.py` / `dim_ui.py` / `dim_user.py` / `dim_opt.py` /
+  `dim_host.py` / `build_dim_index.py` / `dim_user.json`，以及内置官方 DIM 静态站 `dim_app/`（约 98MB）。
+- 删除生成索引：`manifest_index/dim_items.json`（8.7MB）/ `dim_buckets.json` / `dim_categories.json` /
+  `dim_loadouts.json`。
+- `webui.py`：去掉 `dim_web` / `dim_host` 的挂载与顶部导航「DIM背包」，OAuth 回跳不再转交 `dimauth-`。
+- 打包/部署：`D2Query.spec` 去掉 `dim_*` hiddenimports，`deploy_exe.ps1` 去掉 `dim_app` 同步段。
+- 配置：`.env` / `.env.example` 去掉 `DIM_HIDE_NAV`，`.gitignore` / `.zcodeignore` 去掉 dim 条目。
+- 新增 `manifest_index/community_dim.json`（Clarity 社区洞察）**保留**：它给武器 perk 用，与 DIM 页面无关。
+
+## 2026-10-02 QQ 官方机器人「预设指令」配齐（指令面板 + 单聊自定义菜单）
+
+开放平台「高级设置 → 菜单与指令」在网上只写了「通过 API 配置」，没有可视化界面——新增
+`qq_official_panel.py` 直接打官方 OpenAPI 把面板写进去（默认 dry-run，`--apply` 才写，`--list`
+看线上现状，`--check` 按限额离线自检）。
+
+- 接口：域名 `https://api.bot.qq.com`（旧 `api.sgroup.qq.com` 留作回退），鉴权头
+  `Authorization: QQBot {access_token}` + `X-Union-Appid`，token 由
+  `bots.qq.com/app/getAppAccessToken` 用 AppID/AppSecret 换（复用 `qq_official_creds.json`）；
+  用到的接口是 `POST/GET/PUT/DELETE /v2/panels`、`PUT /v2/panels/{id}/target`、`GET/PUT /v2/menu`。
+- **生效范围只能在创建时定**：全局面板要用 `POST /v2/panels` 带 `target_type=all` 建；
+  `PUT /v2/panels/{id}` 只改元素与备注、改不了生效范围，`/target` 接口对全局面板直接报 40030021。
+  这里踩过一次坑：早先探测 `target_type=specific` 能不能用时建的测试面板**其实建成功了**（脚本把
+  后续请求的报错当成了建面板失败，没走到删除那步），后一次「更新」正好更新到它，群里那份于是变成
+  `specific` + 空关联 = 对谁都不生效——用户看到的就是「面板突然没了」。脚本现在只复用
+  `target_type=all` 的面板，其余一律删掉重建，`--list` 也会打印 target。
+- **限额**：单面板最多 20 项、元素名 ≤14 字符、描述 ≤30 字符、菜单按钮名 ≤10 字符、子菜单 ≤5 个，
+  **一个汉字算 2 个字符**（脚本 `--check` 按此校验）。另外列表接口在面板刚建好时可能只回一条
+  （异步生效有传播延迟），别据此以为「一个场景只能有一个面板」。
+- 写入内容：群聊 + 单聊各一份 20 项指令面板（帮助/绑定/武器查询/perk查询/武器筛选/护甲查询/
+  护甲套装/掉落/每日光尘/轮换/玩家/生涯/raid/地牢/pvp/pve/历史/常用武器/pve生涯武器/宗师，
+  每条带中文描述，就是小日向那种打 `/` 弹出的入口）；单聊另配 7 个底部按钮
+  （武器查询/perk查询/护甲查询 + 战绩·资料·记录·账号 四个子菜单），把挤不进面板的
+  `/智谋` `/热力图` `/称号` `/锻造` `/我的` `/解绑` 也带上了。
+- 平台会把写入的元素名开头的 `/` 去掉，客户端按 `type=command` 自动补回，所以清单里照常写 `/指令`。
+- 指令清单与描述都在脚本顶部 `PANEL_ITEMS` / `MENU_ITEMS`，改完重跑 `--apply` 即生效；
+  首次 `--apply` 会把改动前的线上配置备份到 `qq_official_menu_backup.json`（已 gitignore）。
+
+## 2026-10-02 全部查询指令接入 QQ 官方机器人（NapCat 之外的第二条通道）
+
+### 平台层 bot_platform.py（新文件）
+
+- 同一套指令要同时跑两种适配器，差异全部收进 `bot_platform.py`：平台判定、身份/群标识、
+  @ 判定（`at_target`/`at_other_only`/`at_me_only`）、消息段构造（文本/图片/@）、回复打包、
+  多图拆分、官方群开关。业务侧（`destiny2.py`）不再直接碰任何适配器类型。
+- 关键平台差异（都写在模块 docstring 里）：
+  - **身份**：NapCat 是 QQ 号，官方只有 `member_openid`/`user_openid` → 绑定表按 openid 另存一份
+    （同一 store，`uid()` 取值不同，天然不撞车）；
+  - **图片**：NapCat 走 `base64://` 直发；官方必须走富媒体上传（`MessageSegment.file_image`），
+    且**一条消息只带一个媒体**（适配器 `_extract_qq_media` 只取最后一个媒体段）；
+  - **被动回复**：官方群 5 分钟 / 最多 5 条，超窗口发不出去（没有主动推送）→ 长任务
+    （热力图/生涯武器）先回「统计中」卡片再回结果，超时那条只能记日志、让用户重发（有缓存后秒出）；
+  - **群开关**：官方群用 `bot_config.json` 的 `official_groups`（group_openid 列表）单独管，
+    与 NapCat 的 `enabled_groups`（QQ 群号）分开——混在一起面板会把官方群判成"未勾选"。
+- 官方通道的 @ 回执（回复里 @ 发起人）默认关：官方群 @ 语法（适配器渲染成 `<@openid>`）
+  没在文档里得到确认，`bot_config.json` 的 `official_at_back=true` 可开，不用重新打包。
+
+### destiny2.py 去 OneBot 化（`nonebot_plugins/destiny2.py`）
+
+- 删掉 `from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment`：
+  注解改用基类 `nonebot.adapters.Message`（`CommandArg()` 的 Depends 不做类型校验，两个适配器都注入），
+  `msg_logger` 从 `on_type(MessageEvent)` 改成 `on_type(Event, rule=Rule(bp.is_message_event))`
+  （两个适配器的 `MessageEvent.get_type()` 都是 `"message"`）。
+- 回复统一走 `bp.reply_msg(event, *segs)`：NapCat 群聊前缀 `at+空格`，官方按 `official_at_back` 决定。
+- `/掉落` 多图：NapCat 一条消息带全部；官方拆条（最多 4 张 + 1 条说明，被动回复 5 条上限）。
+
+### bot_runtime.py：组合驱动 + 官方适配器（`bot_runtime.py`）
+
+- 驱动从 `~fastapi` 换成 **`~fastapi+~httpx+~websockets`**：前者供协议端反向 WS（8901 不变），
+  后两个是官方适配器要的（出站 WS 连网关 + HTTP 调开放平台 API）。组合驱动由 nonebot 的
+  `combine_driver` 现场合成，不冲突。
+- 凭证读 `qq_official_creds.json`（模板 `qq_official_creds.example.json`，已 gitignore）；
+  没配/还是占位文本就**不挂官方适配器**，NapCat 通道照常。官方适配器注册失败也只打日志
+  （`_serve` 里 try/except），不牵连 NapCat。
+- 官方 intent 只开 `c2c_group_at_messages`（位 25：群 @ + 单聊），与冒烟脚本里验过的一致。
+
+### 验证
+
+- **离线双通道烟测** `_rtest/official_harness.py`：真插件 + 桩渲染 + 假 bot，事件按真实模型造、
+  走完整 nonebot 管线。22 项全通过：NapCat（/帮助 /武器查询 @bot直查 /掉落 @别人不响应 /我的
+  /指令@某人）/ 官方（/帮助 /武器查询 @bot直查 /@bot带指令词 /perk查询 /护甲查询 /护甲套装 /掉落
+  /轮换 /武器筛选 /我的（openid 绑定）/私聊C2C /指令@某人），并断言官方每条回复都带被动 `msg_id`、
+  媒体内容就是卡片 PNG。
+- **真机**：`_rtest/official_live.py` 用真凭证连官方网关 → READY（bot `11824830429619768898`），
+  并把 1.05MB 真实卡片图上传成功（`srv_send_msg=False`，不打扰群）。
+- 打包：`D2Query.spec` 的 hiddenimports 补 `bot_platform`/`nonebot.adapters.qq`/`nonebot.drivers.httpx`；
+  `deploy_exe.ps1` 外置同步清单加 `bot_platform.py`（漏了它 exe 一起就 ImportError）。
+
 ## 2026-10-02 全站卡片统一 v2 深灰风格 + 角落水印 + 重启后「未连接」修复
 
 ### 查询卡片统一到武器卡/护甲卡的深灰家族（bot_cards.py / webui.py）

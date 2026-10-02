@@ -1,10 +1,14 @@
-"""QQ bot 运行时：在同进程后台线程里跑 NoneBot（OneBot v11 反向 WS 服务端）
+"""QQ bot 运行时：在同进程后台线程里跑 NoneBot，同时挂两条通道
 
-NapCat / LLOneBot 等协议端（负责 QQ 扫码登录）以反向 WS 接入：
-  ws://127.0.0.1:8901/onebot/v11/ws
+① NapCat / LLOneBot 等协议端（个人号，负责 QQ 扫码登录）以反向 WS 接入：
+     ws://127.0.0.1:8901/onebot/v11/ws
+② QQ 官方机器人（q.qq.com）：出站 WS 连官方网关，不占本地端口。
+   凭证读 qq_official_creds.json（模板 qq_official_creds.example.json）；
+   文件不存在/没填真值就不挂这条通道，NapCat 照常工作。
 
 群开关等配置存 bot_config.json：
-  {"enabled_groups": ["123456"]}   # 空 = 所有群都响应
+  {"enabled_groups": ["123456"]}   # NapCat 群白名单（QQ 群号），空 = 所有群都响应
+  {"official_groups": ["4A7B47…"]} # 官方群白名单（group_openid），空 = 全部响应
 """
 import json
 import os
@@ -14,7 +18,33 @@ import threading
 import time
 
 CONFIG_FILE = "bot_config.json"
+CREDS_FILE = "qq_official_creds.json"
 BOT_PORT = 8901
+
+# 只要群 @ 消息这一个 intent；其余显式关掉——申请了没审批的 intent 会被网关拒绝。
+# 与 qq_official_smoke.py 里验证通过的那份保持一致。
+# （c2c_group_at_messages 位同时覆盖「群聊@机器人」和「单聊消息」）
+OFFICIAL_INTENTS = {
+    "guilds": False,
+    "guild_members": False,
+    "guild_message_reactions": False,
+    "message_audit": False,
+    "at_messages": False,
+    "c2c_group_at_messages": True,
+}
+
+
+def official_creds() -> tuple[str, str] | None:
+    """官方机器人 AppID/AppSecret；没配或还是占位文本时返回 None"""
+    try:
+        data = json.load(open(CREDS_FILE, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    appid = str(data.get("appid") or "").strip()
+    secret = str(data.get("secret") or "").strip()
+    if not appid or not secret or appid.startswith("填"):
+        return None
+    return appid, secret
 
 
 def load_config() -> dict:
@@ -103,11 +133,24 @@ def _serve(state: dict) -> None:
         print(f"[bot] {BOT_PORT} 已超 {BIND_WAIT_SEC}s 仍被占用：多半已有一个实例在跑，"
               "本实例不启动 QQ bot（网页查询不受影响）")
         return
-    nonebot.init(driver="~fastapi", host="127.0.0.1", port=BOT_PORT,
-                 log_level="WARNING", command_start={"/"})
+    creds = official_creds()
+    # ~fastapi 供协议端反向 WS（要占 8901）；~httpx+~websockets 给官方适配器
+    # 用（出站连网关 + 调开放平台 API）。官方适配器没配也留着这两个混入类，
+    # 免得同一份配置在两台机器上起法不一致。
+    nonebot.init(driver="~fastapi+~httpx+~websockets", host="127.0.0.1", port=BOT_PORT,
+                 log_level="WARNING", command_start={"/"},
+                 qq_bots=[{"id": creds[0], "secret": creds[1], "intent": OFFICIAL_INTENTS}]
+                 if creds else [])
     state["inited"] = True          # 到这里之后再失败就不能重来了，见 _run
     driver = nonebot.get_driver()
     driver.register_adapter(Adapter)
+    if creds:
+        try:
+            from nonebot.adapters.qq import Adapter as QQOfficialAdapter
+            driver.register_adapter(QQOfficialAdapter)
+            print(f"[bot] 官方 QQ 通道已挂上（AppID {creds[0][:6]}***，出站 WS，不占端口）")
+        except Exception as exc:  # noqa: BLE001  官方通道挂了也要保住 NapCat
+            print(f"[bot] 官方 QQ 通道没挂上（NapCat 不受影响）：{exc}")
     # 打包 exe 时插件目录在 exe 旁边；开发时在源码目录
     if getattr(sys, "frozen", False):
         plugin_dir = os.path.join(os.path.dirname(sys.executable), "nonebot_plugins")

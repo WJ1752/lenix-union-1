@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_all
 pw_datas, pw_binaries, pw_hidden = collect_all('playwright')
 
 # manifest_index 索引**自动收集**，别改回手写清单：手写版漏过一次 stats.json，
-# 打包出来的 exe 一开 DIM 页面就报 "No such file or directory: manifest_index\stats.json"。
+# 打包出来的 exe 一开武器详情就报 "No such file or directory: manifest_index\stats.json"。
 # raw_* 是构建中间产物（raw_items.json 有 220MB），只给构建脚本用，不进包。
 _MI_SKIP = {'raw_items.json', 'raw_plugsets.json', 'raw_items_en_lite.json'}
 mi_datas = [(p, 'manifest_index') for p in sorted(glob.glob('manifest_index/*.json'))
@@ -24,7 +24,7 @@ a = Analysis(
     pathex=[],
     binaries=pw_binaries,
     datas=[*mi_datas, *loot_datas, ('certs/localhost.pem', 'certs'), ('certs/localhost-key.pem', 'certs')] + pw_datas,
-    hiddenimports=['card_render', 'bot_cards', 'weapon_filter', 'weapon_usage', 'raid_loot', 'dim_data', 'dim_web', 'dim_ui', 'dim_user', 'dim_opt', 'greenlet', 'pyee', 'qr_png', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.http', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11'] + pw_hidden,
+    hiddenimports=['card_render', 'bot_cards', 'bot_platform', 'bot_fireteam', 'weapon_filter', 'weapon_usage', 'raid_loot', 'greenlet', 'pyee', 'qr_png', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.httpx', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11', 'nonebot.adapters.qq'] + pw_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -16,16 +16,8 @@ import bot_log
 import napcat_runtime
 import bungie_auth
 import weapon_filter
-import dim_web
-import dim_host
-from pathlib import Path
 
 app = FastAPI()
-# 内置官方 DIM：构建产物 dim_app/ 挂到 /dim。须先于 dim_web 注册，
-# /dim/* 由 DIM 静态站接管；未找到 dim_app 时不启用，旧自研板块照常。
-dim_host.mount_dim(app, Path(__file__).parent)
-# DIM 板块（背包仓库/成就/配装）是独立模块，只在这里挂上它的路由，现有页面不受影响
-app.include_router(dim_web.router)
 
 
 # ---------- 顶部导航：玩家 / 武器 / Perk 同级切换 ----------
@@ -34,7 +26,7 @@ app.include_router(dim_web.router)
 _NAV_ITEMS = (("/", "玩家查询"), ("/catalog", "武器图鉴"),
               ("/perks", "Perk查询"), ("/eververse", "光尘商店"), ("/rotation", "本周轮换"),
               ("/armorsets", "护甲套装"),
-              ("/dim", "DIM背包"), ("/panel", "Bot面板"))
+              ("/panel", "Bot面板"))
 
 
 def navbar(active: str = "") -> str:
@@ -959,12 +951,6 @@ async def bungie_manual(request: dict):
 
 @app.get("/bungie/callback", response_class=HTMLResponse)
 async def bungie_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    # DIM 板块的授权回跳（state 固定为 dimauth- 前缀）：原样转交 DIM 的 authReturn 页，
-    # 由 DIM 自己（构建时烘焙的 client_secret）完成 code 换 token，与面板授权互不干扰
-    if state.startswith("dimauth-") and code and not error:
-        from starlette.responses import RedirectResponse
-        from urllib.parse import quote
-        return RedirectResponse(f"/dim/authReturn.html?code={quote(code)}&state={quote(state)}")
     back = ("<div style='margin-top:14px'><a href='/panel' "
             "style='color:#4b8fd4;font:14px sans-serif'>← 返回面板</a></div>")
     if error or not code:
@@ -1016,7 +1002,8 @@ def _badge(label: str, n: int, cls: str = "") -> str:
 
 
 def _raid_badges(g: dict) -> str:
-    """raid.report 式徽章：参与/通关/无暇/单人/双人/三人/单人无暇/双人无暇/三人无暇，为 0 的压暗。
+    """raid.report 式徽章：参与/通关恒显；无暇/低人/首日/首周这类特殊通关只在有数时出现，
+    为 0 不再压暗占位（用户 2026-10-02：直接只显示已完成的特殊通关）。
 
     「参与」= 该副本该难度的总场次（含没打完的），这样中途散的团也看得见；
     大师不再单独出徽章——它已经是卡片里的独立分栏。
@@ -1027,7 +1014,19 @@ def _raid_badges(g: dict) -> str:
                           ("单人", "solo", "lm"), ("双人", "duo", "lm"), ("三人", "trio", "lm"),
                           ("单人无暇", "solo_fl", "sf"), ("双人无暇", "duo_fl", "sf"),
                           ("三人无暇", "trio_fl", "sf")):
-        out.append(_badge(lab, g[key], cls))
+        if g[key]:
+            out.append(_badge(lab, g[key], cls))
+    if g.get("day_one"):
+        # 首日徽章带 raid.report 首日赛名次（api.raidreport.dev；查不到/没进榜就只显示次数）
+        txt = f"首日 {g['day_one']}"
+        tip = f"首日窗口内通关 ×{g['day_one']}"
+        r = g.get("d1_rank")
+        if r and r.get("rank"):
+            txt = f"首日 #{r['rank']}" + (f"/{r['total']}" if r.get("total") else "")
+            tip = f"首日通关 ×{g['day_one']} · raid.report 首日赛第 {r['rank']} 名"
+        out.append(f"<span class='bd d1' title='{tip}'>{txt}</span>")
+    if g.get("week_one"):
+        out.append(_badge("首周", g["week_one"], "w1"))
     return "".join(out)
 
 
@@ -1046,7 +1045,7 @@ def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "") -> st
                  f"<img src='{g['pgcr']}'>"
                  f"<div class='rin'><div class='rname'><b>{g['name']}</b>{dtag}</div>"
                  f"<div class='rbads'>{_raid_badges(g)}</div></div>"
-                 f"<span class='dim'>最快 {_fmat(g['best'])}<br>最近 {g['last'][:10]}</span></a>")
+                 f"<span class='dim'>最快 {_fmat(g['best'])}<br>最近 {(g['last'] or '—')[:10]}</span></a>")
     return rows
 
 
@@ -1062,7 +1061,7 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
         sections += f"<h2>大师难度</h2>{mst}"
     if not sections:
         sections = ("<h2>副本统计</h2>"
-                    "<p class='empty'>该玩家没有相关通关记录（对局历史最多回溯 100 场/角色）</p>")
+                    "<p class='empty'>该玩家没有相关通关记录（对局历史按官方接口深度回溯，每人最多 40 页 × 250 场）</p>")
     top = "".join([
         f"<div class='row hl'><span>总通关次数</span><b>{rep['total_clears']}</b></div>",
         f"<div class='row'><span>总参与次数（含未通关）</span><b>{rep.get('total_plays', rep['total_clears'])}</b></div>",
@@ -1085,6 +1084,8 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
             f".bd.off{{opacity:.32}}"
             f".bd.pl b{{color:#e8e6e3}}.bd.cl b{{color:#35c66b}}.bd.fw b{{color:#d4b26a}}.bd.ms b{{color:#ff8d85}}"
             f".bd.lm b{{color:#4b8fd4}}.bd.sf b{{color:#9b6bd4}}"
+            f".bd.d1{{background:rgba(255,200,90,.14);border:1px solid rgba(255,200,90,.35)}}"
+            f".bd.d1 b{{color:#ffc95c}}.bd.w1 b{{color:#8fd0ff}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -1094,17 +1095,25 @@ def render_raid_detail(rep: dict, base: str, month: str, amode: int = 4, diff: s
     qname = quote(rep["display"])
     ms = d2.filter_matches(rep["matches"], month=month, base=base, diff=diff)
     done = [m for m in ms if m["completed"]]
-    flawless = sum(1 for m in done if m["deaths"] == 0)
-    solo = sum(1 for m in done if m["player_count"] == 1)
-    duo = sum(1 for m in done if m["player_count"] == 2)
-    trio = sum(1 for m in done if 0 < m["player_count"] <= 3)
-    solo_fl = sum(1 for m in done if m["deaths"] == 0 and m["player_count"] == 1)
-    duo_fl = sum(1 for m in done if m["deaths"] == 0 and m["player_count"] == 2)
-    trio_fl = sum(1 for m in done if m["deaths"] == 0 and 0 < m["player_count"] <= 3)
+    # 与主卡同口径：无暇=0死+从头开始（full_run）+非私局；低人按全程出现过的账号数
+    flawless = sum(1 for m in done if m["deaths"] == 0 and m.get("full_run", True)
+                   and not m.get("private"))
+    solo = sum(1 for m in done if m.get("low_accounts", m["player_count"]) == 1
+               and not m.get("private"))
+    duo = sum(1 for m in done if m.get("low_accounts", m["player_count"]) <= 2
+              and not m.get("private"))
+    trio = sum(1 for m in done if 0 < m.get("low_accounts", m["player_count"]) <= 3
+               and not m.get("private"))
+    solo_fl = sum(1 for m in done if m["deaths"] == 0 and m.get("full_run", True)
+                  and not m.get("private") and m.get("low_accounts", m["player_count"]) == 1)
+    duo_fl = sum(1 for m in done if m["deaths"] == 0 and m.get("full_run", True)
+                 and not m.get("private") and m.get("low_accounts", m["player_count"]) <= 2)
+    trio_fl = sum(1 for m in done if m["deaths"] == 0 and m.get("full_run", True)
+                  and not m.get("private") and 0 < m.get("low_accounts", m["player_count"]) <= 3)
     master = sum(1 for m in done if m.get("diff") == "大师")
     best = min((m["duration"] for m in done), default=None)
     rname = base or (ms[0]["base"] if ms else "副本")
-    months = sorted({m["period"][:7] for m in rep["matches"]
+    months = sorted({(m.get("period_cn") or m["period"])[:7] for m in rep["matches"]
                      if m["base"] == base and (not diff or m.get("diff") == diff)}, reverse=True)
     link = (f"/card?name={qname}&mode=raidg&amode={amode}&base={quote(base)}"
             + (f"&diff={quote(diff)}" if diff else ""))
@@ -1154,7 +1163,7 @@ def render_history_card(rep: dict) -> str:
             f"<a class='mrow hist' href='/pgcr?i={m['instance']}'>"
             f"<img src='{m['pgcr']}'>"
             f"<div class='mi'><div class='hname'>{m['name']}{tag}{mtag}</div>"
-            f"<span class='dim'>{m['period'][5:16]} · 用时 {dur}</span></div>"
+            f"<span class='dim'>{(m.get('period_cn') or m['period'])[5:16]} · 用时 {dur}</span></div>"
             f"<div class='hcols'>{cols}</div></a>"
         )
     body = (f"<h1>{rep['display']}</h1>"
@@ -1617,7 +1626,7 @@ async def pgcr_page(instance: str) -> str:
                f"<section><h2>本场 MVP</h2>"
                f"<p class='mvpname'>{mvp}</p><p class='dim'>按得分排行第一名</p></section></div>")
     body = (f"<h1>{d['name']}</h1>"
-            f"<div class='sub'>对局详情 · {d['period']} · 共 {len(d['entries'])} 名玩家</div>"
+            f"<div class='sub'>对局详情 · {d.get('period_cn') or d['period']}（北京时间） · 共 {len(d['entries'])} 名玩家</div>"
             f"{summary}<h2>玩家排行（点开武器明细）</h2>{rows}")
     return CARD_CSS.replace("__BODY__", body)
 
@@ -2296,7 +2305,7 @@ def esc(s: str) -> str:
 def render_matches(matches: list[dict], limit: int = 15) -> str:
     order = list(reversed(matches))
     grid = "".join(
-        f"<span class='cell {match_result(m)[1]}' title='{esc(m['name'])} {esc(m['period'])}'></span>"
+        f"<span class='cell {match_result(m)[1]}' title='{esc(m['name'])} {esc(m.get('period_cn') or m['period'])}'></span>"
         for m in order
     )
     rows = ""
@@ -2306,7 +2315,7 @@ def render_matches(matches: list[dict], limit: int = 15) -> str:
         mtag = f"<span class='mtag'>{m['mode_name']}</span>" if m.get("mode_name") else ""
         rows += (
             f"<a class='mrow' href='/pgcr?i={m['instance']}'><img src='{m['pgcr']}'><div class='mi'>"
-            f"<b>{m['name']}</b> {tag}{mtag} <span class='dim'>{m['period']} · {dur} · 点击查看对局详情</span></div>"
+            f"<b>{m['name']}</b> {tag}{mtag} <span class='dim'>{m.get('period_cn') or m['period']} · {dur} · 点击查看对局详情</span></div>"
             f"<div class='ms'><span>击杀 <b>{m['kills']}</b></span><span>死亡 <b>{m['deaths']}</b></span>"
             f"<span>K/D <b>{m['kd']:.2f}</b></span><span>协助 <b>{m['assists']}</b></span>"
             + (f"<span>效率 <b>{m['eff']:.2f}</b></span>" if m.get("eff") else "")

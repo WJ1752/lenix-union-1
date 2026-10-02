@@ -4,7 +4,7 @@
 
 **命运 2 本地查询站 + QQ 机器人**　·　一个 exe 同时搞定「网页战绩查询」和「群里丢指令出图」
 
-原生窗口界面 · 全指令图片回复 · 内置 DIM 板块 · 内置 NapCat 扫码登录 · 无需外网服务器
+原生窗口界面 · 全指令图片回复 · 内置 NapCat 扫码登录 · 无需外网服务器
 
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![NoneBot2](https://img.shields.io/badge/NoneBot2-2.5.0-EE4C2C)](https://nonebot.dev/)
@@ -24,7 +24,6 @@
 | :--- | :--- |
 | **网页查询站** | 本地 8900 端口，原生窗口（pywebview）打开，无需浏览器插件、不依赖任何公网服务 |
 | **QQ 机器人** | 内置 NoneBot2 + OneBot V11 + NapCat，面板里扫码登录，群里发 `/生涯` 直接出图片卡片 |
-| **DIM 板块** | 对着官方 DIM 复刻的背包 / 进度 / 配装 / 配装器 / 管理器五个页面，标签与自建配装存本地 |
 
 数据全部来自 **Bungie 官方 API + Manifest（简体中文）**，本地索引 2208 把武器、三万多条物品定义，
 查询走本地缓存，除了 Bungie 本身的请求外不碰任何第三方站点。
@@ -42,6 +41,7 @@
 <tr><td width="50%" valign="top">
 
 ### 📊 玩家战绩
+- **生涯面板** `/生涯`　逐赛季网格（赛季背景图 + 起止 / 天数 + 赛季等级）+ 分职业分模式时长 + 三模式生涯，秒级出图
 - **总览**　光能 / 时长 / 三角色 + 三模式生涯速览
 - **PVP / PVE / 智谋**　官方生涯统计（含胜率、精准击杀）+ 近期战绩（连胜连败 / KDA / 平均效率）+ **模式细分表**
 - **Raid / 地牢**　跨角色聚合，八枚徽章逐副本一行，点击展开细分 + 按月筛选
@@ -58,19 +58,7 @@
 - **锻造**　按掉落来源分组，顶部永远留没集齐的组
 
 </td></tr>
-<tr><td valign="top">
-
-### 🎒 DIM 板块
-对齐官方 DIM 的五个页面，取色与布局照 DIM 源码：
-- **背包** `/dim`　四列（泰坦 / 猎人 / 术士 / 保险库），**拖拽搬运**、拖到装备槽即装备
-- **物品弹窗**　悬停出详情，左键固定，右键出操作菜单；属性条 / Perk / 插槽模组 / 来源
-- **标签与备注**　收藏 ♥ / 保留 ⚑ / 丢弃 ✖ / 注入 ⚡ / 归档 🗄，快捷键 `shift+1..5`
-- **搜索语法**　`is:weapon`、`tag:favorite`、`notes:xx`、`not:<词>` + 13 个快捷 chip
-- **配装** `/dim/loadouts`　游戏内 20 套 + 自建配装，支持分享链接 / 导入 / 一键应用 / 两套对比
-- **配装器** `/dim/optimizer`　属性优先级 + 最小最大值 + 假定大师之作，穷举 5 护甲槽出前 24 套
-- **管理器** `/dim/manage`　表格式整理，勾选后批量打标签 / 批量搬运
-
-</td><td valign="top">
+<tr><td colspan="2" valign="top">
 
 ### 🔫 图鉴与查询
 - **武器图鉴** `/catalog`　全量 **2208 把**武器网格，六维度（类型 / 框架 / 元素 / 弹药 / 槽位 / 品质）**动态联动计数**筛选
@@ -87,11 +75,15 @@
 <tr><td valign="top">
 
 ### 🤖 QQ 机器人
+- **两条通道共用同一套指令**：NapCat 协议端（个人号，扫码登录）+ QQ 官方机器人
+  （q.qq.com，出站 WS，不占端口），平台差异全收在 `bot_platform.py`
 - 群里所有回复都是**图片卡片**（HTML 排版 + 无头浏览器截图，小日向式）
 - 战绩类卡片**直接复用网页端排版**——改网页样式，机器人出图跟着变，不用维护两套
-- 群内回复自动 `@` 发起人，私聊不加
+- 群内回复自动 `@` 发起人（官方通道由 `official_at_back` 控制），私聊不加
 - 支持「引用某条消息 / @机器人 后再发指令」，也支持直接 `@机器人 武器名` 出卡
 - **面板内置 NapCat 一键登录**：二维码直接显示在面板里，手机扫码即可，全程不用打开 NapCat WebUI
+- **预设指令面板 + 单聊菜单已配好**（打 `/` 弹出的指令列表，小日向同款，每条带中文说明）：
+  改清单重跑 `qq_official_panel.py --apply` 即同步，见下文「指令面板 / 单聊菜单」
 - 面板带**后台任务进度条**（谁发起的 / 查到第几场 / 排队位次）与**消息日志**
 
 </td><td valign="top">
@@ -101,7 +93,7 @@
 - **事件循环隔离**　同时跑三个 loop（主界面 / Bungie 回跳 HTTPS / QQ bot），httpx 客户端与 Playwright 浏览器**按 loop 各持一份**
 - **本地缓存**　PGCR 逐场落盘（上限 20000 场），生涯武器 / 热力图结果级缓存，再查秒开
 - **任务串行队列**　长任务排队执行，避免被 Bungie 限流
-- **离线自检**　`test_sweep.py` 57 项接口断言；`_rtest/dim_ui_check.py` 用无头 Edge 逐页 DOM 断言，**写请求全部 route 拦截，不打真实账号**
+- **离线自检**　`test_sweep.py` 57 项接口断言；`_rtest/` 下用无头 Edge 逐页 DOM 断言，**写请求全部 route 拦截，不打真实账号**
 
 </td></tr>
 </table>
@@ -110,14 +102,12 @@
 
 ## 界面预览
 
-**DIM 背包仓库** —— 四列布局、拖拽搬运、赛季竖条水印、大师之作金边
-
-<div align="center"><img src="docs/screenshots/dim-inv.png" width="860" alt="DIM 背包"></div>
+**武器图鉴** —— 2208 把武器 · 六维联动筛选 · 同名版本合并
 
 <table>
 <tr>
 <td width="50%"><div align="center"><img src="docs/screenshots/catalog.png" alt="武器图鉴"><br><sub><b>武器图鉴</b>　2208 把武器 · 六维联动筛选</sub></div></td>
-<td width="50%"><div align="center"><img src="docs/screenshots/dim-opt.png" alt="配装器"><br><sub><b>配装器</b>　属性优先级 + 假定大师之作穷举</sub></div></td>
+<td width="50%"><div align="center"><img src="docs/screenshots/panel.png" alt="Bot面板"><br><sub><b>Bot 面板</b>　扫码登录 · 后台任务进度 · 消息日志</sub></div></td>
 </tr>
 <tr>
 <td><div align="center"><img src="docs/screenshots/eververse.png" alt="光尘商店"><br><sub><b>光尘商店</b>　当日轮换商品</sub></div></td>
@@ -160,7 +150,6 @@ python -m venv .venv
 .venv\Scripts\python build_manifest.py
 .venv\Scripts\python build_weapon_details.py
 .venv\Scripts\python enrich_weapons_ci.py
-.venv\Scripts\python build_dim_index.py
 .venv\Scripts\python build_weapon_filter_index.py
 .venv\Scripts\python build_weapon_catalog.py
 .venv\Scripts\python build_modes.py
@@ -185,7 +174,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File stop_webui.ps1
 
 ```ini
 BUNGIE_API_KEY=          # 必填，https://www.bungie.net/en/Application
-BUNGIE_CLIENT_ID=        # 光尘商店 / DIM 板块需要 OAuth
+BUNGIE_CLIENT_ID=        # 光尘商店需要 OAuth
 BUNGIE_CLIENT_SECRET=
 BUNGIE_REDIRECT_URI=https://127.0.0.1:8902/bungie/callback
 HOST=127.0.0.1
@@ -203,9 +192,34 @@ PORT=8900
 | 玩家战绩 / Raid / 地牢 / PVP / PVE / 历史 / 热力图 | ✅ | |
 | 武器图鉴 / 武器查询 / Perk 查询 / 武器筛选 / 轮换 | ✅ | |
 | 光尘商店 | | ✅ |
-| DIM 板块（背包 / 配装 / 配装器 / 管理器） | | ✅ |
 | QQ 群里查别人战绩 | ✅ | |
-| QQ 里 `/我的` 相关绑定账号的资产操作 | | ✅ |
+
+</details>
+
+<details>
+<summary><b>接 QQ 官方机器人（可选，和 NapCat 可以同时开）</b></summary>
+
+在 [q.qq.com](https://q.qq.com/qbot) 创建机器人后，把开发设置里的 AppID / AppSecret 填进
+exe（或源码）同目录的 `qq_official_creds.json`（模板见 `qq_official_creds.example.json`）：
+
+```json
+{ "appid": "你的AppID", "secret": "你的AppSecret" }
+```
+
+重启程序即自动挂上官方通道（出站 WS 连官方网关，不占本地端口，和 NapCat 互不影响；
+没这个文件就不挂，NapCat 照常跑）。官方群只推送 @机器人 的消息，所以官方群里每条指令都要
+先 @ 机器人。面板的群开关只列 NapCat 侧的群；官方侧的群白名单写在 `bot_config.json`：
+
+```json
+{
+  "enabled_groups": [],              // NapCat：QQ 群号白名单，空 = 全部响应
+  "official_groups": [],             // 官方：group_openid 白名单，空 = 全部响应
+  "official_at_back": false          // 官方回复里是否 @ 发起人（默认关；官方群 @ 语法未确认）
+}
+```
+
+`qq_official_creds.json` 已在 `.gitignore` 里，**不要外发或提交**；AppSecret 若曾泄露到聊天记录/截图，
+去开放平台重置一次。
 
 </details>
 
@@ -216,6 +230,30 @@ PORT=8900
 > **所有指令必须带 `/` 前缀**，命令词后要紧跟空白或直接结束。
 > 群里闲聊「pve是顺手写的…」不会被当成查询；前置的 `@机器人` 与「引用某条消息」会自动忽略。
 > **所有回复都是图片卡片。** 旧 `d2` 系列全部保留为别名（同样要带 `/`）。
+>
+> NapCat 通道（个人号）裸写指令即可；**官方机器人通道**只推送 @机器人 的消息，
+> 所以官方群里每条指令都要先 @ 机器人（`@雷尼克斯联合-1 /raid`），@bot 直查同样可用。
+> 官方通道拿不到 QQ 号，`/绑定` 的账号按 openid 单独记一份（同一个人两个通道各绑一次）。
+
+### 指令面板 / 单聊菜单（打 `/` 弹出的预设指令）
+
+开放平台「高级设置 → 菜单与指令」只能**通过 API 配置**，仓库里的 `qq_official_panel.py` 就是干这个的：
+
+```bash
+.venv/Scripts/python.exe qq_official_panel.py --check    # 离线自检：名字≤14 / 描述≤30 字符（汉字算 2）
+.venv/Scripts/python.exe qq_official_panel.py            # dry-run，只打印将要写入的内容
+.venv/Scripts/python.exe qq_official_panel.py --apply    # 真写（改动前的线上配置备份到 qq_official_menu_backup.json）
+.venv/Scripts/python.exe qq_official_panel.py --list     # 看线上现在是什么
+```
+
+- **面板 = 用户在聊天框打 `/` 时弹出的指令清单**（小日向那版就是这个）：群聊、单聊各一份，20 条，
+  每条带中文说明；点一下把指令填进输入框。
+- **单聊另有 7 个底部按钮**：武器查询 / perk查询 / 护甲查询 + 战绩·资料·记录·账号 四个子菜单。
+- **平台限制**：面板的生效范围（全群/指定群）只能在创建时定，改不了——脚本只认 `target_type=all`
+  的那份，发现别的（比如探测用的 specific 面板）会删掉重建；单面板最多 20 项。
+  所以挤不进来的 `/智谋` `/热力图` `/称号` `/锻造` `/我的` `/解绑` 靠 `/帮助` 和单聊菜单兜底。
+- 清单与描述都写在脚本顶部 `PANEL_ITEMS` / `MENU_ITEMS`，改完重跑 `--apply` 即生效。
+- 平台会把元素名开头的 `/` 去掉、客户端按 `type=command` 自动补回，所以清单里照常写 `/指令`。
 
 ### 账号
 
@@ -230,13 +268,14 @@ PORT=8900
 | 指令 | 别名 | 说明 |
 | :--- | :--- | :--- |
 | `/玩家 [玩家名#编号]` | `/d2` | 徽章横幅三角色 + 最高光能 + 三模式速览 |
-| `/生涯` | `/周报` `/d2周报` | PVP / PVE / 智谋生涯表 + 总计 |
+| `/生涯` | `/周报` `/d2周报` | PVP / PVE / 智谋生涯表 + 总计；21 个赛季逐格显示等级与**该赛季游玩时长** |
 | `/raid` | `/突袭` `/d2raid` | 分标准 / 大师两栏，每副本八枚徽章 |
 | `/地牢` | `/dungeon` `/d2地牢` | 口径同 raid（mode 82） |
 | `/pvp` | `/熔炉` `/d2pvp` | 生涯统计 + 近期战绩 + 模式细分表 |
 | `/pve` | `/d2pve` | 用通关率代替胜率（排除探索 / 巡逻） |
 | `/智谋` | `/gambit` `/d2智谋` | 官方聚合接口已下线，走对局历史聚合 |
 | `/历史` | `/战绩` `/最近对局` `/d2历史` | 全模式最近对局流 |
+| `/队伍` | `/队友` `/fireteam` `/d2队伍` | **在轨道/组队时**：队内每人的**生涯总时长 + 成就点数**（名单取自官方实时队伍）；**在活动中**：突袭/地牢=全队每人**每副本「完成数/导师」**指标砖（副本专属图标），熔炉/智谋=**按「你的阵营/对方阵营」分列** + 该模式生涯；活动名按官方 activity hash 认定，不再拿"上一把"顶替 |
 | `/常用武器` | `/武器统计` `/mvp` `/生涯武器` `/pvp生涯武器` | PVP 武器排名，前三奖牌色 + 击杀条 |
 | `/pve生涯武器` | `/pve武器` `/pve常用武器` | PVE 口径，默认当前赛季 |
 | `/热力图` | `/活跃` `/d2热力图` | 按赛季分组的全历史月历 |
@@ -253,6 +292,7 @@ PORT=8900
 | `/护甲套装 [套装名]` | `/套装效果` `/d2套装` `/套装` | 2/4 件效果全中文数值（Starside）；不带名字出全部索引；支持别名：炽天使套 / 一愿 / 遗愿 / 梦魇 / vog / kf / vow / ce … |
 | `/武器筛选 关键词…` | `/d2武器筛选` `/d2筛选` `/筛选武器` | 从 2208 把里按条件筛列表，多词之间是与 |
 | `/每日光尘` | `/光尘商店` `/光尘` `/eververse` | 当日光尘商店商品 |
+| `/老九` | `/仄` `/xur` | 仄（Xûr）每周商品 · 周六凌晨 1 点到高塔，未到也显示预上架 |
 | `/轮换` | `/本周轮换` `/突袭轮换` `/raid轮换` | 本周轮换突袭 + 推算的另三个 |
 | `/掉落 副本名` | `/ce掉落` `/ron掉落` `/kf掉落` `/掉落克洛塔` … | Sayalarry 掉落和收集列表图（B站专栏）；已收录：克洛塔末日 / 梦魇根源 / 救赎边缘 / 国王陨落 / 玻璃穹顶 / 深渊机灵 / 守护者尖塔 / 战争废墟 / 晚星之主 / 各活动总览 |
 | `/称号` | `/d2称号` | 称号 / 传承称号分组，x/y 进度 + 镀金标记 |
@@ -292,7 +332,6 @@ lenix-union-1/
 ├── bungie_auth.py          # OAuth + 自签 https 回跳口
 ├── bot*.py                 # QQ 侧：nonebot 运行时 / 图片卡片 / 消息日志
 ├── card_render.py          # Playwright 卡片渲染（按事件循环各持一个浏览器）
-├── dim_*.py                # DIM 板块：数据层 / 路由 / 主题与公共 JS / 标签 / 配装器
 ├── weapon_filter.py        # /武器筛选 词库与匹配
 ├── napcat_runtime.py       # 内置 NapCat 的启动与扫码登录桥接
 ├── build_*.py              # 索引构建脚本（Manifest → manifest_index/*.json）
@@ -334,7 +373,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1
 
 | 改了什么 | 要做什么 |
 | :--- | :--- |
-| `webui.py` / `destiny_data.py` / `dim_*.py` / `D2Query.spec` | **重新打包** `build_exe.bat` + `deploy_exe.ps1` |
+| `webui.py` / `destiny_data.py` / `D2Query.spec` | **重新打包** `build_exe.bat` + `deploy_exe.ps1` |
 | `nonebot_plugins/destiny2.py` / `card_render.py` / `bot_cards.py` / `weapon_filter.py` | 外置加载，**复制到 exe 同目录**重启即可（不用重打包） |
 | 新增 `manifest_index/*.json` | spec 用 glob 自动收集，但 exe 已生成的话需重打包才会进 `_internal` |
 | 网页样式 / 卡片排版 | 重新打包（`webui.py` 内嵌） |
@@ -356,18 +395,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1
 </details>
 
 <details>
-<summary><b>DIM 页面报 <code>No such file or directory: manifest_index\stats.json</code></b></summary>
+<summary><b>武器详情报 <code>No such file or directory: manifest_index\stats.json</code></b></summary>
 
 exe 里少了索引文件。`D2Query.spec` 已改成 glob 自动收集，重跑 `build_exe.bat` 即可；
 临时救急可以把缺的 json 直接补进 `_internal\manifest_index\`。
-
-</details>
-
-<details>
-<summary><b>搬运 / 装备物品后数据没变</b></summary>
-
-Bungie 档案接口是**快照式**的，写完立刻回读拿到的是旧数据，最久约 40 秒才对上。
-前端是「先在本地挪过去立即重绘，再隔 4s / 16s 各对账一次」，属于预期行为。
 
 </details>
 
@@ -390,8 +421,7 @@ Bungie 档案接口是**快照式**的，写完立刻回读拿到的是旧数据
 
 ## 说明
 
-- 本项目为**单账号自用**工具，DIM 板块的标签 / 自建配装存在本地 `dim_user.json`。
-  Bungie **没有开放标签接口**（`SetTag` 404），官方 DIM 也是本地存，故这里一致。
+- 本项目为**单账号自用**工具，请勿把绑定的他人账号用于高压查询。
 - `.env`、`bungie_token.json`、`user_bindings.json`、各类缓存均已在 `.gitignore` 中排除，**不要提交**。
 - 详细的功能演进记录与「实测踩出来的」实现约束见 **[CHANGELOG.md](CHANGELOG.md)** —— 改代码前建议先读。
 

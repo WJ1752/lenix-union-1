@@ -1,14 +1,22 @@
 """构建模式索引 manifest_index/modes.json（来自 DestinyActivityModeDefinition）
 
-modeType → {name, cat, parents[], order, agg}
+modeType → {name, cat, parents[], order, agg, key}
 用途：把对局 activityDetails.modes 翻译成「试炼 / 铁旗占领模式 / 打击 / 地牢」这类可读模式。
 cat: 0=无 1=PvE 2=PvP 3=PvP竞技合作(智谋)；agg=True 表示聚合类模式(如「熔炉竞技场」)。
+key: Bungie 历史统计接口返回的模式键名（friendlyName 归一化），见 destiny_data.CAREER 用它与
+     GetHistoricalStats 的返回体对上号；聚合模式的键名与 friendlyName 不一致，另有兜底表。
 
 单独重建：python build_modes.py
 （build_manifest.py 建全量索引时也会调用 build_modes()）
 """
 import json
 import os
+import re
+
+
+def norm_key(s: str) -> str:
+    """friendlyName → 历史统计返回的键名（去掉非字母数字并小写）"""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
 def build_modes(client, base: str, paths: dict, out_dir: str = "manifest_index") -> dict:
@@ -26,6 +34,7 @@ def build_modes(client, base: str, paths: dict, out_dir: str = "manifest_index")
             "parents": [h2mt[x] for x in (d.get("parentHashes") or []) if x in h2mt],
             "order": d.get("order", 0),
             "agg": bool(d.get("isAggregateMode")),
+            "key": norm_key(d.get("friendlyName")),
         }
     json.dump(out, open(os.path.join(out_dir, "modes.json"), "w", encoding="utf-8"),
               ensure_ascii=False)

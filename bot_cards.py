@@ -34,8 +34,24 @@ h3{margin:0 0 8px;font-size:12px;color:#6d737b;font-weight:700;letter-spacing:1.
 .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 .grid.two{grid-template-columns:1fr 1fr}
 section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:10px 12px 12px}
-.char{display:flex;align-items:center;gap:12px;background-size:cover;border-radius:12px;border:1px solid #2a2e33;padding:10px 14px;margin:8px 0;background-color:#1b1e22}
-.char img{height:44px;border-radius:4px}
+/* 徽章底图固定 474×96 的长横条：盒子 aspect-ratio 与图同比例，底图 100% 100% 铺满，
+   → 横向不裁切、纵向不拉伸，整条名片完整可见（换成 cover 只会露出中间一条）。 */
+.strip{position:relative;overflow:hidden;border-radius:12px;border:1px solid #2a2e33;
+       aspect-ratio:474/96;background-color:#1b1e22;
+       background-size:100% 100%;background-position:center;background-repeat:no-repeat}
+.strip .veil{position:absolute;inset:0;
+             background:linear-gradient(90deg,rgba(10,12,14,.9) 0%,rgba(10,12,14,.5) 46%,rgba(10,12,14,.72) 100%)}
+.strip>*{position:relative;z-index:1}
+.char{display:flex;align-items:center;gap:12px;padding:12px 16px;margin:8px 0}
+.char img{height:44px;border-radius:4px;box-shadow:0 1px 6px rgba(0,0,0,.6)}
+/* /生涯 顶部玩家名牌：名牌叠在完整名片上，左侧暗色渐变保证文字可读 */
+.namebar{display:flex;align-items:center;gap:16px;padding:0 22px;margin:0 0 6px}
+.namebar .nem{height:64px;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.7)}
+.namebar .ninfo{min-width:0}
+.namebar .nname{font-size:34px;font-weight:700;color:#fff;line-height:1.15;
+                text-shadow:0 2px 12px rgba(0,0,0,.9)}
+.namebar .nsub{font-size:13px;color:#d3d7da;margin-top:6px;text-shadow:0 1px 6px rgba(0,0,0,.95)}
+.namebar .nsub b{color:#d4b26a}
 .ci{display:flex;flex-direction:column;line-height:1.5;font-size:14px;background:rgba(15,17,19,.72);
     padding:4px 10px;border-radius:6px}
 .ci .dim{color:#9aa0a6;font-size:12px}
@@ -129,6 +145,40 @@ section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:1
        display:flex;align-items:center;justify-content:center;border:1px solid #2a2e33;overflow:hidden}
 .evico img{width:88px;height:88px;object-fit:contain}
 .evico .noi{color:#9aa0a6;font-size:12px;font-style:normal;text-align:center;padding:0 6px}
+.evperks{display:flex;gap:4px;margin-top:5px}.evperks img{width:26px;height:26px;border-radius:4px;background:#22262b;border:1px solid #2a2e33}
+/* 老九（参照小日向商人页风格：藏青渐变底 + 橙色分节条 + 稀有度框 + 币上数下价格） */
+.xurwrap{background:linear-gradient(135deg,#1b222b 0%,#242c37 55%,#1a1f27 100%);border:1px solid #2c3540;border-radius:12px;padding:2px 14px 12px;margin-top:12px}
+.xusec{display:flex;align-items:center;gap:10px;margin:20px 2px 10px}
+.xusec::before{content:'';width:4px;height:16px;background:#e08a3c;border-radius:2px;flex-shrink:0}
+.xusec b{font-size:17px;color:#f2f4f7}
+.xusec .cnt{color:#8b93a0;font-size:12px}
+.xugrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.xugrid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.xucard{display:flex;align-items:center;gap:12px;background:linear-gradient(180deg,#242b35,#1d232c);border:1px solid #2c3540;border-radius:10px;padding:10px 12px 10px 10px}
+.xuico{width:84px;height:84px;border-radius:8px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:#171b21;border:1px solid #323a45}
+.xuico img{width:76px;height:76px;object-fit:contain}
+.xuico.t5{background:linear-gradient(160deg,#4a3b16,#2a2110);border-color:#a9842f}
+.xuico.t6{background:linear-gradient(160deg,#332a44,#211a2c);border-color:#7d68ab}
+.xuico.t4{background:linear-gradient(160deg,#183349,#0e1e2b);border-color:#2f6a9e}
+.xumeta{flex:1;min-width:0}
+.xurar{font-size:11px;font-weight:700}
+.xurar.t5{color:#d9a83c}.xurar.t6{color:#a98fd4}.xurar.t4{color:#5f9fd6}.xurar.t1{color:#9aa3ae}
+.xuname{font-weight:700;font-size:15px;color:#f2f4f7;margin-top:2px}
+.xusub{display:flex;align-items:center;gap:6px;margin-top:6px;color:#9aa3ae;font-size:12px;min-width:0}
+.xusub img{width:18px;height:18px;border-radius:3px;background:#171b21;flex-shrink:0}
+.xuprice{display:flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0;min-width:44px}
+.xuprice img{width:20px;height:20px}
+.xuprice b{color:#d4b26a;font-size:17px}
+.xuprice .no{color:#5a616b;font-size:15px}
+.xubig{position:relative;border:1px solid #a9842f;border-radius:12px;overflow:hidden;background:#171b21;margin-bottom:10px}
+.xubig .bg{position:absolute;inset:0;background-size:cover;background-position:center top;opacity:.5}
+.xubig .scrim{position:absolute;inset:0;background:linear-gradient(90deg,rgba(10,12,16,.94) 0%,rgba(10,12,16,.6) 48%,rgba(10,12,16,.2) 100%)}
+.xubig .inner{position:relative;padding:12px 14px}
+.xubig .xuname{font-size:19px}
+.xuperks{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.xuperk{display:flex;align-items:center;gap:6px;background:rgba(20,24,30,.88);border:1px solid #3a4350;border-radius:6px;padding:4px 9px 4px 5px;font-size:12px;color:#dfe3e8}
+.xuperk img{width:22px;height:22px;border-radius:4px;background:#171b21}
+.xuhint{color:#8b93a0;font-size:12px;margin:12px 2px 0}
 .evico.t5{background:linear-gradient(160deg,#4a3b16,#2a2110);border-color:#a9842f}
 .evico.t6{background:linear-gradient(160deg,#332a44,#211a2c);border-color:#7d68ab}
 .evico.t4{background:linear-gradient(160deg,#183349,#0e1e2b);border-color:#2f6a9e}
@@ -346,6 +396,80 @@ body.pgw .enh{color:#d4b26a;background:rgba(212,178,106,.16)}
 .rd-cell.on{border-color:#35c66b;background:rgba(53,198,107,.09)}
 .rd-cell.on span{color:#9ad4ae}
 .rd-cell.on b{color:#35c66b}
+/* ---- 扭曲板块改版：左时间表（当前+7格未来一轮）/ 右掉落面板（武器+套装） ---- */
+.rd2{display:grid;grid-template-columns:minmax(0,19fr) minmax(0,21fr);gap:10px;align-items:stretch}
+.rd2-l{display:flex;flex-direction:column;gap:9px;min-width:0}
+.rd2-r{background:#1b1e22;border:1px solid #2a2e33;border-radius:10px;padding:10px 12px;min-width:0}
+.rd2-h{display:flex;align-items:baseline;gap:7px;font-size:12px;color:#9ad4ae;letter-spacing:1px}
+.rd2-h b{font-size:15px;color:#35c66b;letter-spacing:0}
+.rd2-h span{margin-left:auto;font-size:10.5px;color:#6d737b;letter-spacing:0}
+.rd2-weps{display:grid;grid-template-columns:1fr 1fr;gap:5px 8px;margin-top:8px}
+.rd2-w{display:flex;align-items:center;gap:7px;min-width:0;background:#16181b;
+       border:1px solid #26292e;border-radius:8px;padding:4px 7px}
+.rd2-w img{width:26px;height:26px;flex:0 0 26px;border-radius:5px;border:1px solid #2a2e33;background:#0b0d0f}
+.rd2-w div{min-width:0}
+.rd2-w .wn{display:block;font-size:12px;color:#e8e6e3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rd2-w .wt{display:block;font-size:10px;color:#6d737b;margin-top:1px}
+.rd2-set{margin-top:9px;padding-top:8px;border-top:1px dashed #2a2e33;display:flex;
+         align-items:center;gap:6px;font-size:12.5px;color:#d4b26a}
+.rd2-set img{width:18px;height:18px;flex:0 0 18px;border-radius:4px;border:1px solid #2a2e33}
+.rd2-set em{font-style:normal;color:#9aa0a6;font-size:11px;margin-left:auto}
+.rd-cyc{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.rd-cyc .rd-cell{padding:7px 3px;gap:2px}
+.rd-cyc .rd-cell b{font-size:12px}
+.rd-cyc .rd-cell span{font-size:10px}
+.rd-cyc .rd-cell.nx{border-color:rgba(53,198,107,.45)}
+/* ===== /轮换 · 今日遗失区域（rotdist 同款面板：3×3 网格，目的地/勇士护盾/奖励套装） ===== */
+.ls-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:2px}
+.ls-cell{background:#1b1e22;border:1px solid #2a2e33;border-radius:10px;padding:9px 11px;
+         min-width:0;display:flex;flex-direction:column;gap:4px}
+.ls-cell .ls-dest{font-size:11px;color:#6d737b;letter-spacing:.5px}
+.ls-cell b{font-size:14.5px;color:#e8e6e3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls-cell .ls-mod{font-size:11.5px;color:#9aa0a6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ls-cell .ls-mod em{font-style:normal;color:#6d737b}
+.ls-cell .ls-set{font-size:11.5px;color:#d4b26a;display:flex;align-items:center;gap:5px;margin-top:auto;
+                 white-space:nowrap;overflow:hidden}
+.ls-cell .ls-set img{width:18px;height:18px;flex:0 0 18px;border-radius:4px;border:1px solid #2a2e33}
+.ls-cell .ls-set span{overflow:hidden;text-overflow:ellipsis}
+.ls-empty{font-size:12.5px;color:#6d737b;background:#16181b;border:1px dashed #2a2e33;
+          border-radius:10px;padding:10px 14px}
+/* 生涯面板：赛季网格（赛季背景图做底）+ 分职业分模式时长 */
+.sgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
+.scard{position:relative;height:98px;border:1px solid #2a2e33;border-radius:10px;overflow:hidden;
+       background:#1b1e22 center/cover no-repeat}
+.scard .scr{position:absolute;inset:0;background:linear-gradient(180deg,rgba(10,12,14,.34) 0%,rgba(10,12,14,.92) 100%)}
+.scard .stl{position:absolute;top:7px;left:8px;display:flex;align-items:center;gap:5px;max-width:64%;z-index:2}
+.scard .sico{width:22px;height:22px;flex:0 0 22px;border-radius:5px;background:#0b0d0f center/cover no-repeat;
+             border:1px solid rgba(212,178,106,.6);
+             box-shadow:0 1px 5px rgba(0,0,0,.8),inset 0 0 0 1px rgba(0,0,0,.45)}
+.scard .snum{font-size:10.5px;color:#b8bec4;letter-spacing:1px;text-shadow:0 1px 3px #000;
+             background:rgba(10,12,14,.7);border-radius:4px;padding:1px 5px}
+.scard .slv{position:absolute;top:7px;right:9px;font-size:11.5px;font-weight:700;color:#d4b26a;
+            text-shadow:0 1px 4px #000;background:rgba(10,12,14,.55);border-radius:4px;padding:1px 5px;z-index:2}
+.scard .scn{position:absolute;left:10px;right:10px;bottom:8px}
+.scard .sn{font-size:14.5px;font-weight:700;color:#fff;letter-spacing:.3px;
+           text-shadow:0 1px 6px #000,0 0 14px rgba(0,0,0,.75);white-space:nowrap;
+           overflow:hidden;text-overflow:ellipsis}
+.scard .sd{font-size:11px;color:#a6adb4;margin-top:2px;text-shadow:0 1px 4px #000}
+.scard .stm{font-size:11px;font-weight:700;color:#d4b26a;margin-top:1px;text-shadow:0 1px 4px #000}
+.scard.now{border-color:#35c66b;box-shadow:0 0 0 1px rgba(53,198,107,.35) inset}
+.cpane{margin:10px 0;border:1px solid #2a2e33;border-radius:12px;overflow:hidden;background:#16181b}
+.cbanner{position:relative;overflow:hidden;aspect-ratio:474/96;background-color:#1b1e22;
+         background-size:100% 100%;background-position:center;background-repeat:no-repeat;
+         display:flex;align-items:center;gap:14px;padding:0 16px}
+.cbanner .veil{position:absolute;inset:0;
+               background:linear-gradient(90deg,rgba(10,12,14,.92) 0%,rgba(10,12,14,.5) 48%,rgba(10,12,14,.74) 100%)}
+.cbanner>*{position:relative;z-index:1}
+.cbanner img{height:56px;border-radius:4px;box-shadow:0 1px 6px rgba(0,0,0,.6)}
+.cbanner .cb{background:rgba(15,17,19,.78);border-radius:6px;padding:6px 12px;line-height:1.5;font-size:15px}
+.cbanner .cb .dim{font-size:12px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:10px 12px}
+.mchip{display:flex;align-items:center;gap:6px;background:#1b1e22;border:1px solid #2a2e33;
+       border-left:3px solid #35c66b;border-radius:7px;padding:5px 9px;font-size:12px;color:#c5cacd}
+.mchip b{color:#d4b26a;font-size:12.5px}
+.mchip.pvp{border-left-color:#ff8d85}
+.mchip.gmb{border-left-color:#4b8fd4}
+.chips .none{font-size:12.5px;color:#6d737b}
 /* 角落水印：bot 名 + 作者。绝对定位挂在 body 上，full_page 截图时正好落在整张图右下角；
    body 同步留出底部空白，免得压住页脚或最后一行内容。 */
 body,body.pgw{position:relative;padding-bottom:30px}
@@ -460,10 +584,10 @@ def help_card() -> str:
 
     c = lambda s: f"<code>{esc(s)}</code>"
     rows = (
-        cat("玩家", f"{c('/玩家')} {c('/生涯')} {c('/raid')} {c('/地牢')} {c('/pvp')} {c('/pve')} {c('/智谋')}") +
-        cat("记录", f"{c('/历史')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
+        cat("玩家", f"{c('/玩家')} {c('/生涯')} {c('/raid')} {c('/地牢')} {c('/pvp')} {c('/pve')} {c('/智谋')} {c('/队伍')}") +
+        cat("记录", f"{c('/战绩')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
             "pvp 版同理") +
-        cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲查询 护甲名')} {c('/护甲套装')} {c('/每日光尘')} {c('/轮换')}") +
+        cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲查询 护甲名')} {c('/护甲套装')} {c('/每日光尘')} {c('/老九')} {c('/轮换')}") +
         cat("掉落表", f"{c('/掉落 副本名')}", "裸指令也行：/二象性掉落、/ron掉落…，发 /掉落 看列表") +
         cat("武器筛选", f"{c('/武器筛选 关键词…')}", "空格分隔多词，例：/武器筛选 主手 锻造 微冲 900") +
         cat("账号", f"{c('/绑定 玩家名#1234')} {c('/我的')} {c('/解绑')}") +
@@ -484,7 +608,9 @@ def help_card() -> str:
 
 def player_card(data: dict) -> str:
     chars = "".join(
-        f"<div class='char' style=\"background-image:url('{esc(c['emblem_bg'])}')\">"
+        f"<div class='char strip' "
+        f"style=\"background-image:url('{esc(c['emblem_bg'])}')\">"
+        f"<div class='veil'></div>"
         f"<img src='{esc(c['emblem'])}'><div class='ci'>"
         f"<b>{esc(c['class'])} · {esc(c['race'])}</b>"
         f"<span>光能 {c['light']} · {d2.fmt_hours(c['playtime_min'])}</span>"
@@ -507,24 +633,97 @@ def player_card(data: dict) -> str:
 
 # ---------- /生涯 ----------
 
+# 分职业面板里不重复列的「全量聚合」模式：0=所有、7=PvE（职业总时长已经单独写了）
+_CAREER_SKIP_MODES = {0, 7}
+
+
+def _career_chips(modes: dict, limit: int = 15) -> str:
+    """分模式时长小标签；按 PvE（绿）/ PvP（红）/ 智谋（蓝）三种左侧色区分，按时长降序"""
+    rows = [(mt, h) for mt, h in (modes or {}).items()
+            if mt not in _CAREER_SKIP_MODES and h >= 0.1]
+    rows.sort(key=lambda x: -x[1])
+    if not rows:
+        return "<span class='none'>暂无分模式时长</span>"
+    out = ""
+    for mt, h in rows[:limit]:
+        meta = d2.MODES.get(mt) or {}
+        cls = "pvp" if meta.get("cat") == 2 else ("gmb" if meta.get("cat") == 3 else "")
+        name = meta.get("name") or f"模式{mt}"
+        out += f"<span class='mchip {cls}'>{esc(name)}<b>{h:,.1f}h</b></span>"
+    return out
+
+
+def _season_time_txt(h: float) -> str:
+    """赛季时长文案：0 就显示 0；不足 10 小时给 1 位小数，再往上取整"""
+    if not h or h < 0.05:
+        return "0"
+    return f"{h:,.1f}" if h < 10 else f"{h:,.0f}"
+
+
+def _season_bg_style(s: dict) -> str:
+    """赛季卡底图。
+
+    优先级：赛季主视觉 key art（art）→ 官方赛季背景图（bg）→ 赛季号派生的暗色渐变。
+    icon（150×150 赛季徽记）不再当整块底图，改在 career_card 里做左上角角标；
+    因此每一格都至少有一张真图或一层底色，不会出现整块空白。
+    """
+    img = s.get("art") or s.get("bg")
+    if img:
+        return f" style=\"background-image:url('{esc(img)}')\""
+    n = int(s.get("number") or 0)
+    h = (n * 47) % 360
+    grad = (f"radial-gradient(120% 100% at 15% 0%,hsl({h},34%,26%) 0%,"
+            f"hsl({h},28%,15%) 55%,hsl({(h + 30) % 360},24%,9%) 100%)")
+    return f" style=\"background-image:{grad}\""
+
+
 def career_card(data: dict) -> str:
-    tot_k = sum((data[m].get("kills") or 0) for m in ("pvp", "pve", "gambit"))
-    tot_d = sum((data[m].get("deaths") or 0) for m in ("pvp", "pve", "gambit"))
-    tot_e = sum((data[m].get("activitiesEntered") or 0) for m in ("pvp", "pve", "gambit"))
-    tot_kd = (tot_k / tot_d) if tot_d else 0.0
+    cur = d2.current_season()
+    cur_num = int(cur["number"]) if cur else -1
+    scards = "".join(
+        f"<div class='scard{' now' if int(s['number']) == cur_num else ''}'"
+        + _season_bg_style(s) + ">"
+        f"<div class='scr'></div>"
+        + "<div class='stl'>"
+        + (f"<span class='sico' style=\"background-image:url('{esc(s['icon'])}')\"></span>"
+           if s.get("icon") else "")
+        + f"<span class='snum'>#{s['number']}</span></div>"
+        f"<div class='slv'>Lv.{s['rank']}</div>"
+        f"<div class='scn'><div class='sn'>{esc(s['name'])}</div>"
+        f"<div class='sd'>{esc(s['start'])} · {s['days']}天</div>"
+        f"<div class='stm'>⏱ {_season_time_txt(s.get('time_h') or 0)} 小时</div></div></div>"
+        for s in data["seasons"])
+
+    panes = "".join(
+        f"<div class='cpane'><div class='cbanner' "
+        f"style=\"background-image:url('{esc(c['emblem_bg'])}')\">"
+        f"<div class='veil'></div>"
+        f"<img src='{esc(c['emblem'])}'><div class='cb'><b>{esc(c['class'])}</b>"
+        f"<br><span class='dim'>光能 {c['light']} · {c['minutes'] / 60:,.1f} 小时</span>"
+        f"</div></div><div class='chips'>{_career_chips(c['modes'])}</div></div>"
+        for c in data["chars"])
+
+    main = data["chars"][0] if data.get("chars") else {}
     body = (
-        f"<h1>{esc(data['display'])}</h1><div class='sub'>生涯统计 · Bungie 官方 allTime</div>"
+        f"<div class='namebar strip' "
+        f"style=\"background-image:url('{esc(data.get('emblem_bg') or '')}')\">"
+        f"<div class='veil'></div>"
+        + (f"<img class='nem' src='{esc(main['emblem'])}'>" if main.get("emblem") else "")
+        + f"<div class='ninfo'><div class='nname'>{esc(data['display'])}</div>"
+        f"<div class='nsub'>守护者等级 <b>{data['guardian_rank']}</b> 级"
+        f"（历史最高 {data['max_guardian_rank']}）· 最高光能 {data['max_light']}"
+        f" · 生涯总时长 {data['total_playtime'] / 60:,.1f} 小时"
+        + (f" · 上次在线 {esc(data['last_played'])}" if data.get("last_played") else "")
+        + "</div></div></div>"
+        f"<h2>赛季</h2><div class='sgrid'>{scards}</div>"
+        f"<h2>分职业时长</h2>{panes}"
+        f"<h2>三模式生涯</h2>"
         + _stats_grid([("PVP", _mode_items(data["pvp"], True)),
                        ("PVE", _mode_items(data["pve"], False)),
                        ("智谋", _mode_items(data["gambit"], True))])
-        + "<h2>总计</h2>"
-        + f"<div class='row'><span>总击杀</span><b>{tot_k:,.0f}</b></div>"
-        + f"<div class='row'><span>总死亡</span><b>{tot_d:,.0f}</b></div>"
-        + f"<div class='row hl'><span>总 K/D</span><b>{tot_kd:.2f}</b></div>"
-        + f"<div class='row'><span>总场次</span><b>{tot_e:,.0f}</b></div>"
-        + f"<div class='row'><span>总游戏时长</span><b>{d2.fmt_hours(data['total_playtime'])}</b></div>"
-        + "<div class='foot'>数据来自 Bungie.net · 生涯累计为官方聚合接口</div>"
-    )
+        + "<div class='foot'>数据来自 Bungie.net · 赛季等级＝奖励档＋声望档（S27 起通行证改版，"
+          "为统一轨等级）；单赛季时长按官方每日历史统计合计（官方约保留 2 年半，更早赛季为 0）；"
+          "分模式时长为官方历史统计的在场时长</div>")
     return _page(body)
 
 
@@ -536,8 +735,8 @@ def _chips(lst: list[dict], n: int = 8) -> str:
         for p in lst[:n])
 
 
-# 属性条的展示顺序（对齐游戏内/DIM：射速→伤害→射程→稳定性→操控性→填装→弹匣→…）
-# 按游戏内/DIM 面板顺序：射速/充能在前，随后冲击、爆炸范围、弹头速度等武器特有项
+# 属性条的展示顺序（对齐游戏内面板：射速→伤害→射程→稳定性→操控性→填装→弹匣→…）
+# 按游戏内面板顺序：射速/充能在前，随后冲击、爆炸范围、弹头速度等武器特有项
 STAT_ORDER = ["每分钟发射数", "射击速度", "充能时间", "蓄力时间", "蓄能时间", "充能速度",
               "冲击", "爆炸范围", "弹头速度", "射程", "稳定性", "操控性", "填装速度", "弹匣",
               "辅助瞄准", "变焦", "后坐方向", "空中效率", "弹药生成",
@@ -1115,8 +1314,82 @@ _TIER_CLS = {"异域": "t5", "传说": "t6", "稀有": "t4", "基本": "t1"}
 
 # ---------- /轮换（本周突袭 & 地牢 + 扭曲星球） ----------
 
+_DEST_SET = {
+    "欧洲无人区": "wildwood", "幽梦之城": "reverie dawn", "王座世界": "veritas",
+    "月球": "dreambane", "木卫二": "crystocrene", "涅索斯": "exodus down",
+    "发射基地": "seventh seraph",
+}
+_DIST_LOOT = None
+
+
+def _dist_loot() -> dict:
+    """扭曲目的地武器池+套装名（manifest_index/distortion_loot.json，静态数据，缺了走旧版板块）"""
+    global _DIST_LOOT
+    if _DIST_LOOT is None:
+        try:
+            _DIST_LOOT = json.load(open(d2._idx_file("distortion_loot.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _DIST_LOOT = {}
+    return _DIST_LOOT
+
+
 def _dist_block(dist: dict) -> str:
-    """扭曲星球板块：当前时段高亮（w2-cell.on 同款绿），今日剩余时段 + 下一个目的地/倒计时。"""
+    """扭曲星球板块改版：左=当前时段+7格「未来一轮」压缩表，右=本时段武器掉落+护甲套装。"""
+    if not (dist or {}).get("ok"):
+        return ""
+    loot = _dist_loot()
+    weps = [w for w in (loot.get("pools") or {}).get(dist["dest"]) or []
+            if w.get("zh") and w.get("icon")]
+    mins, secs = divmod(dist["next_in_sec"], 60)
+    left = f"{mins // 60} 时 {mins % 60:02d} 分" if mins >= 60 else f"{mins} 分 {secs:02d} 秒"
+    cells = ""
+    if weps:
+        try:
+            dd = d2._distortion()
+            cyc, slots = dd.get("cycle") or [], dd.get("slots") or []
+            st = dist["start"]
+            cur = slots[st.weekday()][st.hour]
+            for off in range(7):
+                cls = "rd-cell on" if off == 0 else ("rd-cell nx" if off == 1 else "rd-cell")
+                sub = f"现在 · 剩{dist['next_in_sec'] // 60}分" if off == 0 else f"+{off} 小时"
+                cells += (f"<div class='{cls}'><span>{sub}</span>"
+                          f"<b>{esc(cyc[(cur + off) % len(cyc)])}</b></div>")
+        except Exception:  # noqa: BLE001
+            return _dist_block_basic(dist)
+    if not cells or not weps:
+        return _dist_block_basic(dist)
+    setrec = (loot.get("sets") or {}).get(_DEST_SET.get(dist["dest"], "")) or {}
+    sic = f"<img src='{esc(setrec['icon'])}'>" if setrec.get("icon") else ""
+    rows = "".join(
+        f"<div class='rd2-w'><img src='{esc(w['icon'])}'>"
+        f"<div><span class='wn'>{esc(w['zh'])}</span>"
+        f"<span class='wt'>{esc(w.get('type') or '')}</span></div></div>"
+        for w in weps)
+    return ("<div class='evhead'>扭曲星球轮换<span>每小时换目的地 · 7 小时一轮 · 本机时间</span></div>"
+            "<div class='rotdist'><div class='rd2'>"
+            "<div class='rd2-l'>"
+            "<div class='rd-now'>"
+            f"<div><span class='rd-k'>当前时段 · {esc(dist['range'])}</span>"
+            f"<b class='rd-dest'>{esc(dist['dest'])}</b></div>"
+            "<div class='rd-next'>下一个"
+            f"<b> {esc(dist['next_dest'])}</b>"
+            f"<span>{esc(dist['next_hm'])} 切换 · 还剩 {left}</span></div>"
+            "</div>"
+            f"<div class='rd-cyc'>{cells}</div>"
+            "</div>"
+            "<div class='rd2-r'>"
+            f"<div class='rd2-h'>本时段掉落<b>{esc(dist['dest'])}</b>"
+            "<span>整点随目的地切换</span></div>"
+            f"<div class='rd2-weps'>{rows}</div>"
+            f"<div class='rd2-set'>{sic}"
+            f"<span>奖励 · {esc(setrec.get('zh') or '')} 套装</span>"
+            f"<em>{len(weps)} 武器 · 1 护甲</em></div>"
+            "</div>"
+            "</div></div>")
+
+
+def _dist_block_basic(dist: dict) -> str:
+    """旧版扭曲板块：当前时段高亮（w2-cell.on 同款绿），今日剩余时段 + 下一个目的地/倒计时。"""
     if not (dist or {}).get("ok"):
         return ""
     mins, secs = divmod(dist["next_in_sec"], 60)
@@ -1138,16 +1411,72 @@ def _dist_block(dist: dict) -> str:
             "</div>")
 
 
-def rotation_card(rot: dict, dist: dict | None = None) -> str:
-    """本周轮换卡片：突袭①② / 地牢①②（pgcr 横图）+ 扭曲星球实时时段板块。"""
+def _gm_block(gm: dict) -> str:
+    """当前宗师板块：横图大卡（pgcr 图 + 中文名 + 目的地），取不到时出一行缺省提示。"""
+    if not gm:
+        return ""
+    if not gm.get("ok"):
+        return "<div class='evhead'>当前宗师<span>每周三凌晨 1 点换</span></div>" \
+               "<div class='ls-empty'>本次没抓到宗师数据，稍后再试。</div>"
+    shot = gm.get("pgcr") or ""
+    if not shot and gm.get("hash"):
+        rec = d2.activity_name(gm["hash"])
+        shot = rec.get("pgcr") or ""
+    style = (f" style=\"background-image:url('{esc(shot)}')\""
+             if shot and "missing_icon" not in shot else "")
+    sub = " · ".join(x for x in (gm.get("dest_zh") or "", "先锋警戒") if x)
+    return ("<div class='evhead'>当前宗师<span>宗师征服 · 每周三凌晨 1 点换</span></div>"
+            "<div class='evhero one'>"
+            "<div class='evbig'" + style + ">"
+            "<div class='scrim'></div>"
+            "<span class='evtier'>宗师</span>"
+            "<div class='evbigg'><div class='who'>"
+            f"<b>{esc(gm.get('zh') or gm.get('en') or '？')}</b>"
+            f"<span class='ty'>{esc(sub)}</span></div></div></div></div>")
+
+
+def _ls_block(ls: dict) -> str:
+    """今日遗失区域板块：9 个目的地各 1 个，3×3 网格（rotdist 同款风格）。"""
+    if not ls:
+        return ""
+    if not ls.get("ok") or not (ls.get("sectors") or []):
+        return "<div class='evhead'>今日遗失区域<span>每天凌晨 1 点换</span></div>" \
+               "<div class='ls-empty'>本次没抓到遗失区域数据，稍后再试。</div>"
+    cells = ""
+    for s in ls["sectors"]:
+        mod = ""
+        if s.get("champs"):
+            mod += f"<em>勇士</em> {'·'.join(s['champs'])}"
+        if s.get("shields"):
+            mod += (" ｜ " if mod else "") + f"<em>护盾</em> {'·'.join(s['shields'])}"
+        reward = s.get("set_zh") or s.get("set_en") or ""
+        ico = (f"<img src='{esc(s['set_icon'])}'>" if s.get("set_icon") else "")
+        cells += ("<div class='ls-cell'>"
+                  f"<span class='ls-dest'>{esc(s['dest_zh'])}</span>"
+                  f"<b>{esc(s['zh'])}</b>"
+                  + (f"<span class='ls-mod'>{mod}</span>" if mod else "")
+                  + (f"<span class='ls-set'>{ico}<span>奖励 · {esc(reward)}</span></span>"
+                     if reward else "")
+                  + "</div>")
+    return ("<div class='evhead'>今日遗失区域"
+            "<span>9 个目的地各 1 个 · 每天凌晨 1 点换</span></div>"
+            f"<div class='ls-grid'>{cells}</div>")
+
+
+def rotation_card(rot: dict, dist: dict | None = None,
+                  ls: dict | None = None, gm: dict | None = None) -> str:
+    """本周轮换卡片：突袭①② / 地牢①②（pgcr 横图）+ 当前宗师 + 今日遗失区域 + 扭曲星球实时时段板块。"""
     raids = rot.get("raids") or []
     dungeons = rot.get("dungeons") or []
     dist_block = _dist_block(dist or {})
-    if not raids and not dungeons and not dist_block:
+    gm_block = _gm_block(gm or {})
+    ls_block = _ls_block(ls or {})
+    if not raids and not dungeons and not dist_block and not gm_block and not ls_block:
         return notice("暂时拿不到本周轮换",
                       ["Bungie 里程碑接口没有返回可识别的突袭/地牢，稍后再试。"], kind="warn")
-    body = ("<h1>本周轮换 · 突袭 &amp; 地牢</h1>"
-            f"<div class='sub'>{esc(rot.get('label') or '本周')} · 每周三凌晨 1 点刷新</div>")
+    body = ("<h1>本周轮换</h1>"
+            f"<div class='sub'>{esc(rot.get('label') or '本周')} · "
+            "突袭 / 地牢 / 宗师每周三凌晨 1 点刷新 · 遗失区域每天凌晨 1 点</div>")
     for title, names, tag in (("突袭", raids, "突袭"), ("地牢", dungeons, "地牢")):
         if not names:
             continue
@@ -1164,9 +1493,13 @@ def rotation_card(rot: dict, dist: dict | None = None) -> str:
                       "<div class='evbigg'><div class='who'>"
                       f"<b>{esc(nm)}</b></div></div></div>")
         body += f"<div class='evhero'>{cards}</div>"
+    body += gm_block
+    body += ls_block
     body += dist_block
     body += ("<div class='foot'>数据来自 Bungie.net / Starside"
              + ("" if rot.get("matched") else " · 配对表没对上，只列出了官方周常突袭")
+             + (" · 宗师 lfcarry / 遗失区域 d2lostsector.report"
+                if gm_block or ls_block else "")
              + "</div>")
     return _page(body)
 
@@ -1227,6 +1560,176 @@ def eververse_card(store: dict) -> str:
             body += f"<div class='evgrid'>{cards}</div>"
     body += (f"<div class='foot'>共 {total} 件 · 当前上架（Bungie 商店接口，需账号授权）"
              " · 数字单位：光尘</div>")
+    return _page(body)
+
+
+# ---------- /老九（仄 / Xûr 每周商品） ----------
+
+_XUR_ORDER = ("异域护甲", "职业金", "异域武器", "异域武器催化", "传说武器",
+              "传说护甲", "材料", "任务", "其他")
+_XUR_CLS_ORDER = ("泰坦", "猎人", "术士")
+
+
+def _xur_head(title: str, n: int) -> str:
+    return (f"<div class='xusec'><b>{esc(title)}</b>"
+            f"<span class='cnt'>{n} 件</span></div>")
+
+
+def _xur_sub(it: dict) -> str:
+    cls, ty = it.get("cls") or "", it["ty"]
+    return f"{cls} · {ty}" if cls and cls != "通用" and not ty.startswith(cls) else ty
+
+
+def _xur_price(it: dict) -> str:
+    cost = it.get("cost")
+    if not cost:
+        return "<div class='xuprice'><span class='no'>—</span></div>"
+    cico = f"<img src='{esc(cost['icon'])}'>" if cost.get("icon") else ""
+    return f"<div class='xuprice'>{cico}<b>{cost['n']:,}</b></div>"
+
+
+def _xur_perk_chip(perk: dict) -> str:
+    """perkHash → 图标+中文名芯片（perks.json 里没有的丢弃；mock 可自带 name/icon）。"""
+    mname, micon = d2.perk_meta(perk.get("h"))
+    name = perk.get("name") or mname
+    ic = perk.get("icon") or micon
+    if not name and not ic:
+        return ""
+    chip = f"<img src='{esc(ic)}'>" if ic else ""
+    return f"<span class='xuperk'>{chip}{esc(name)}</span>" if name else \
+           f"<span class='xuperk'>{chip}</span>"
+
+
+def _xur_chips(it: dict, all_plugs: bool = False) -> str:
+    """只有武器出 perk 芯片（金装不出）。传说武器=特性槽末两个（游戏 3/4 号位，
+    击杀记录器类已在数据层滤掉）；固定卷异域=它的固有特性（如蒙特卡洛法则）；
+    大卡（all_plugs）=隼月整卷：固有特性 + 全部特性槽。"""
+    if it.get("sec") not in ("异域武器", "传说武器"):
+        return ""
+    plugs = it.get("plugs") or []
+    if all_plugs:
+        sel = ([it.get("intr")] if it.get("intr") else []) + plugs
+    elif it.get("sec") == "传说武器":
+        sel = plugs[-2:]
+    else:
+        sel = [it["intr"]] if it.get("intr") else plugs[:1]
+    return "".join(x for x in (_xur_perk_chip(p) for p in sel) if x)
+
+
+def _xur_small(it: dict) -> str:
+    tcls = _TIER_CLS.get(it["tier"], "t1")
+    thumb = (f"<img src='{esc(it['icon'])}'>" if it["icon"]
+             else f"<em class='noi'>{esc(_cut(it['ty'] or '商品', 6))}</em>")
+    chips = _xur_chips(it)
+    return ("<div class='xucard'>"
+            f"<span class='xuico {tcls}'>{thumb}</span>"
+            "<div class='xumeta'>"
+            f"<span class='xurar {tcls}'>{esc(it['tier'])}</span>"
+            f"<div class='xuname'>{esc(it['n'])}</div>"
+            f"<div class='xusub'>{chips}<span>{esc(_xur_sub(it))}</span></div>"
+            "</div>" + _xur_price(it) + "</div>")
+
+
+def _xur_big(it: dict) -> str:
+    """带随机卷的异域武器大卡：武器大图当背景 + 本周随机卷 perk 逐个（图标+名）。"""
+    style = (f" style=\"background-image:url('{esc(it['shot'])}')\""
+             if it.get("shot") and "missing_icon" not in it["shot"] else "")
+    chips = _xur_chips(it, all_plugs=True)
+    return ("<div class='xubig'>"
+            f"<div class='bg'{style}></div><div class='scrim'></div>"
+            "<div class='inner'>"
+            "<div style='display:flex;align-items:center;gap:12px'>"
+            "<div style='flex:1;min-width:0'>"
+            f"<span class='xurar {_TIER_CLS.get(it['tier'], 't1')}'>异域 · 本周随机卷</span>"
+            f"<div class='xuname'>{esc(it['n'])}</div>"
+            f"<div class='xusub'><span>{esc(it['ty'])}</span></div>"
+            "</div>" + _xur_price(it) + "</div>"
+            + (f"<div class='xuperks'>{chips}</div>" if chips else "")
+            + "</div></div>")
+
+
+def _xur_grid(its: list) -> str:
+    return f"<div class='xugrid'>{''.join(_xur_small(it) for it in its)}</div>"
+
+
+def xur_card(stock: dict) -> str:
+    """老九（仄/Xûr）每周商品卡（参照小日向商人页风格）。
+
+    异域护甲/传说护甲按 泰坦/猎人/术士 分节（职业臂与职业传说甲是按角色发的，
+    数据层已并三角色）；带随机卷的异域武器（如隼月）单独大卡展示本周 perk；
+    未到场时接口里也有预上架商品，照常展示并标注抵达倒计时。
+    """
+    items = [it for it in (stock.get("items") or [])
+             if it.get("sec") != "异域印痕"]     # 异域记忆水晶不出卡
+    if not items:
+        when = stock.get("arrives_txt") or "每周六凌晨 1:00"
+        return notice("老九还没到高塔",
+                      ["仄每周六凌晨 1 点抵达高塔，周三凌晨 1 点随维护离开。",
+                       f"下次抵达：{esc(when)}（北京时间）。",
+                       "他到岗后发 /老九 就能看本周货单。"], kind="warn")
+    present = stock.get("present")
+    body = ("<h1>老九 · 仄（Xûr）</h1>"
+            "<div class='sub'>高塔 · "
+            + ("本周在售" if present else "还没到，以下是已预上架的货")
+            + " · 每周六凌晨 1 点抵达 · 周三凌晨 1 点离开</div>")
+    body += "<div class='xurwrap'>"
+    if not present:
+        inm = stock.get("in_min") or 0
+        left = f"{inm // 60} 小时 {inm % 60:02d} 分" if inm >= 60 else f"{inm} 分钟"
+        body += ("<div class='ls-empty'>还没到高塔 —— 距下次抵达"
+                 f"（{esc(stock.get('arrives_txt') or '周六 01:00')}）约 <b>{esc(left)}</b>，"
+                 "到岗即可购买。</div>")
+    secs = {}
+    for it in items:
+        secs.setdefault(it.get("sec") or "其他", []).append(it)
+    has_gear = any(sec in ("异域武器", "异域武器催化", "传说武器", "传说护甲")
+                   for sec in secs)
+    for sec in _XUR_ORDER:
+        its = secs.pop(sec, None)
+        if not its:
+            continue
+        if sec == "职业金":
+            # 泰坦印记/猎人披风/术士猎环单独一横列
+            body += _xur_head(sec, len(its))
+            body += f"<div class='xugrid3'>{''.join(_xur_small(it) for it in its)}</div>"
+            continue
+        if sec in ("异域护甲", "传说护甲"):
+            # 护甲按职业再分节（异域护甲的节名直接用职业名，对齐参照稿）
+            bycls = {}
+            for it in its:
+                bycls.setdefault(it.get("cls") or "通用", []).append(it)
+            for c in _XUR_CLS_ORDER + ("通用",):
+                sub = bycls.pop(c, None)
+                if not sub:
+                    continue
+                body += _xur_head(c if sec == "异域护甲" else f"{sec} · {c}", len(sub))
+                body += _xur_grid(sub)
+            for c, sub in bycls.items():
+                body += _xur_head(c, len(sub))
+                body += _xur_grid(sub)
+            continue
+        body += _xur_head(sec, len(its))
+        if sec == "异域武器":
+            # 定义里特性槽带 randomizedPlugSetHash = 带随机卷的那把（如隼月）→ 大卡整卷
+            rolled = [it for it in its if it.get("rolled")]
+            plain = [it for it in its if not it.get("rolled")]
+            for it in rolled:
+                body += _xur_big(it)
+            if plain:
+                body += _xur_grid(plain)
+        else:
+            body += _xur_grid(its)
+    for sec, its in secs.items():      # 兜底：未知分节照常出
+        body += _xur_head(sec, len(its))
+        body += _xur_grid(its)
+    if present and not has_gear:
+        body += ("<div class='xuhint'>异域武器 / 催化 / 传说装备栏需要账号在游戏内解锁"
+                 "（购买「更多奇异优惠 / 奇异装备优惠」或异域等级达标）才会出现在接口里。</div>")
+    body += "</div>"
+    body += ("<div class='foot'>共 "
+             f"{len(items)} 件 · Bungie 商店接口（需账号授权）"
+             + ("" if present else " · 未到场只显示已预上架部分")
+             + " · 到场后可购买</div>")
     return _page(body)
 
 
@@ -1366,3 +1869,160 @@ def _armor_list_card(q: str, items: list[dict]) -> str:
             "<div class='w2-foot'><span>雷尼克斯联合 · 异域护甲图谱</span>"
             "<span>数据来自 Bungie Manifest</span></div>")
     return _page_weapon(body)
+
+
+# ---------- /队伍：当前活动队友简报 ----------
+
+_FT_COLORS = {4: "#35c66b", 82: "#9b6bd4", 5: "#ff8d85", 63: "#4b8fd4", 7: "#c5cacd"}
+_FT_CLS = {4: "rd", 82: "dg", 5: "pvp", 63: "gmb", 7: ""}
+
+_FT_CSS = (".ft-head{border:1px solid #2a2e33;border-radius:12px;padding:18px 20px 14px;"
+           "background:linear-gradient(115deg,#1b1e22 0%,#141619 52%,#0f1113 100%);margin-bottom:4px}"
+           ".ft-t{font-size:30px;font-weight:700;color:#fff}"
+           ".ft-tag{font-size:13px;color:#d4b26a;border:1px solid #d4b26a;border-radius:6px;"
+           "padding:2px 8px;margin-left:10px;vertical-align:4px;font-weight:400}"
+           ".ft-tag.live{color:#e0a24a;border-color:#e0a24a}"
+           ".ft-sub{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;"
+           "margin-top:10px;font-size:13.5px;color:#9aa0a6}"
+           ".ft-sub b{color:#e8e6e3;font-size:15px}"
+           ".ft-q{margin-left:auto;color:#6d737b}"
+           ".ft-badge{border:1px solid #2a2e33;border-left-width:3px;border-radius:6px;"
+           "padding:2px 9px;font-size:12.5px;color:#c5cacd;background:#16181b}"
+           ".ft-mem{display:flex;align-items:center;gap:14px;background:#1b1e22;"
+           "border:1px solid #2a2e33;border-left:3px solid #35c66b;border-radius:10px;"
+           "padding:10px 16px;margin:7px 0}"
+           ".ft-mem img,.ft-mem .ft-noe{width:46px;height:46px;border-radius:4px;flex-shrink:0;"
+           "object-fit:cover;display:block}"
+           ".ft-mem .ft-noe{background:#16181b;border:1px solid #2a2e33}"
+           ".ft-mem.rd{border-left-color:#35c66b}.ft-mem.dg{border-left-color:#9b6bd4}"
+           ".ft-mem.pvp{border-left-color:#ff8d85}.ft-mem.gmb{border-left-color:#4b8fd4}"
+           ".ft-who{width:232px;min-width:0;flex-shrink:0}"
+           ".ft-who .nm{font-size:16px;font-weight:700;color:#fff;white-space:nowrap;"
+           "overflow:hidden;text-overflow:ellipsis}"
+           ".ft-who .nm i{font-style:normal;font-size:11px;color:#0f1113;background:#d4b26a;"
+           "border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:2px}"
+           ".ft-who .mt{font-size:12px;color:#9aa0a6;margin-top:3px}"
+           ".ft-chips{display:flex;flex-wrap:wrap;gap:4px 16px;margin-left:auto;"
+           "justify-content:flex-end;flex:1}"
+           ".ft-chip{text-align:right;min-width:52px}"
+           ".ft-chip span{display:block;font-size:11px;color:#6d737b}"
+           ".ft-chip b{font-size:15px;color:#d4b26a;font-weight:700}"
+           ".ft-none{font-size:12px;color:#6d737b;align-self:center}"
+           ".ft-mem.ft-raid{display:block;padding:12px 16px}"
+           ".ft-mrow{display:flex;align-items:center;gap:14px}"
+           ".ft-tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:10px}"
+           ".ft-tile{display:flex;align-items:center;gap:9px;background:#141619;"
+           "border:1px solid #262a2f;border-radius:8px;padding:6px 10px;min-width:0}"
+           ".ft-tile img{width:26px;height:26px;border-radius:4px;flex-shrink:0}"
+           ".ft-tile .ft-tx{min-width:0}"
+           ".ft-tile b{display:block;font-size:17px;color:#e8e6e3;line-height:1.2}"
+           ".ft-tile span{display:block;font-size:12px;color:#c5cacd;white-space:nowrap;"
+           "overflow:hidden;text-overflow:ellipsis}"
+           ".ft-tile i{display:block;font-style:normal;font-size:10.5px;color:#6d737b}"
+           ".ft-group{font-size:13px;font-weight:700;color:#9aa0a6;margin:10px 0 1px;"
+           "padding-left:2px}")
+
+
+def _ft_tile(t: dict) -> str:
+    """突袭指标砖：图标 + 大数字 + 名称 + 来源（职业生涯//突袭）"""
+    ic = f"<img src='{esc(t.get('icon'))}'>" if t.get("icon") else ""
+    return (f"<div class='ft-tile'>{ic}"
+            f"<div class='ft-tx'><b>{esc(str(t.get('value') or '—'))}</b>"
+            f"<span>{esc(t.get('label') or '')}</span>"
+            f"<i>{esc(t.get('source') or '')}</i></div></div>")
+
+
+def _ft_row(m: dict, bucket: int) -> str:
+    """roster 单行：普通模式=徽标+名字+数据 chips；突袭=名字条+「完成数/导师」指标砖网格"""
+    em = m.get("emblem") or ""
+    em_html = f"<img src='{esc(em)}'>" if em else "<i class='ft-noe'></i>"
+    tag = "<i>查询</i>" if m.get("is_self") else ""
+    light = f" · 光能 {m.get('light')}" if m.get("light") else ""
+    who = (f"<div class='ft-who'><div class='nm'>{esc(m.get('name') or '')}{tag}</div>"
+           f"<div class='mt'>{esc(m.get('class') or '')}{light}</div></div>")
+    cls = _FT_CLS.get(bucket, "")
+    if m.get("is_self"):
+        cls += " self"
+    if m.get("tiles"):
+        tiles = "".join(_ft_tile(t) for t in m["tiles"])
+        return (f"<div class='ft-mem ft-raid {cls}'>"
+                f"<div class='ft-mrow'>{em_html}{who}</div>"
+                f"<div class='ft-tiles'>{tiles}</div></div>")
+    chips = "".join(f"<div class='ft-chip'><span>{esc(k)}</span><b>{esc(v)}</b></div>"
+                    for k, v in (m.get("rows") or []))
+    chips = chips or "<div class='ft-none'>暂无该模式数据</div>"
+    return (f"<div class='ft-mem {cls}'>{em_html}{who}"
+            f"<div class='ft-chips'>{chips}</div></div>")
+
+
+def fireteam_card(data: dict) -> str:
+    """「/队伍」：当前在打什么 + 队内（可见）成员在该模式的生涯数据
+
+    成员名单来自官方 Transitory 组件（隐私设置会隐藏成员，脚注已注明）。
+    专属样式全部内联在本函数（_FT_CSS），不占用通用 CSS。"""
+    bucket = int(data.get("bucket") or 7)
+    color = _FT_COLORS.get(bucket, "#c5cacd")
+    state = data.get("state") or ("live" if data.get("live") else
+                                  "ended" if data.get("in_activity") else "party")
+    tag = {"live": "<span class='ft-tag live'>进行中</span>",
+           "pending": "<span class='ft-tag live'>进行中</span>",
+           "ended": "<span class='ft-tag'>已结束</span>",
+           "orbit": "<span class='ft-tag'>在轨道</span>",
+           "offline": "<span class='ft-tag'>不在线</span>"}.get(
+               state, "<span class='ft-tag'>组队中</span>")
+    parts = [f"<span class='ft-badge' style='border-left-color:{color};color:{color}'>"
+             f"{esc(data.get('mode_name') or '其他')}</span>"]
+    if state in ("live", "ended"):
+        parts.append(f"<b>{esc(data.get('activity') or '')}</b>")
+        parts.append(f"<span>开始 {esc(data.get('started_text') or '')}（UTC+8）</span>")
+        dur = int(data.get("duration_min") or 0)
+        parts.append(f"<span>{'已进行' if state == 'live' else '对局时长'} {dur} 分钟</span>")
+    elif state == "pending":
+        parts.append(f"<b>{esc(data.get('activity') or '进行中的对局')}</b>")
+        if data.get("started_text"):
+            parts.append(f"<span>开始 {esc(data.get('started_text'))}（UTC+8）</span>")
+            parts.append(f"<span>已进行 {int(data.get('duration_min') or 0)} 分钟</span>")
+        parts.append("<span>本场名单还没发布，先显示可见队伍成员</span>")
+    elif state == "orbit":
+        parts.append("<b>在轨道待机</b>")
+        parts.append("<span>队内生涯总览（生涯总时长 / 成就点数）</span>")
+    elif state == "offline":
+        parts.append("<b>不在线</b>")
+        lt = esc(data.get("last_text") or "")
+        if lt:
+            parts.append(f"<span>{lt}</span>")
+        parts.append("<span>没进游戏（角色选择界面 / 已退出），下方为生涯累计</span>")
+    else:
+        parts.append("<b>还没进入活动</b>")
+    parts.append(f"<span class='ft-q'>查询 {esc(data.get('name') or '')}</span>")
+    members = data.get("members") or []
+    rows, grouped = "", False
+    if bucket in (5, 63):
+        my_team = next((m.get("team") for m in members if m.get("is_self")), None)
+        if my_team is not None:
+            def gk(m):
+                return m.get("team") if m.get("team") is not None else my_team
+            teams = []
+            for m in members:
+                if gk(m) not in teams:
+                    teams.append(gk(m))
+            teams.sort(key=lambda t: (t != my_team, str(t)))
+            for t in teams:
+                rows += ("<div class='ft-group'>"
+                         + esc("你的阵营" if t == my_team else "对方阵营") + "</div>")
+                rows += "".join(_ft_row(m, bucket) for m in members if gk(m) == t)
+            grouped = True
+    if not grouped:
+        rows = "".join(_ft_row(m, bucket) for m in members)
+    foot = ("命运2 查询 · 数据来自 Bungie.net · 在轨道/不在线：显示生涯累计"
+            "（生涯总时长 / 成就点数）；名单取自官方实时队伍，队友未公开时可能不全"
+            if state in ("orbit", "offline") else
+            "命运2 查询 · 数据来自 Bungie.net · 熔炉/智谋按阵营分列，"
+            "突袭/地牢为全队 + 每副本完成数/导师；名单取自本场对局，刚开局或队友未公开时可能不全")
+    body = (f"<style>{_FT_CSS}</style>"
+            f"<div class='ft-head'><div class='ft-t'>当前队伍简报{tag}</div>"
+            f"<div class='ft-sub'>{''.join(parts)}</div></div>"
+            f"<h2>队伍成员（{len(members)}）</h2>"
+            + (rows or "<div class='nt warn'>没拿到成员数据</div>")
+            + f"<div class='foot'>{foot}</div>")
+    return _page(body)
