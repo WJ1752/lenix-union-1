@@ -3204,7 +3204,7 @@ def perk_meta(h) -> tuple:
     return p.get("name") or "", p.get("icon") or ""
 
 
-_XUR_ARMOR_KW = ("护甲", "头盔", "臂甲", "披风", "猎戏", "印记", "臂环")
+_XUR_ARMOR_KW = ("护甲", "头盔", "臂甲", "臂铠", "披风", "猎戏", "印记", "臂环")
 
 
 def _xur_sec(tier: str, ty: str, name: str) -> str:
@@ -3213,8 +3213,8 @@ def _xur_sec(tier: str, ty: str, name: str) -> str:
     if "任务" not in ty and (name.endswith("催化") or "催化" in ty):
         return "异域武器催化"
     if "记忆水晶" in ty:
-        return "异域印痕"
-    if tier == "异域" and any(k in ty for k in ("披风", "猎戏", "印记")):
+        return "材料"
+    if tier == "异域" and any(k in ty for k in ("披风", "印记", "臂环", "猎戏")):
         return "职业金"
     armor = any(k in ty for k in _XUR_ARMOR_KW)
     if tier == "异域":
@@ -3234,24 +3234,160 @@ def _xur_sec(tier: str, ty: str, name: str) -> str:
     return "其他"
 
 
+# ---------- 老九周货主源：Kyber's Corner 内嵌 vendor 数据 ----------
+# 武器/催化/传说栏在未解锁账号的 Bungie 接口里被「更多奇异优惠/奇异装备优惠」
+# 门槛挡住（只回护甲/材料/任务），而 kyberscorner.com/destiny2/xur/ 每周把完整
+# 货单内嵌在页面 JSON 里（window.KYBER_XUR_DATA：异域护甲/隼月整卷 sockets/
+# 金枪/催化/传说武器/传说护甲/材料价目，hash 与本地索引对得上）。到场窗口内
+# 用它出卡（免授权）；抓不到或已过离场时间再走 Bungie 接口兜底。
+_KYBER_XUR_URL = "https://kyberscorner.com/destiny2/xur/"
+_KYBER_CACHE_FILE = "xur_kyber_cache.json"
+_KYBER_CACHE: dict = {"at": 0.0, "data": None}
+_PLUG_META: dict | None = None
+
+
+def _plug_meta_idx() -> dict:
+    """plug_meta.json 懒加载（build_plug_meta.py 产出：插件 hash → 中文名/图标）。"""
+    global _PLUG_META
+    if _PLUG_META is None:
+        try:
+            _PLUG_META = json.load(open(_idx_file("plug_meta.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _PLUG_META = {}
+    return _PLUG_META
+
+
+def _iso_ts(s: str) -> float:
+    """UTC ISO 时间 → epoch（解析不了给 0）。"""
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def _kyber_xur() -> dict | None:
+    """抓 Kyber's Corner 老九周货 JSON：内存缓存 2h + 落盘兜底，抓不到回上次数据。"""
+    now = time.time()
+    c = _KYBER_CACHE
+    if c["data"] and now - c["at"] < 7200:
+        return c["data"]
+    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+    data = None
+    try:
+        html = await _web_get_text(_KYBER_XUR_URL)
+        m = re.search(r"window\.KYBER_XUR_DATA\s*=\s*", html)
+        if m:
+            raw, _ = json.JSONDecoder().raw_decode(html[m.end():])
+            if isinstance(raw, dict) and raw.get("status") == "ok" and raw.get("arrival"):
+                data = raw
+    except Exception:  # noqa: BLE001
+        data = None
+    if data is None:
+        try:
+            data = json.load(open(os.path.join(base, _KYBER_CACHE_FILE), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+    if data and (not c["data"] or data.get("generatedAt") != c["data"].get("generatedAt")):
+        try:
+            json.dump(data, open(os.path.join(base, _KYBER_CACHE_FILE), "w",
+                                 encoding="utf-8"), ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            pass
+    c.update(at=now, data=data)
+    return data
+
+
+def _xur_kyber_plugs(src: dict, cats: tuple) -> list[dict]:
+    """Kyber sockets → perk 芯片（plug_meta 解中文名，缺了退它自带的英文名）。"""
+    out = []
+    for s in (src.get("sockets") or []):
+        cat = (s.get("plugCategoryIdentifier") or "").rsplit(".", 1)[-1]
+        ph = s.get("plugHash")
+        if cat not in cats or not ph:
+            continue
+        pm = _plug_meta_idx().get(str(ph)) or {}
+        name = pm.get("name") or s.get("name") or ""
+        if any(k in name for k in ("记录器", "计数器")):
+            continue
+        out.append({"h": int(ph), "name": name,
+                    "icon": pm.get("icon") or s.get("icon") or ""})
+    return out
+
+
+def _xur_kyber_items(ky: dict) -> list[dict]:
+    """Kyber 周货 → 老九卡物品：中文名/类型/职业全走本地 vendor_items 索引，
+    索引查不到的（如奇异礼物）跳过；带 grips 槽或可重用池的异域武器判随机卷大卡。"""
+    idx = _vi_index()
+    items = []
+    sec_items = ([(it, "") for it in (ky.get("exoticArmor") or [])]
+                 + [(it, "") for it in (ky.get("hawkmoon") or [])]
+                 + [(it, "") for it in (ky.get("exoticWeapons") or [])]
+                 + [(it, "") for it in (ky.get("catalysts") or [])]
+                 + [(it, "") for it in (ky.get("legendaryWeapons") or [])]
+                 + [(it, "") for it in (ky.get("legendaryArmor") or [])]
+                 + [(it, "材料") for it in (ky.get("strangeOffers") or [])])
+    for i, (src, force_sec) in enumerate(sec_items):
+        h = str(src.get("hash") or "")
+        rec = idx.get(h)
+        if not rec or not rec[0]:
+            continue
+        name, ty, tier, icon, cls, shot = (list(rec) + [""] * 6)[:6]
+        cost = None
+        for cc in (src.get("costs") or []):
+            crec = idx.get(str(cc.get("hash") or ""))
+            cost = {"n": int(cc.get("quantity") or 0),
+                    "cur": crec[0] if crec else "？",
+                    "icon": (BASE + crec[3]) if crec and len(crec) > 3 and crec[3] else ""}
+            break
+        it = {"hash": h, "idx": i, "n": name, "ty": ty, "tier": tier,
+              "cls": _XUR_CLASS_ZH.get(cls if isinstance(cls, int) else -1, "通用"),
+              "icon": (BASE + icon) if icon else (src.get("icon") or ""),
+              "shot": (BASE + shot) if shot else (src.get("screenshot") or ""),
+              "cost": cost, "status": 0, "perks": [],
+              "sec": force_sec or _xur_sec(tier, ty, name)}
+        if it["sec"] in ("异域武器", "传说武器"):
+            it["intr"] = (_xur_kyber_plugs(src, ("intrinsics",)) or [None])[0]
+            # 枪管/弹夹也在 sockets 里：大卡要整卷；小卡 _xur_chips 取 plugs[-2:]
+            # 仍是两特性（槽序 枪管→弹夹→特性×2）
+            it["plugs"] = _xur_kyber_plugs(src, ("barrels", "magazines", "frames", "grips"))
+            it["rolled"] = any(
+                (s.get("plugCategoryIdentifier") or "").rsplit(".", 1)[-1] in ("frames", "grips")
+                and ((s.get("plugCategoryIdentifier") or "").endswith("grips")
+                     or len(s.get("reusablePlugs") or []) > 1)
+                for s in (src.get("sockets") or []))
+        items.append(it)
+    return items
+
+
 @_traced("老九商品")
 async def xur_stock(force: bool = False) -> dict:
     """仄（老九 / Xûr）的每周商品。
 
-    到场窗口内缓存 2 小时，未到场 10 分钟查一次。逐角色查一遍再合并：职业臂/
-    职业传说甲只发给对应职业的角色（133/134/135 三格各归各职业）。未到场时
-    全量接口也带预上架商品，照常出卡并在卡头标注；单店接口（随机卷 perks）
-    到场才开（未到场 404 DestinyVendorNotFound），失败自动退回全量兜底。
-    未授权抛 BungieAuthRequired（上层提示去面板授权）。
+    主源：Kyber's Corner 每周内嵌的完整货单（免授权，武器/催化/传说栏齐全），
+    在场窗口内直接用它出卡。兜底走 Bungie 接口：逐角色查再合并（职业臂/
+    职业传说甲只发给对应职业的角色，133/134/135 三格各归各职业），未解锁账号
+    会缺武器/催化/传说栏（卡上有提示行）。未到场时全量接口也带预上架商品，
+    照常出卡并在卡头标注；单店接口（随机卷 perks）到场才开（未到场 404
+    DestinyVendorNotFound），失败自动退回全量兜底。未授权抛
+    BungieAuthRequired（上层提示去面板授权）。
     """
-    import bungie_auth
-    if not bungie_auth.authorized():
-        raise BungieAuthRequired("还没有授权 Bungie 账号")
     now = time.time()
     if not force:
         c = _XUR_CACHE
         if c["data"] and now - c["at"] < (7200 if c["data"].get("present") else 600):
             return c["data"]
+    ky = await _kyber_xur()
+    if ky and _iso_ts(ky.get("arrival")) <= now < _iso_ts(ky.get("departure")):
+        items = [it for it in _xur_kyber_items(ky) if it["sec"] != "任务"]
+        data = {"present": True, "source": "kyber", "items": items, "updated": now,
+                "arrives": 0.0, "arrives_txt": "", "in_min": 0}
+        _XUR_CACHE.update(at=now, data=data)
+        return data
+
+    import bungie_auth
+    if not bungie_auth.authorized():
+        raise BungieAuthRequired("还没有授权 Bungie 账号")
     mem = await bungie_auth.membership()
     if not mem or not mem.get("membership_id"):
         # membership() 失败会吞掉真实原因，直接调一次把异常透传出去
@@ -3306,6 +3442,7 @@ async def xur_stock(force: bool = False) -> dict:
                 items.append(it)
     if not present:
         items = [it for it in items if it.get("status") == 0]
+    items = [it for it in items if it.get("sec") != "任务"]   # 异星学等周常任务不出卡
     order = {s: i for i, s in enumerate(("异域护甲", "职业金", "异域武器",
                                          "异域武器催化", "传说武器", "传说护甲",
                                          "材料", "任务", "其他"))}
@@ -3322,7 +3459,7 @@ async def xur_stock(force: bool = False) -> dict:
         it.pop("_live", None)
     arr = 0.0 if present else _xur_next_arrival(now)
     at = datetime.datetime.fromtimestamp(arr) if arr else None
-    data = {"present": present, "items": items, "updated": now,
+    data = {"present": present, "source": "api", "items": items, "updated": now,
             "arrives": arr,
             "arrives_txt": (f"{['周一', '周二', '周三', '周四', '周五', '周六', '周日'][at.weekday()]}"
                             f" {at:%H:%M}") if at else "",

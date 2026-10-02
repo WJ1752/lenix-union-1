@@ -171,7 +171,7 @@ section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:1
 .xuprice b{color:#d4b26a;font-size:17px}
 .xuprice .no{color:#5a616b;font-size:15px}
 .xubig{position:relative;border:1px solid #a9842f;border-radius:12px;overflow:hidden;background:#171b21;margin-bottom:10px}
-.xubig .bg{position:absolute;inset:0;background-size:cover;background-position:center top;opacity:.5}
+.xubig .bg{position:absolute;inset:0;background-size:contain;background-position:right 14px center;background-repeat:no-repeat;opacity:.6}
 .xubig .scrim{position:absolute;inset:0;background:linear-gradient(90deg,rgba(10,12,16,.94) 0%,rgba(10,12,16,.6) 48%,rgba(10,12,16,.2) 100%)}
 .xubig .inner{position:relative;padding:12px 14px}
 .xubig .xuname{font-size:19px}
@@ -1631,9 +1631,11 @@ def _xur_small(it: dict) -> str:
 
 
 def _xur_big(it: dict) -> str:
-    """带随机卷的异域武器大卡：武器大图当背景 + 本周随机卷 perk 逐个（图标+名）。"""
-    style = (f" style=\"background-image:url('{esc(it['shot'])}')\""
-             if it.get("shot") and "missing_icon" not in it["shot"] else "")
+    """带随机卷的异域武器大卡：官方 1920x1080 截图整枪缩放靠右当背景（cover 会裁成
+    横条、物品图标本身是特写都不完整）+ 本周随机卷 perk 逐个（图标+名）。"""
+    pic = it.get("shot") or it.get("icon") or ""
+    style = (f" style=\"background-image:url('{esc(pic)}')\""
+             if pic and "missing_icon" not in pic else "")
     chips = _xur_chips(it, all_plugs=True)
     return ("<div class='xubig'>"
             f"<div class='bg'{style}></div><div class='scrim'></div>"
@@ -1659,8 +1661,7 @@ def xur_card(stock: dict) -> str:
     数据层已并三角色）；带随机卷的异域武器（如隼月）单独大卡展示本周 perk；
     未到场时接口里也有预上架商品，照常展示并标注抵达倒计时。
     """
-    items = [it for it in (stock.get("items") or [])
-             if it.get("sec") != "异域印痕"]     # 异域记忆水晶不出卡
+    items = list(stock.get("items") or [])
     if not items:
         when = stock.get("arrives_txt") or "每周六凌晨 1:00"
         return notice("老九还没到高塔",
@@ -1722,12 +1723,14 @@ def xur_card(stock: dict) -> str:
     for sec, its in secs.items():      # 兜底：未知分节照常出
         body += _xur_head(sec, len(its))
         body += _xur_grid(its)
-    if present and not has_gear:
+    if present and not has_gear and stock.get("source") != "kyber":
         body += ("<div class='xuhint'>异域武器 / 催化 / 传说装备栏需要账号在游戏内解锁"
                  "（购买「更多奇异优惠 / 奇异装备优惠」或异域等级达标）才会出现在接口里。</div>")
     body += "</div>"
+    src = ("Kyber's Corner 周货单 · Bungie 商店数据"
+           if stock.get("source") == "kyber" else "Bungie 商店接口（需账号授权）")
     body += ("<div class='foot'>共 "
-             f"{len(items)} 件 · Bungie 商店接口（需账号授权）"
+             f"{len(items)} 件 · {src}"
              + ("" if present else " · 未到场只显示已预上架部分")
              + " · 到场后可购买</div>")
     return _page(body)
