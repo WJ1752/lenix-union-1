@@ -778,6 +778,12 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
             plugs.append({"hash": int(hsh), "name": meta["name"], "icon": meta["icon"], "pct": pct})
         if not plugs:
             continue
+        # 同一 perk 常被原版/重制版两个 hash 描述（枯骨鳞片催化、脉搏监控…），按名去重留高出现率
+        by_name: dict = {}
+        for p in plugs:
+            if p["name"] not in by_name or (p["pct"] or 0) > (by_name[p["name"]]["pct"] or 0):
+                by_name[p["name"]] = p
+        plugs = list(by_name.values())
         plugs.sort(key=lambda x: -x["pct"])
         best, bestn = None, 0
         for k, (_, hs) in enumerate(wf_cols):
@@ -827,6 +833,9 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
             meta = _join_plug(hsh)
             if meta and not meta["name"].startswith("空"):
                 plugs.append({"hash": int(hsh), "name": meta["name"], "icon": meta["icon"]})
+        # 原版/重制版催化常是两个 hash 同名（枯骨鳞片催化），按名去重后不足两选项就不注入
+        seen_n: set = set()
+        plugs = [p for p in plugs if not (p["name"] in seen_n or seen_n.add(p["name"]))]
         if len(plugs) >= 2:
             col = {"title": "催化", "plugs": plugs}
             # 游戏内催化插槽在特性之后、枪托之前
@@ -840,6 +849,11 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
             meta = _join_plug(hsh)
             if meta:
                 rows.append({"name": meta["name"], "icon": meta["icon"], "pct": pct})
+        by_name: dict = {}
+        for r in rows:
+            if r["name"] not in by_name or (r["pct"] or 0) > (by_name[r["name"]]["pct"] or 0):
+                by_name[r["name"]] = r
+        rows = list(by_name.values())
         rows.sort(key=lambda x: -x["pct"])
         return rows
 
@@ -874,6 +888,10 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
                            "pct": round(op["pct"] / n_cat, 2)}
                           for op in other["plugs"] for cp in cat_col["plugs"]]
                 combos.sort(key=lambda x: -x["pct"])
+    # 同名组合只留一条（原版/重制版双 hash 去重前可能生成重复行），留出现率最高的
+    seen_c: set = set()
+    combos = [c for c in combos
+              if not (tuple(c["names"]) in seen_c or seen_c.add(tuple(c["names"])))]
     combos = combos[:8]
     if not combos and len(trait_cols) >= 2:            # 没有真实数据 → 两列 pct 独立乘积估算
         prods = []

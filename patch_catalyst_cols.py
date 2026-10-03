@@ -46,6 +46,12 @@ for h, w in wfu.items():
                 "i": "https://www.bungie.net" + dp.get("icon", "/common/destiny2_content/icons/DestinyPlugSetIcon_0.png") if dp.get("icon") else "",
             })
         col = {"t": "催化", "items": col_items}
+        # 原版/重制版催化是两个 hash 同名（枯骨鳞片催化），按名去重，只剩一条就不是可选列
+        seen = set()
+        col["items"] = [x for x in col_items
+                        if not (x["n"] in seen or seen.add(x["n"]))]
+        if len(col["items"]) < 2:
+            continue
         cols = w.setdefault("plugs", {}).setdefault("cols", [])
         if any(c.get("t") == "催化" for c in cols):
             continue
