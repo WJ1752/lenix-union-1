@@ -2,6 +2,32 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 `/raid` `/地牢` 通关数对齐 raid.report + 最右列改「最快全程」
+
+- **现象（用户报）**：卡片数据跟 raid.report 对不上（深岩墓室 56 vs 84、忧愁王冠 1 vs 8、
+  玻璃拱顶 28 vs 37……全线偏低）；最右侧「最快」显示的是所有通关场里的最短时长
+  （检查点进局的 3 分钟能吊打正经全程），raid.report 显示的是 fastest full clear。
+- **根因**：①官方对局历史会被裁剪——只留 ~2020-03 起的场，**已删除角色**的历史完全拉不到；
+  raid.report 的数据库是「历史累计」（对局发生时就入库），所以老副本通关数永远比官方历史全。
+  ②「最快」没过滤检查点局。
+- **修复**：新主源 `api.raidreport.dev /{raid|dungeon}/player/{mid}`（一条请求逐 hash 给
+  `clears / fullClears / fastestFullClear`，与它页面显示完全同源）：
+  - `_rr_stats()`：30 分钟 TTL 磁盘缓存（raidreport_stats.json）；拉不到时**退回过期缓存**；
+    连缓存都没有才回落官方历史口径（`_rr_fetch_json` 直连→CDP 复用既有通道）。
+  - `_merge_rr_stats()`：hash→中文名用 manifest_index/activities.json，`split_activity` 拆
+    难度后并入历史分组；通关取 max、最快全程取 min；官方历史完全没有的组只在发售表里的
+    主副本补建（参与=通关兜底，别让「通关>参与」打架）；众神殿分身等杂项 hash 没历史组就跳过。
+  - 「最快全程」兜底口径：raid.report 不可用时，把最快的 24 场通关补进 PGCR 复核
+    （验 `activityWasStartedFromBeginning`），只认**明确验证过从头开始**的场。
+  - 顶部「总通关次数」改为 Σ分组通关（对齐后与 raid.report 口径一致）；副标题标注
+    「通关数/最快全程已对齐 raid.report（含官方历史已裁剪的老对局）」。
+  - 徽章（无暇/低人/首日/首周）仍走官方历史+PGCR 复核，raid.report 接口不提供这些。
+- **实测核对**（Wj#8984，合并逻辑离线单测 + 线上卡片）：深岩墓室 84✓ 忧愁王冠 8✓
+  玻璃拱顶 21+16✓ 国王的陨落 42✓ 梦魇根源 78+2✓ 救赎的边缘 18+3✓ 最后一愿 15✓；
+  最快全程 = raid.report FASTEST 列同值（如 DSC 37m49s，不再是检查点局 3分0秒）。
+- **注意**：利维坦家族（2018 年 3 个副本）raid.report 页面与自家 API 数字略有出入（±3），
+  以 API 为准；`raidreport_stats.json` 已入 .gitignore。
+
 ## 2026-10-04 修复：武器卡「催化」列重复条目（枯骨鳞片）
 
 - **现象**：`/武器查询 枯骨鳞片` 的催化列并排两条「枯骨鳞片催化」，热门组合也两两重复。

@@ -1436,6 +1436,65 @@ async def _day_one_rank(mtype: int, mid: str, base: str, is_master: bool) -> dic
         _RR_INFLIGHT.discard(inflight)
 
 
+# 通关数/最快全程主源：api.raidreport.dev 的 /{raid|dungeon}/player/{mid}。
+# 官方对局历史会被裁剪（只留 ~2020-03 起、已删角色的场完全拉不到），所以官方历史算出的
+# 通关数永远低于 raid.report 页面（它是历史累计库）；该接口逐 hash 给 clears/fullClears/
+# fastestFullClear，与其页面显示一致。30 分钟 TTL；拉不到时退回过期缓存；连缓存都没有
+# 才回落官方历史口径（此时「最快全程」只认 PGCR 复核过从头开始的场）。
+_RR_STATS_PATH = os.path.join("raidreport_stats.json")
+_RR_STATS: dict | None = None
+_RR_STATS_TTL = 1800
+
+
+def _rr_stats_cache() -> dict:
+    global _RR_STATS
+    if _RR_STATS is None:
+        try:
+            _RR_STATS = json.load(open(_RR_STATS_PATH, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _RR_STATS = {}
+    return _RR_STATS
+
+
+def _rr_stats_save() -> None:
+    try:
+        json.dump(_rr_stats_cache(), open(_RR_STATS_PATH, "w", encoding="utf-8"),
+                  ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _rr_stats(mid: str, mode: int) -> dict | None:
+    """→ {"ts": 取数时刻, "acts": {hash: {"clears", "full", "ffc"}}}；拿不到且无缓存 → None"""
+    kind = "dungeon" if mode == 82 else "raid"
+    key = f"{mid}:{kind}"
+    ent = _rr_stats_cache().get(key)
+    if ent and time.time() - ent.get("ts", 0) < _RR_STATS_TTL:
+        return ent
+    d, not_found = await _rr_fetch_json(f"{_RR_BASE}/{kind}/player/{mid}", str(mid))
+    if d is None:
+        # 404 当作「没打过」（空表缓存）；网络/CF 失败用过期缓存兜底，没有就 None
+        if not_found:
+            out = {"ts": time.time(), "acts": {}}
+            _rr_stats_cache()[key] = out
+            _rr_stats_save()
+            return out
+        return ent
+    acts = {}
+    for a in (d.get("response") or {}).get("activities") or []:
+        v = a.get("values") or {}
+        ffc = (v.get("fastestFullClear") or {}).get("value")
+        acts[str(a.get("activityHash"))] = {
+            "clears": int(v.get("clears") or 0),
+            "full": int(v.get("fullClears") or 0),
+            "ffc": int(ffc) if ffc else None,
+        }
+    out = {"ts": time.time(), "acts": acts}
+    _rr_stats_cache()[key] = out
+    _rr_stats_save()
+    return out
+
+
 async def _pgcr_run_info(instance: str) -> dict:
     """PGCR 局面信息：fresh=是否从头开始打、accounts=全程出现过的账号数、private=私局。
 
@@ -1459,6 +1518,45 @@ async def _pgcr_run_info(instance: str) -> dict:
         }
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _merge_rr_stats(groups: dict, acts: dict) -> None:
+    """raid.report 逐 hash 统计并入分组：通关数取 max（它是历史累计库，只会更全）、
+    最快全程取 min；官方历史完全没有的组（老对局/已删角色）只在发售表里的主副本补建。"""
+    for h, st in acts.items():
+        if not st["clears"]:
+            continue
+        info = _activities.get(str(h)) or {}
+        base, diff = split_activity(info.get("name") or "")
+        if not base:
+            continue
+        is_master = diff == "大师"
+        g = groups.get((base, is_master))
+        if g is None:
+            # 杂项活动（众神殿分身之类）没有历史组就跳过
+            if base not in _RAID_ORDER_IDX:
+                continue
+            rel = _RAID_RELEASE_UTC.get(base) or ""
+            g = groups.setdefault((base, is_master), {
+                "name": base, "master_mode": is_master,
+                "ref": 0, "pgcr": info.get("pgcr", ""),
+                "plays": 0, "clears": 0, "best": None, "last": "", "ffc": None,
+                "flawless": 0, "solo": 0, "duo": 0, "trio": 0,
+                "solo_fl": 0, "duo_fl": 0, "trio_fl": 0, "master": 0,
+                "diffs": [diff] if diff else [],
+                "day_one": 0, "week_one": 0,
+                "rel_d1": _ts_shift(rel, 24 * 3600) if rel else "",
+                "rel_w1": _ts_shift(rel, 7 * 24 * 3600) if rel else "",
+            })
+        if st["clears"] > g["clears"]:
+            g["clears"] = st["clears"]
+            if st["clears"] > g["plays"]:
+                g["plays"] = st["clears"]   # 参与 ≥ 通关，别让卡片自相矛盾
+        if diff and diff not in g["diffs"]:
+            g["diffs"].append(diff)
+        ffc = st.get("ffc")
+        if ffc and (g["ffc"] is None or ffc < g["ffc"]):
+            g["ffc"] = ffc
 
 
 @_traced(lambda name, mode: (f"/地牢 {name}" if mode == 82 else f"/raid {name}"))
@@ -1504,7 +1602,15 @@ async def raid_report(name: str, mode: int) -> dict:
     # 特殊通关复核：0 死亡通关 / 低人通关才拉 PGCR —— 判断「是否从头开始打」。
     # 尾王检查点进去通掉尾王（哪怕 0 死）官方 PGCR 给 activityWasStartedFromBeginning=False，
     # 不算全程无暇（用户 2026-10-02 指定口径）；私局（自定义装载）也不进特殊徽章。
+    rr = await _rr_stats(mid, mode)
     cand = [m for m in matches if m["completed"] and (m["deaths"] == 0 or 0 < m["player_count"] <= 3)]
+    if rr is None:
+        # raid.report 接口不可用时「最快全程」只能自己复核：最快的 24 场通关大概率包含
+        # 检查点局，逐场验「从头开始」——验证过的才允许进「最快全程」
+        fast = sorted((m for m in matches if m["completed"] and m["duration"] > 0),
+                      key=lambda m: m["duration"])[:24]
+        have = {id(m) for m in cand}
+        cand = cand + [m for m in fast if id(m) not in have]
     if cand:
         log_progress(f"raid:{mid}:{mode}", 0, len(cand), label=f"/{rname} {disp}", force=True,
                      extra=f"复核 {len(cand)} 场特殊通关（全程 / 低人口径）")
@@ -1514,6 +1620,7 @@ async def raid_report(name: str, mode: int) -> dict:
             for m, info in zip(chunk, infos):
                 if info:
                     m["full_run"] = info["fresh"] is not False
+                    m["full_verified"] = True   # PGCR 明确回答过「是否从头开始」
                     m["private"] = info["private"]
                     # 账号数取 PGCR 全程出现过的账号 与 场上人数 的较大者：
                     # 6 人团中途退到剩 2 人通关，靠 PGCR 账号数戳穿不算双人；
@@ -1531,7 +1638,7 @@ async def raid_report(name: str, mode: int) -> dict:
         rel = _RAID_RELEASE_UTC.get(base) or ""
         g = groups.setdefault((base, is_master), {
             "name": base, "master_mode": is_master, "ref": m["ref"], "pgcr": m["pgcr"],
-            "plays": 0, "clears": 0, "best": None, "last": "",
+            "plays": 0, "clears": 0, "best": None, "last": "", "ffc": None,
             "flawless": 0, "solo": 0, "duo": 0, "trio": 0,
             "solo_fl": 0, "duo_fl": 0, "trio_fl": 0, "master": 0, "diffs": [],
             "day_one": 0, "week_one": 0,
@@ -1577,7 +1684,21 @@ async def raid_report(name: str, mode: int) -> dict:
                     g["week_one"] += 1
             if g["best"] is None or m["duration"] < g["best"]:
                 g["best"] = m["duration"]
+
+    # 通关数/最快全程对齐 raid.report：官方历史裁剪掉的通关（老对局/已删角色）从这里补齐，
+    # 分组用 manifest activities.json 的 hash→名（split_activity 拆难度），与历史组分并
+    if rr:
+        _merge_rr_stats(groups, rr["acts"])
+    else:
+        # 兜底口径：只认 PGCR 明确回答过「从头开始打」的通关场（fast=False 的检查点局不算）
+        for m in matches:
+            if (m["completed"] and m.get("full_verified") and m["full_run"]
+                    and not m["private"] and m["duration"] > 0):
+                g = groups.get((m["base"], m["diff"] == "大师"))
+                if g and (g["ffc"] is None or m["duration"] < g["ffc"]):
+                    g["ffc"] = m["duration"]
     done = [m for m in matches if m["completed"]]
+    total_clears = sum(g["clears"] for g in groups.values())
     _unk = len(_RAID_ORDER_IDX)
     std = sorted((g for g in groups.values() if not g["master_mode"]),
                  key=lambda g: (_RAID_ORDER_IDX.get(g["name"], _unk), g["name"]))
@@ -1593,8 +1714,9 @@ async def raid_report(name: str, mode: int) -> dict:
                 g["d1_rank"] = None
     return {
         "display": f"{member['display']}#{fmt_code(member['code'])}",
-        "total_clears": len(done),
+        "total_clears": total_clears,
         "total_plays": len(matches),
+        "rr_aligned": bool(rr),
         "flawless": sum(1 for m in done if _mfl(m)),
         "solo_fl": sum(1 for m in done if _mfl(m) and m["low_accounts"] == 1),
         "duo_fl": sum(1 for m in done if _mfl(m) and m["low_accounts"] <= 2),

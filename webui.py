@@ -1066,7 +1066,7 @@ def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "") -> st
     dq = f"&diff={quote(diff)}" if diff else ""
     rows = ""
     for g in groups:
-        if not g.get("plays", g["clears"]):  # 只打过没通关的也要列出来
+        if not g.get("plays") and not g.get("clears"):  # 只打过没通关的也要列出来
             continue
         diffs = " / ".join(g["diffs"]) if g["diffs"] else ""
         dtag = f"<span class='rdiff'>{diffs}</span>" if diffs else ""
@@ -1075,7 +1075,7 @@ def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "") -> st
                  f"<img src='{g['pgcr']}'>"
                  f"<div class='rin'><div class='rname'><b>{g['name']}</b>{dtag}</div>"
                  f"<div class='rbads'>{_raid_badges(g)}</div></div>"
-                 f"<span class='dim'>最快 {_fmat(g['best'])}<br>最近 {(g['last'] or '—')[:10]}</span></a>")
+                 f"<span class='dim'>最快全程 {_fmat(g.get('ffc'))}<br>最近 {(g['last'] or '—')[:10]}</span></a>")
     return rows
 
 
@@ -1100,7 +1100,10 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
         f"<div class='row'><span>大师通关</span><b>{rep['master']}</b></div>",
     ])
     body = (f"<h1>{rep['display']}</h1>"
-            f"<div class='sub'>{title} · 数据来自 Bungie.net · 点副本查看细分统计</div>"
+            f"<div class='sub'>{title} · 数据来自 Bungie.net"
+            + (" · 通关数/最快全程已对齐 raid.report（含官方历史已裁剪的老对局）"
+               if rep.get("rr_aligned") else "")
+            + " · 点副本查看细分统计</div>"
             f"{top}{sections}"
             f"<style>"
             f".rrow{{align-items:flex-start}}"
