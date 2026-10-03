@@ -6,6 +6,7 @@
 """
 WEBUI_TOKEN = "d2query"  # 与 config/webui.json 中的 token 保持一致
 ONEBOT_WS_URL = "ws://127.0.0.1:8901/onebot/v11/ws"
+import atexit
 import json
 import os
 import sys
@@ -56,7 +57,7 @@ def _find_qq() -> str:
     try:
         out = subprocess.check_output(
             ["wmic", "process", "where", "name='QQ.exe'", "get", "ExecutablePath"],
-            text=True, timeout=10)
+            text=True, errors="replace", timeout=10)
         for line in out.splitlines():
             line = line.strip()
             if line.lower().endswith("qq.exe"):
@@ -86,7 +87,8 @@ def _kill_webui_holder() -> bool:
     只认 QQ.exe / NapCatWinBootMain.exe，不会误伤用户自己的其他程序"""
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                             capture_output=True, text=True, timeout=15).stdout
+                             capture_output=True, text=True, errors="replace",
+                             timeout=15).stdout
     except Exception:  # noqa: BLE001
         return False
     pids = set()
@@ -98,7 +100,8 @@ def _kill_webui_holder() -> bool:
     for pid in pids:
         try:
             q = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                               capture_output=True, text=True, timeout=15).stdout
+                               capture_output=True, text=True, errors="replace",
+                               timeout=15).stdout
         except Exception:  # noqa: BLE001
             continue
         name = q.split(",")[0].strip('"').strip() if q else ""
@@ -191,6 +194,27 @@ def start(qq_path: str = "") -> dict:
         return {"started": True, "qq": qq, "log": LOG_FILE, "webui": webui_url()}
 
 
+def _kill_orphan_boot() -> bool:
+    """兜底杀掉仍在跑的 NapCatWinBootMain（exe 崩溃退出、或 NapCat 被认领后 _proc 为空的场景）。
+    本机的 NapCatWinBootMain 只可能来自本程序（与 _cleanup.ps1 同口径），不会碰到用户自己的 QQ"""
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq NapCatWinBootMain.exe",
+                              "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=15).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    killed = False
+    for line in out.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == "napcatwinbootmain.exe":
+            try:
+                killed = _tree_kill(int(parts[1])) or killed
+            except ValueError:
+                continue
+    return killed
+
+
 def stop():
     global _proc
     with _lock:
@@ -198,6 +222,22 @@ def stop():
             _tree_kill(_proc.pid)
         _proc = None
         _kill_webui_holder()  # 残留的 QQ.exe 不清掉，下次启动会误认领僵尸进程
+        _kill_orphan_boot()   # 被认领/遗留的 NapCat 引导进程也要连根拔掉
+
+
+# 面板窗口关闭 = webview.start() 返回、解释器正常收尾 → NapCat/QQ 跟程序一起退出。
+# 部署脚本用 taskkill /F 停 exe，不走 atexit，NapCat 存活，重启 exe 后原会话直接重连免扫码。
+# 收尾阶段任何异常都不能外抛（否则退出时打一屏 traceback，还可能断在半路）
+
+
+def _atexit_stop():
+    try:
+        stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+atexit.register(_atexit_stop)
 
 
 def reset() -> dict:

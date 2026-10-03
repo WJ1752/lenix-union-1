@@ -9,10 +9,10 @@
 # 字符串里的中文一旦解码错位就会把收尾引号吞掉，直接报「字符串缺少终止符」。
 #
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1
-#        powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1 -Dst dist_new\D2Query
-#        （现在实际在跑的是 dist_new\D2Query，默认的 dist\D2Query 是旧的旁路目录）
+#        默认部署到 dist_new\D2Query（2026-10-03 起**只允许工作区内目录**，
+#        工作区外的落点已按用户要求废弃删除，不要再往 F:\D2Query 之类的地方部署）
 param(
-  [string]$Dst = "dist\D2Query"
+  [string]$Dst = "dist_new\D2Query"
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot

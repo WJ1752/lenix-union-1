@@ -2,6 +2,25 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-03 程序退出带走 NapCat + 面板授权态补「刷新 Token / 重新授权」+ 部署落点限死工作区
+
+- **NapCat 随程序关闭**：`napcat_runtime` 注册 atexit——面板窗口关闭（`webview.start()`
+  返回、解释器正常收尾）时 `stop()` 连根清掉 NapCatWinBootMain + QQ 进程树；`stop()`
+  新增 `_kill_orphan_boot()` 兜底，把「exe 崩溃后遗留 / 被新实例认领（_proc 为空）」的
+  引导进程也按 EXE 名扫杀（与 `_cleanup.ps1` 同口径，不会碰用户自己的主号 QQ）。
+  部署脚本 `taskkill /F` 停 exe 不走 atexit，NapCat 存活 → 重启 exe 后原会话自动重连，
+  依旧免扫码。注意：关窗再开程序后需在面板点一次「启动并扫码登录」（uin 已存，快速
+  登录免扫码）。
+- **面板授权态补按钮**：已授权分支此前只有「取消授权」，token 过期（本例 access_token
+  已于 10-03 凌晨过期且一直没触发过自动续期）没有任何手动入口。现补：token 到期时间
+  展示 + 过期高亮；「刷新 Token」（新端点 `POST /api/bungie/refresh`：`authorized()`
+  检查 + `access_token()` 就地续期，未过期直接复用、不浪费一次性 refresh_token；失败
+  报真实原因并附重新授权链接）；「重新授权」直达 `/bungie/authorize`。
+- **部署落点限死工作区**：`deploy_exe.ps1` 默认 `-Dst` 从 `dist\D2Query` 改为
+  `dist_new\D2Query`；工作区外落点（`F:\D2Query`）已废弃，在用户要求下删除——删除前
+  已核对两边数据文件（.env / user_bindings / seen_players / 凭据 / token /
+  bot_config / napcat 登录态）为同一代且 marker/inode 测试确认互为独立目录。
+
 ## 2026-10-03 `/老九` 改版：武器/催化/隼月整卷上线（Kyber 周货主源 + 分节修复）
 
 - **用户反馈的四个问题**：只有金装没武器；术士职业金（唯我主义，ty=`术士臂环`）没和

@@ -327,8 +327,16 @@ async function refreshBungie(){
     return;
   }
   if(s.authorized){
+    const exp = s.expires_at ? new Date(s.expires_at*1000).toLocaleString() : '';
+    const expired = s.expires_at && (s.expires_at*1000 < Date.now());
     box.innerHTML = `<span class="on">● 已授权</span>　<b>${esc(s.display_name||s.membership_id||'')}</b>`
-      + '<div style="margin-top:8px"><button class="ghost" onclick="bungieLogout()">取消授权</button></div>';
+      + (exp ? `<div class="dim" style="margin-top:4px">token 到期：${esc(exp)}`
+             + (expired ? '　<span class="off">已过期，点「刷新 Token」续期</span>' : '') + '</div>' : '')
+      + '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
+      + '<button onclick="bungieRefresh()">刷新 Token</button>'
+      + '<a href="/bungie/authorize" target="_blank"><button class="ghost">重新授权</button></a>'
+      + '<button class="ghost" onclick="bungieLogout()">取消授权</button></div>'
+      + '<div class="dim" id="bmsg2" style="margin-top:6px"></div>';
     return;
   }
   box.innerHTML = '<span class="off">● 未授权</span>'
@@ -359,6 +367,16 @@ async function bungieManual(){
       headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})})).json();
     if(r.ok){ refreshBungie(); }
     else if(msg){ msg.innerHTML = '<span class="off">' + esc(r.error||'授权失败') + '</span>'; }
+  }catch(e){ if(msg) msg.textContent = '请求失败，稍后重试'; }
+}
+async function bungieRefresh(){
+  const msg = document.getElementById('bmsg2');
+  if(msg) msg.textContent = '正在用 refresh_token 续期…';
+  try{
+    const r = await (await fetch('/api/bungie/refresh', {method:'POST'})).json();
+    if(r.ok){ if(msg) msg.textContent = '已续期'; refreshBungie(); }
+    else if(msg){ msg.innerHTML = '<span class="off">' + esc(r.error||'刷新失败') + '</span>　'
+      + '<a href="/bungie/authorize" target="_blank">重新授权</a>'; }
   }catch(e){ if(msg) msg.textContent = '请求失败，稍后重试'; }
 }
 async function bungieLogout(){
@@ -913,6 +931,18 @@ def needs_bungie_page() -> str:
 @app.get("/api/bungie/status")
 def bungie_status():
     return bungie_auth.status()
+
+
+@app.post("/api/bungie/refresh")
+async def bungie_refresh():
+    """手动续期：token 过期就用 refresh_token 换新的（refresh_token 一次性，失败报真实原因）"""
+    if not bungie_auth.authorized():
+        return {"ok": False, "error": "尚未授权"}
+    try:
+        await bungie_auth.access_token()  # 未过期时直接复用，不白白消耗一次性 refresh_token
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/bungie/authorize")
