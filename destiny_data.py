@@ -1548,10 +1548,12 @@ def _merge_rr_stats(groups: dict, acts: dict) -> None:
                 "rel_d1": _ts_shift(rel, 24 * 3600) if rel else "",
                 "rel_w1": _ts_shift(rel, 7 * 24 * 3600) if rel else "",
             })
-        if st["clears"] > g["clears"]:
-            g["clears"] = st["clears"]
-            if st["clears"] > g["plays"]:
-                g["plays"] = st["clears"]   # 参与 ≥ 通关，别让卡片自相矛盾
+        # 同一副本会有多个活动 hash（原版/重制版/竞赛版等），页面口径是逐难度【求和】
+        g["rr_sum"] = g.get("rr_sum", 0) + st["clears"]
+        if g["rr_sum"] > g["clears"]:
+            g["clears"] = g["rr_sum"]
+            if g["clears"] > g["plays"]:
+                g["plays"] = g["clears"]   # 参与 ≥ 通关，别让卡片自相矛盾
         if diff and diff not in g["diffs"]:
             g["diffs"].append(diff)
         ffc = st.get("ffc")
@@ -1566,32 +1568,58 @@ async def raid_report(name: str, mode: int) -> dict:
     if not member:
         raise LookupError(f"没找到玩家 {name}")
     mtype, mid = member["mtype"], member["mid"]
-    profile = await get_profile(mtype, mid)
-    chars = profile.get("characters", {}).get("data", {})
+    # 跨存档全家桶：raid.report 页面把同一 bungie 账号下所有平台的历史合并显示，
+    # 只拉主平台会少算跨平台前打的那些场（实测 Benson 克洛塔 页面87 vs 主平台86）
+    accts = [(mtype, str(mid))]
+    try:
+        r = await client().get(f"/User/GetMembershipsById/{mid}/{mtype}/")
+        for mm in ((r.json().get("Response") or {}).get("destinyMemberships") or []):
+            mt2, md2 = mm.get("membershipType"), str(mm.get("membershipId") or "")
+            if md2 and mt2 in (1, 2, 3, 4, 5, 6, 10) and (mt2, md2) not in accts:
+                accts.append((mt2, md2))
+    except Exception:  # noqa: BLE001  拿不到就只算主平台
+        pass
 
     seen, matches = set(), []
     rname = "地牢" if mode == 82 else "raid"
     disp = f"{member['display']}#{fmt_code(member['code'])}"
-    nchars = len(chars) or 1
-    log_progress(f"raid:{mid}:{mode}", 0, nchars * 40, label=f"/{rname} {disp}", force=True,
-                 extra="翻取副本对局历史（每人最多 40 页 × 250 场）")
-    for ci, cid in enumerate(chars, 1):
-        # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
-        page = 0
-        while page < 40:
-            acts = await activity_history(mtype, mid, cid, mode, count=250, page=page)
-            for m in acts:
-                key = m["instance"] or f"{m['ref']}{m['period']}"
-                if key not in seen:
-                    seen.add(key)
-                    matches.append(m)
-            if len(acts) < 250:
-                break
-            page += 1
-            log_progress(f"raid:{mid}:{mode}", (ci - 1) * 40 + page, nchars * 40,
-                         label=f"/{rname} {disp}",
-                         extra=f"角色 {ci}/{nchars} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
-    log_progress(f"raid:{mid}:{mode}", nchars * 40, nchars * 40, label=f"/{rname} {disp}",
+    nunits = 0
+    for at, am in accts:
+        try:
+            prof = await get_profile(at, am)
+            nunits += len(prof.get("characters", {}).get("data", {}) or {})
+        except Exception:  # noqa: BLE001
+            pass
+    if not nunits:
+        nunits = 1
+    log_progress(f"raid:{mid}:{mode}", 0, nunits * 40, label=f"/{rname} {disp}", force=True,
+                 extra=f"翻取副本对局历史（{len(accts)} 个平台 · 每人最多 40 页 × 250 场）")
+    unit = 0
+    for at, am in accts:
+        try:
+            prof = await get_profile(at, am)
+            chars_p = prof.get("characters", {}).get("data", {})
+        except Exception:  # noqa: BLE001
+            chars_p = {}
+        for cid in chars_p:
+            unit += 1
+            # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
+            page = 0
+            while page < 40:
+                acts = await activity_history(at, am, cid, mode, count=250, page=page)
+                for m in acts:
+                    key = m["instance"] or f"{m['ref']}{m['period']}"
+                    if key not in seen:
+                        seen.add(key)
+                        matches.append(m)
+                if len(acts) < 250:
+                    break
+                page += 1
+                log_progress(f"raid:{mid}:{mode}", unit * 40 - 40 + page, nunits * 40,
+                             label=f"/{rname} {disp}",
+                             extra=f"平台 {accts.index((at, am)) + 1}/{len(accts)} · "
+                                   f"角色 {unit}/{nunits} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
+    log_progress(f"raid:{mid}:{mode}", nunits * 40, nunits * 40, label=f"/{rname} {disp}",
                  force=True, extra=f"历史翻取完成，共 {len(matches)} 场，开始统计")
     matches.sort(key=lambda m: m["period"], reverse=True)
     # 展示用北京时间（period 保留 UTC 原值给首日/首周判定）

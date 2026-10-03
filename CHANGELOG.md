@@ -2,6 +2,27 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04（二）raid 卡多账号比对：修「同副本多 hash 求和」+ 跨存档全平台历史合并
+
+- **多账号验证**（5 名榜单玩家 + Wj，覆盖 steam/psn/xbox/epic；对比脚本 `_rtest/multi_compare_raid.py`）：
+  逐副本对「页面 / api.raidreport.dev / 本地卡片」三方比对。
+- **差异根因 ①**：同一副本在 raid.report 里有**多个活动 hash**（原版/重制版/竞赛版等，如克洛塔
+  「标准」37 + 「普通」51），页面的难度行是**求和**（88），合并逻辑原来取 max 导致系统性少算。
+  已改 `_merge_rr_stats` 按 (base,大师) 分组内 **rr_sum 累加**、与官方历史取 max。
+- **差异根因 ②**：raid.report 页面合并同一 bungie 账号**全部平台**的对局（GetMembershipsById），
+  主平台单拉会少算跨存档前的场次（Benson 克洛塔页面 93 vs 主平台 92）。`raid_report()` 现在
+  枚举全部平台 membership，逐平台×角色深翻历史并按 instanceId 去重（无跨存档的玩家零开销）。
+- **验证结果**：Wj raid 卡与 raid.report 页面完全一致（克洛塔 33、KF 42、DSC 84、忧愁王冠 8、
+  最后一愿 15、玻璃拱顶 21+16）；Niko 地牢 11/11 全对；合计 OK 27 / DIFF 6。
+- **剩余 6 处差异（≤4 场）均为 raid.report 自身口径漂移**：页面「总数」与「难度行之和」自相矛盾
+  （Benson 守望者尖塔 总数 122 vs 行和 99）、自家 DB 与页面不同步（Wj 预言 39 vs API 38）、
+  页面 fastest 与 API fastestFullClear 差 45~50s（忧愁王冠 1h18m vs 1h18m45s）。卡片取
+  「官方历史(全平台) 与 rr API 求和 的 max」，只多不少，属更完整口径。
+- **对比脚本的坑**：页面 innerText 解析别用文本启发式剥难度后缀（「永恒沙漠」会被难度词
+  「永恒」整行吞掉）；直接解析 HTML 行结构（`<b>名</b><span class='rdiff'>难度</span>…通关<b>N</b>`，
+  徽章与数字之间**无空格**）。rr 页面数字是前端现算的，抓取要等 `Kills\t数字` 出现；
+  连续导航会让标签页 renderer 崩掉（`document.body` 变 null），每页新开标签抓完即关。
+
 ## 2026-10-04 `/raid` `/地牢` 通关数对齐 raid.report + 最右列改「最快全程」
 
 - **现象（用户报）**：卡片数据跟 raid.report 对不上（深岩墓室 56 vs 84、忧愁王冠 1 vs 8、
