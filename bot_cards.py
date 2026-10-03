@@ -800,18 +800,31 @@ _W2_PAL = ["#4b8fd4", "#c9a227", "#35c66b", "#9b6bd4", "#d0603f"]
 
 
 def _recoil_gauge(v) -> str:
-    """游戏内同款后坐方向半圆仪表：自右端起按 v/100 逆时针填充实心扇形，
-    100=满半圆（完全竖直），缺口方向即水平漂移方向。"""
+    """游戏内同款后坐方向扇形楔（DIM RecoilStat 反推的官方公式）：
+    方向 = sin((v+5)*18°)*(100-v)，正=右偏、负=左偏（每十个数一换边，逢 5 正上），
+    张角随 v 收窄，≥95 收成竖直线。"""
     try:
         v = max(0.0, min(100.0, float(v)))
     except (TypeError, ValueError):
         return ""
-    th = math.radians(v / 100 * 180)
-    x1 = 13 - 11 * math.cos(th)
-    y1 = 13 - 11 * math.sin(th)
-    return ("<svg class='w2-rec' viewBox='0 0 26 14' width='26' height='14'>"
-            "<path d='M2 13A11 11 0 0 1 24 13Z' fill='#24282c'/>"
-            f"<path d='M13 13L24 13A11 11 0 0 0 {x1:.2f} {y1:.2f}Z' fill='#e8e6e3'/></svg>")
+    base = ("<svg class='w2-rec' viewBox='0 0 26 14' width='26' height='14'>"
+            "<path d='M2 13A11 11 0 0 1 24 13Z' fill='#24282c'/>")
+    if v >= 95:
+        return base + "<line x1='13' y1='13' x2='13' y2='2' stroke='#e8e6e3' stroke-width='2'/></svg>"
+    d = math.sin((v + 5) * math.pi / 10) * (100 - v) * 0.8
+    spread = (100 - v) / 100 * 90 * (1 if d >= 0 else -1)
+
+    def pt(a):
+        r = math.radians(a)
+        return 13 + 11 * math.sin(r), 13 - 11 * math.cos(r)
+
+    a1 = max(-90.0, min(90.0, d + spread))
+    a2 = max(-90.0, min(90.0, d - spread))
+    x1, y1 = pt(a1)
+    x2, y2 = pt(a2)
+    sweep = 0 if a1 >= a2 else 1
+    return (base + f"<path d='M13 13L{x1:.2f} {y1:.2f}"
+            f"A11 11 0 0 {sweep} {x2:.2f} {y2:.2f}Z' fill='#e8e6e3'/></svg>")
 
 
 def _mw_name(name) -> str:

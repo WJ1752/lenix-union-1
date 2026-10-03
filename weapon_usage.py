@@ -264,19 +264,18 @@ def _join_plug(h) -> dict | None:
 
 
 def _col_title(orig_title: str, pos: int) -> str:
-    """weapons_full 列标题 → 卡片固定中文标题（特殊槽位保留专名）"""
-    t = orig_title or ""
-    if "起源" in t:
-        return "起源特性"
-    if "特性 1" in t or "特性 2" in t:
-        return t
-    for kw in ("瞄具", "剑刃", "护手", "弓弦", "弓臂", "箭矢", "固定配件"):
-        if kw in t:
-            return kw
-    if "枪管" in t or "发射" in t:
-        return "发射管"
-    if "弹匣" in t or "电池" in t:
-        return "弹匣"
+    """weapons_full 列标题 → 卡片固定中文标题（其余专名原样保留）"""
+    t = (orig_title or "").strip()
+    if t:
+        if "起源" in t:
+            return "起源特性"
+        if "特性" in t:                    # 特性 1/特性 2 已是最终名
+            return t
+        if "枪管" in t or "发射" in t:
+            return "发射管"
+        if "弹匣" in t or "电池" in t:
+            return "弹匣"
+        return t                           # 剑刃/护手/握把/弓弦/瞄具/枪托/核心强化… 直接用本地列名
     return ["发射管", "弹匣", "特性 1", "特性 2", "起源特性"][pos if pos < 5 else 4]
 
 
@@ -760,14 +759,17 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
     except Exception:  # noqa: BLE001
         return None
     wf_cols = ((_wf_pools or {}).get(str(h)) or {}).get("cols") or []
+    # 异域内在 perk 池：light.gg 社区统计最前面多一列「异域特性变体」，本地列没有，
+    # 按位置硬对齐会整体错位一列，因此各列先按 hash 重叠匹配本地列
+    intr = {str(i.get("hash")) for i in (((_wf(h) or {}).get("plugs") or {}).get("intrinsic") or [])
+            if isinstance(i, dict) and i.get("hash")} if _wf(h) else set()
+    used: set[int] = set()
 
     out_cols = []
     trait_cols: list[list[dict]] = []
     for j, pairs in cols:
         if not pairs:
             continue
-        orig = wf_cols[j][0] if j < len(wf_cols) else ""
-        title = _col_title(orig, j)
         plugs = []
         for hsh, pct in pairs:
             meta = _join_plug(hsh)
@@ -777,9 +779,60 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
         if not plugs:
             continue
         plugs.sort(key=lambda x: -x["pct"])
+        best, bestn = None, 0
+        for k, (_, hs) in enumerate(wf_cols):
+            if k in used:
+                continue
+            n = sum(1 for hsh, _ in pairs if str(hsh) in hs)
+            if n > bestn:
+                best, bestn = k, n
+        if best is not None and bestn:
+            used.add(best)
+            title = _col_title(wf_cols[best][0], best)
+        elif intr and sum(1 for hsh, _ in pairs if str(hsh) in intr) >= max(1, len(pairs) // 2):
+            title = "异域特性"
+        else:
+            # 本地列匹配不上：按插件名的槽位后缀识别（要求 ≥60% 命中，避免把
+            # 「枪管收缩装置」这类特性误判成发射管），再退位置默认
+            names = [p["name"] or "" for p in plugs]
+            n = max(1, len(names))
+
+            def _ratio(suffixes, contains=()):
+                hit = sum(1 for s in names
+                          if s.endswith(suffixes) or any(c in s for c in contains))
+                return hit / n
+
+            if _ratio(("枪托",)) >= 0.6:
+                title = "枪托"
+            elif _ratio(("弹匣", "弹药", "子弹")) >= 0.6:
+                title = "弹匣"
+            elif _ratio(("膛线", "枪管", "枪膛", "制退器", "收束器", "枪口")) >= 0.6:
+                title = "发射管"
+            else:
+                title = _col_title("", j)
+        # 框架插槽（异域刀剑可选框架等）名字都带「框架」，本地列却按兜底标成「特性 N」
+        if title.startswith("特性") and sum(1 for p in plugs if "框架" in (p["name"] or "")) >= max(1, -(-len(plugs) * 3 // 5)):
+            title = "框架"
         out_cols.append({"title": title, "plugs": plugs})
-        if "特性" in title:
+        if title.startswith("特性"):
             trait_cols.append(plugs)
+
+    # 光.gg 没有统计的可选列（催化改装：单人合唱/零号修订等塑形异域的催化插槽）
+    # 也注入进卡片，否则 perk 区少一列、组合配不到它
+    for k, (t, hs) in enumerate(wf_cols):
+        if k in used or t != "催化":
+            continue
+        plugs = []
+        for hsh in hs:
+            meta = _join_plug(hsh)
+            if meta and not meta["name"].startswith("空"):
+                plugs.append({"hash": int(hsh), "name": meta["name"], "icon": meta["icon"]})
+        if len(plugs) >= 2:
+            col = {"title": "催化", "plugs": plugs}
+            # 游戏内催化插槽在特性之后、枪托之前
+            idx = next((i for i, c in enumerate(out_cols) if c["title"] == "枪托"), len(out_cols))
+            out_cols.insert(idx, col)
+            break
 
     def side(pairs):
         rows = []
@@ -802,6 +855,25 @@ def _build_contract(h: int, raw: dict, source: str) -> dict | None:
         combos.append({"names": [ma["name"], mb["name"]], "icons": [ma["icon"], mb["icon"]],
                        "pct": round(pct, 2)})
     combos.sort(key=lambda x: -x["pct"])
+    # 组合若配在「固定 100% 单选项列」上（如单人合唱的狂热长矛，唯一选项必然 100%），
+    # 这些 pct 实际只是另一列的边际分布；武器若还有无统计的可选催化列，
+    # 按游戏内真实的可变列重算为 催化 × 该列（均分，无真实联合数据）
+    single_cols = [c for c in out_cols if len(c["plugs"]) == 1 and (c["plugs"][0].get("pct") or 0) >= 100]
+    cat_col = next((c for c in out_cols if c["title"] == "催化" and len(c["plugs"]) >= 2), None)
+    if combos and single_cols and cat_col:
+        fixed_names = {p["name"] for c in single_cols for p in c["plugs"]}
+        if all(c["names"][0] in fixed_names or c["names"][1] in fixed_names for c in combos):
+            combo_names = {n for cc in combos for n in cc["names"]}
+            other = next((c for c in out_cols
+                          if c is not cat_col and len(c["plugs"]) >= 2
+                          and any(p["name"] in combo_names for p in c["plugs"])), None)
+            if other and other["plugs"] and all(p.get("pct") is not None for p in other["plugs"]):
+                n_cat = len(cat_col["plugs"])
+                combos = [{"names": [cp["name"], op["name"]],
+                           "icons": [cp["icon"], op["icon"]],
+                           "pct": round(op["pct"] / n_cat, 2)}
+                          for op in other["plugs"] for cp in cat_col["plugs"]]
+                combos.sort(key=lambda x: -x["pct"])
     combos = combos[:8]
     if not combos and len(trait_cols) >= 2:            # 没有真实数据 → 两列 pct 独立乘积估算
         prods = []

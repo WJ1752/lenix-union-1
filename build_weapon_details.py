@@ -341,7 +341,12 @@ for h, it in items.items():
             elif "origins" in low:
                 label = "起源特性"
                 sock.append(info)
-            elif "traits" in low or "frames" in low:
+            elif "frames" in low:
+                # 异域武器的框架插槽可选（如故我在的波形/涡流/铸造者框架），
+                # 按游戏内叫法单独立列，别混进「特性 N」
+                label = "框架" if is_exotic else ""
+                sock.append(info)
+            elif "traits" in low:
                 sock.append(info)
             else:
                 buckets["mods"].append(info)
@@ -399,6 +404,31 @@ for h, it in items.items():
         infos = _merge_catalysts(infos, dp["name"])
         if infos:
             buckets["catalysts"] = infos
+
+    # 塑形异域的「催化插槽」（空催化插槽 + N 个 XX改装，游戏内可选）：这些插件的类目
+    # 带 catalysts 被收进了催化桶，但它们同时是真正的可选 perk 列（单人合唱等），
+    # 不补列的话 perk 区少一列、社区组合也只能配到固定特性上
+    if is_exotic and not any(c.get("t") == "催化" for c in cols):
+        for se in it.get("sockets", {}).get("socketEntries", []):
+            seth = se.get("reusablePlugSetHash") or se.get("randomizedPlugSetHash")
+            ps = plugset_map.get(str(seth) if str(seth) in plugset_map else seth) or []
+            hashes = [p.get("plugItemHash") for p in ps]
+            names = [(plug_info(ph) or {}).get("n") or "" for ph in hashes]
+            if not any(n == "空催化插槽" for n in names):
+                continue
+            cat_items = []
+            for ph in hashes:
+                info = plug_info(ph)
+                if not info or (info.get("n") or "").startswith("空"):
+                    continue
+                info.pop("cat", None)
+                cat_items.append(info)
+            if len(cat_items) < 2:
+                continue
+            col = {"t": "催化", "items": cat_items}
+            idx = next((i for i, c in enumerate(cols) if c.get("t") == "枪托"), len(cols))
+            cols.insert(idx, col)
+            break
 
     # 去重：列内按名字去重，内容完全相同的列只留第一列
     def dedupe(lst):
