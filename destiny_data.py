@@ -3846,3 +3846,252 @@ async def gm_this_week(force: bool = False) -> dict:
             "dest_en": dest_en, "dest_zh": dest_zh}
     _json_cache_save(base, GM_CACHE_FILE, 1, wk, data)
     return data
+
+
+# ---------- 进度点（d2checkpoint.com 尾王存档点，/进度点） ----------
+# 数据源：D2Checkpoint 的 Astro 动作接口（免授权，免登录）：
+#   POST https://d2checkpoint.com/_actions/bots.getBotsFromDb
+# 响应是 devalue 序列化：一个数组当引用图用——A[0] 是 bot 下标列表，对象存成
+# 「{键: 绝对下标}」的模板，值都在数组槽位里（同名键只存一份，去重）。
+# 每个 bot：activityHash（Bungie 活动 hash，0=不在线）+ encounter（该活动关卡下标）。
+# 「可进/满员/离场」走官方 GetProfile components=1000（profileTransitoryData）：
+#   currentActivity.numberOfPlayers < fireteamSize → 有位；≥ → 满员；
+#   transitory 缺失/0 人 → bot 已离场，点位多半没了。
+# 下面的 hash→活动、活动→中文名表抄自 d2checkpoint 前端 bundle（2026-10），
+# 新副本上线若没认出 hash 会回退显示英文名，不影响出卡。
+
+_CP_HASH_EN: dict[int, tuple[str, int]] = {  # hash → (活动英文名, 火队人数)
+    2122313384: ("Last Wish", 6), 2032534090: ("Shattered Throne", 3),
+    1042180643: ("Garden of Salvation", 6), 2582501063: ("Pit of Heresy", 3),
+    1077850348: ("Prophecy", 3), 910380154: ("Deep Stone Crypt", 6),
+    3881495763: ("Vault of Glass", 6), 3022541210: ("Vault of Glass", 6),
+    4078656646: ("Grasp of Avarice", 3), 1112917203: ("Grasp of Avarice", 3),
+    1441982566: ("Vow of the Disciple", 6), 3889634515: ("Vow of the Disciple", 6),
+    2823159265: ("Duality", 3), 3012587626: ("Duality", 3),
+    1374392663: ("King's Fall", 6), 3257594522: ("King's Fall", 6),
+    1262462921: ("Spire of the Watcher", 3), 2296818662: ("Spire of the Watcher", 3),
+    2381413764: ("Root of Nightmares", 6), 2918919505: ("Root of Nightmares", 6),
+    313828469: ("Ghosts of the Deep", 3), 2716998124: ("Ghosts of the Deep", 3),
+    107319834: ("Crota's End", 6), 1507509200: ("Crota's End", 6),
+    2004855007: ("Warlord's Ruin", 3), 2534833093: ("Warlord's Ruin", 3),
+    1541433876: ("Salvation's Edge", 6), 4129614942: ("Salvation's Edge", 6),
+    300092127: ("Vesper's Host", 3), 4293676253: ("Vesper's Host", 3),
+    3834447244: ("Sundered Doctrine", 3), 3521648250: ("Sundered Doctrine", 3),
+    4046934917: ("Spire of the Watcher", 3), 3339002067: ("Spire of the Watcher", 3),
+    2961030534: ("Ghosts of the Deep", 3), 124340010: ("Ghosts of the Deep", 3),
+    715153594: ("Prophecy", 3), 3193125350: ("Prophecy", 3),
+    1044919065: ("The Desert Perpetual", 6), 2727361621: ("Equilibrium", 3),
+    1516551982: ("Pantheon: Calus Resplendent", 6),
+    2530656885: ("Pantheon: Morgeth Surpassing", 6),
+    747671496: ("Pantheon: Insurrection Prime Revolutionary", 6),
+}
+
+# 活动英文名 → (中文名, 类别, 关卡中文名列表)（关卡顺序与 encounterList 下标对齐）
+_CP_ACT_CN: dict[str, tuple[str, str, list[str]]] = {
+    "Last Wish": ("最后一愿", "raid",
+                  ["卡莉", "舒罗-祈", "莫瑞斯", "玉匣", "瑞文", "女王行走"]),
+    "Garden of Salvation": ("救赎花园", "raid",
+                            ["神圣心智·躲避", "神圣心智·召唤", "神圣心智", "圣洁心智"]),
+    "Deep Stone Crypt": ("深岩墓室", "raid",
+                         ["密码保险库", "阿特拉克斯-1", "下降通道", "塔尼克"]),
+    "Vault of Glass": ("玻璃拱顶", "raid",
+                       ["汇流点", "预言者", "圣殿骑士", "石像鬼", "闸门看守", "阿塞恩"]),
+    "Vow of the Disciple": ("门徒誓约", "raid", ["夺取", "守墓人", "倾覆者", "鲁尔克"]),
+    "King's Fall": ("国王的陨落", "raid",
+                    ["大殿", "战争祭司", "戈尔戈罗斯", "奥尔里克斯之女", "奥里克斯"]),
+    "Root of Nightmares": ("梦魇根源", "raid", ["灾变", "分裂", "宏观宇宙", "涅扎瑞克"]),
+    "Crota's End": ("克洛塔的末日", "raid", ["深渊", "王魂桥", "伊·尤特", "克洛塔"]),
+    "Salvation's Edge": ("救赎的边缘", "raid",
+                         ["地基", "耗散", "宝库", "维尔提", "见证者"]),
+    "The Desert Perpetual": ("永恒沙漠", "raid", ["科雷戈斯"]),
+    "Shattered Throne": ("破碎王座", "dungeon", ["厄瑞玻斯", "沃格斯", "杜尔·因卡鲁"]),
+    "Pit of Heresy": ("异端深渊", "dungeon",
+                      ["死灵之城", "绝望隧道", "苦难之厅", "圣所", "祖尔马克"]),
+    "Prophecy": ("预言", "dungeon",
+                 ["天堂-地狱", "方阵回声", "荒原", "六面体", "死海", "族长回声"]),
+    "Grasp of Avarice": ("贪婪之握", "dungeon",
+                         ["天空守望", "锈蚀跳板", "弗利兹亚", "飙车段", "护盾破坏", "大盗阿瓦罗克"]),
+    "Duality": ("二象性", "dungeon", ["梦魇加尔兰", "解封玉匣", "梦魇卡塔尔"]),
+    "Spire of the Watcher": ("守望者尖塔", "dungeon", ["攀塔", "阿克勒斯", "珀西斯"]),
+    "Ghosts of the Deep": ("深渊机灵", "dungeon", ["巢族仪式", "埃克萨", "西玛玛"]),
+    "Warlord's Ruin": ("战争领主的废墟", "dungeon", ["拉斯尔", "风暴关", "赫夫德的复仇"]),
+    "Vesper's Host": ("晚星之主", "dungeon",
+                      ["韦斯珀站", "统一雷内克斯", "腐化傀儡", "破冰者催化"]),
+    "Sundered Doctrine": ("分离教义", "dungeon", ["阿斯福德尔", "生命之锁", "被抹除者克雷夫"]),
+    "Equilibrium": ("平衡", "dungeon", ["", "", "", "最终 Boss"]),
+    "Pantheon: Calus Resplendent": ("众神殿：辉煌卡鲁斯", "pantheon",
+                                    ["阿尔戈斯", "加尔兰", "卡鲁斯"]),
+    "Pantheon: Morgeth Surpassing": ("众神殿：超越摩格斯", "pantheon",
+                                     ["战争祭司", "神圣心智", "摩格斯"]),
+    "Pantheon: Insurrection Prime Revolutionary": ("众神殿：革命暴动首领", "pantheon",
+                                                   ["起义至尊"]),
+}
+# 卡片排序：突袭（按发售序）→ 地牢 → 万神殿
+_CP_KIND_ORDER = {"raid": 0, "dungeon": 1, "pantheon": 2}
+_CP_ACT_ORDER = ("最后一愿", "救赎花园", "深岩墓室", "玻璃拱顶", "门徒誓约", "国王的陨落",
+                 "梦魇根源", "克洛塔的末日", "救赎的边缘", "永恒沙漠",
+                 "破碎王座", "异端深渊", "预言", "贪婪之握", "二象性", "守望者尖塔",
+                 "深渊机灵", "战争领主的废墟", "晚星之主", "分离教义", "平衡",
+                 "众神殿：革命暴动首领", "众神殿：辉煌卡鲁斯", "众神殿：超越摩格斯")
+_CP_MEMO: dict = {}          # {"at": 时间戳, "data": …} 进程内 90 秒缓存
+_CP_URL = "https://d2checkpoint.com/_actions/bots.getBotsFromDb"
+_CP_TTL = 90
+_ACTS_CACHE: dict | None = None
+
+
+def _acts_manifest() -> dict:
+    """manifest_index/activities.json（官方 DestinyActivityDefinition 精简表：
+    hash → {name: 官方中文名, pgcr/icon: 官方活动图}），本进程内只读一次"""
+    global _ACTS_CACHE
+    if _ACTS_CACHE is None:
+        try:
+            _ACTS_CACHE = json.load(open(_idx_file("activities.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _ACTS_CACHE = {}
+    return _ACTS_CACHE
+
+
+def _parse_devalue_bots(payload) -> list[dict]:
+    """devalue 数组式引用图 → bot 字典列表。根在 A[0]，对象是「{键: 绝对下标}」模板。"""
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError("响应不是 devalue 数组")
+    A = payload
+
+    def deref(i, seen=frozenset()):
+        if not isinstance(i, int) or not (0 <= i < len(A)) or i in seen:
+            return None
+        v = A[i]
+        if isinstance(v, dict):
+            return {k: deref(j, seen | {i}) for k, j in v.items()}
+        if isinstance(v, list):
+            return [deref(j, seen | {i}) for j in v]
+        return v
+
+    root = deref(0)
+    if isinstance(root, dict):
+        root = [root]
+    bots = [b for b in (root or []) if isinstance(b, dict) and b.get("name")]
+    if not bots:
+        raise RuntimeError("devalue 里解析不出 bot 列表")
+    return bots
+
+
+async def _web_post_json(url: str, payload) -> object:
+    """第三方 POST/JSON（独立客户端，不把 Bungie API Key 带出去；带浏览器头防拦）"""
+    loop = asyncio.get_running_loop()
+    c = _WEB_CLIENTS.get(loop)
+    if c is None or c.is_closed:
+        c = httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/126.0.0.0 Safari/537.36"},
+            timeout=20, follow_redirects=True)
+        _WEB_CLIENTS[loop] = c
+    r = await c.post(url, json=payload, headers={
+        "Accept": "application/json", "Content-Type": "application/json",
+        "Origin": "https://d2checkpoint.com", "Referer": "https://d2checkpoint.com/"})
+    r.raise_for_status()
+    return r.json()
+
+
+@_traced("进度点")
+async def fetch_checkpoints(force: bool = False) -> dict:
+    """d2checkpoint.com 在线 bot 的尾王点位 + 官方接口核对「可进/满员/离场」。
+
+    返回 {"ok", "rows": [{bot, act, act_en, boss, kind, kind_cn, state, players,
+                          fireteam, encounter}], "ts"}；网络/解析失败抛异常由指令层兜底。
+    state：ready=有位（绿） / full=满员（灰） / gone=已离场（灰） / unknown=核对失败。"""
+    now = time.time()
+    if not force and _CP_MEMO.get("at") and now - _CP_MEMO["at"] < _CP_TTL:
+        return _CP_MEMO["data"]
+    payload = await _web_post_json(_CP_URL, {})
+    bots = _parse_devalue_bots(payload)
+    rows: list[dict] = []
+    for b in bots:
+        try:
+            h = int(b.get("activityHash") or 0)
+        except (TypeError, ValueError):  # noqa: PERF203
+            continue
+        if h == 0:                            # 不在线的 bot 不上卡
+            continue
+        en, fireteam = _CP_HASH_EN.get(h) or (f"活动 {h}", 6)
+        zh, kind, encs = _CP_ACT_CN.get(en) or (en, "raid" if fireteam >= 6 else "dungeon", [])
+        idx = int(b.get("encounter") or 0)
+        boss = encs[idx] if 0 <= idx < len(encs) and encs[idx] else ""
+        stage = ("尾王" if (encs and idx == len(encs) - 1) else f"第{idx + 1}关")
+        # 活动名/图标用官方 manifest（Pantheon 官方译名是「众神殿：…」这类，别自己音译）
+        am = _acts_manifest().get(str(h)) or {}
+        act = str(am.get("name") or "").split(":")[0].strip() or zh
+        img = str(am.get("pgcr") or am.get("icon") or "")
+        rows.append({"bot": b["name"], "act": act, "act_en": en, "boss": boss,
+                     "stage": stage, "img": img,
+                     "kind": kind, "kind_cn": {"raid": "突袭", "dungeon": "地牢",
+                                               "pantheon": "万神殿"}[kind],
+                     "fireteam": fireteam, "players": 0, "state": "unknown",
+                     "encounter": idx, "membership_id": str(b.get("membershipId") or "")})
+    rows.sort(key=lambda r: (_CP_KIND_ORDER.get(r["kind"], 9),
+                             _CP_ACT_ORDER.index(r["act"]) if r["act"] in _CP_ACT_ORDER else 99,
+                             r["encounter"]))
+    # 逐 bot 核对实时状态（官方 transitory：人数 + 是否还在活动里），并发拉省时间
+    sem = asyncio.Semaphore(5)
+
+    async def _status(r: dict):
+        mid = r.get("membership_id") or ""
+        if not mid:
+            return
+        async with sem:
+            try:
+                resp = await client().get(f"/Platform/Destiny2/3/Profile/{mid}/",
+                                          params={"components": "1000"})
+                j = resp.json() if hasattr(resp, "json") else resp
+                td = (((j or {}).get("Response") or {}).get("profileTransitoryData") or {})
+                data_ = td.get("data") or {}
+                cur = data_.get("currentActivity") or {}
+                n = int(cur.get("numberOfPlayers") or 0)
+                r["players"] = n
+                if not cur or n <= 0:
+                    r["state"] = "gone"
+                elif n >= r["fireteam"]:
+                    r["state"] = "full"
+                else:
+                    r["state"] = "ready"
+            except Exception:  # noqa: BLE001
+                r["state"] = "unknown"
+
+    await asyncio.gather(*(_status(r) for r in rows))
+    for r in rows:
+        r.pop("membership_id", None)
+    # 已离场/状态没核对上的＝大概率蹭不了，不上榜（用户要求只留能用的）
+    rows = [r for r in rows if r["state"] in ("ready", "full")]
+    data = {"ok": True, "rows": rows, "ts": now}
+    _CP_MEMO.clear()
+    _CP_MEMO.update({"at": now, "data": data})
+    return data
+
+
+def checkpoints_text(data: dict) -> str:
+    """/进度 的可复制文字版（小日向式）：点位行 + 下一行 /j 编号，玩家长按整行复制"""
+    rows = data.get("rows") or []
+    if not rows:
+        return ("当前没有可用进度点（bot 都在休息）\n"
+                "每周三凌晨 1 点周重置后点位最全，稍后再来")
+    dot = {"ready": "🟢", "full": "🟡", "gone": "⚪", "unknown": "⚪"}
+    lines = []
+    for r in rows:
+        st = r.get("state") or "unknown"
+        if st == "ready":
+            n = f"有位 {r.get('players')}/{r.get('fireteam')}"
+        elif st == "full":
+            n = "满员"
+        elif st == "gone":
+            n = "已离场"
+        else:
+            n = "状态未知"
+        pos = r.get("stage") or ""
+        if r.get("boss"):
+            pos = f"{pos}·{r['boss']}"
+        lines.append(f"{dot.get(st, '⚪')} {r['act']} {pos}（{n}）")
+        lines.append(f"/j {r['bot']}")
+    lines.append("——轨道界面聊天框粘贴 /j 进车，进本开打→团灭→退队即存点（本周有效）")
+    return "\n".join(lines)
+

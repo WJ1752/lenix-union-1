@@ -15,8 +15,6 @@ PAGES = [
     ("home.png",     "/",               1400, 900,  2500),
     ("catalog.png",  "/catalog",        1400, 1100, 6000),
     ("perks.png",    "/perks",          1400, 900,  2500),
-    ("dim-inv.png",  "/dim",            1400, 1100, 6000),
-    ("dim-opt.png",  "/dim/optimizer",  1400, 1100, 5000),
     ("panel.png",    "/panel",          1400, 900,  2500),
     ("eververse.png", "/eververse",     1400, 1000, 4000),
     ("rotation.png", "/rotation",       1400, 1000, 4000),

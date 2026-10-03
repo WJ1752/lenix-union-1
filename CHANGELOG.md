@@ -2,6 +2,34 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-03 新指令 `/进度`：d2checkpoint 尾王存档点实时列表
+
+- **功能**：群里发 `/进度`（用户定的触发词；别名 进度机器人/进度点/存档点/checkpoint）
+  回复两条：①**可复制文字**（小日向式：`🟢 最后一愿 第2关·舒罗-祈（有位 2/6）` 下一行
+  整行 `/j CheckpointBot#0422`，玩家长按即可复制去游戏里粘贴）②**紧凑卡片图**（两列
+  并排：官方活动小图 + 官方中文副本名 + 第几关/尾王金色高亮 + 人数，离场行置灰）。
+  数据源与「小日向」同一家（d2checkpoint）。
+- **接口（免授权）**：`POST https://d2checkpoint.com/_actions/bots.getBotsFromDb`
+  ——Astro Actions，路径是**点号**拼接（用斜杠会 500）；响应为 devalue 序列化数组
+  （A[0]=bot 下标列表，对象是「{键: 绝对下标}」模板），`_parse_devalue_bots` 解码。
+  activityHash=0 的 bot 是离场不摆的；encounter 是该活动 encounterList 的下标。
+- **实时状态**：官方 `GetProfile components=1000`（profileTransitoryData）核对每车
+  人数——`numberOfPlayers` 含 bot 自己：≥fireteam=满员，0/缺失=已离场（bot 退出了
+  副本，点位多半没了），其余=有位。并发 5 路拉取，全链路 3~4s；进程内缓存 90s。
+  **已离场/状态没核对上的直接不显示**（用户要求只留能用的车）。
+- **官方译名与图标**：活动中文名/小图直接取 `manifest_index/activities.json`
+  （hash → {name, pgcr, icon}，官方 DestinyActivityDefinition 精简表）——Pantheon
+  官方译名是「众神殿：辉煌卡鲁斯/超越摩格斯/革命暴动首领」，**不要自己音译**
+  （此前手写「万神殿：卡鲁斯」就是错的）；`name` 带「: 标准/: 自定义」尾巴要按
+  ASCII 冒号切掉。pgcr 大图走 card_render 的 inline_icons 自动落盘缓存内联。
+  「第几关/尾王」= encounter 下标 + `_CP_ACT_CN` 关卡表长度（末位=尾王）；关卡
+  中文名仍手写官方译名，认不出的 hash 回退英文名+第N关。
+- **改动**：`destiny_data.fetch_checkpoints()/checkpoints_text()` +
+  `bot_cards.checkpoint_card()`（v2 皮肤两列网格）+ `nonebot_plugins/destiny2.py`
+  注册 `/进度`（先 `matcher.send` 文字再发图——`_reply` 会 finish 掉处理器不能复用）；
+  帮助卡「资料」行补 `/进度`。官方 QQ 通道同样可查（被动回复）。
+
+
 ## 2026-10-03 程序退出带走 NapCat + 面板授权态补「刷新 Token / 重新授权」+ 部署落点限死工作区
 
 - **NapCat 随程序关闭**：`napcat_runtime` 注册 atexit——面板窗口关闭（`webview.start()`

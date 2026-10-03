@@ -468,6 +468,9 @@ xur_query = on_command("老九", aliases={"仄", "d2老九", "xur", "Xur", "XUR"
                        priority=8, block=True, force_whitespace=True)
 rot_query = on_command("轮换", aliases={"本周轮换", "d2轮换", "突袭轮换", "raid轮换"},
                        priority=8, block=True, force_whitespace=True)
+cp_query = on_command("进度", aliases={"进度机器人", "进度点", "存档点", "checkpoint",
+                                      "d2进度", "d2进度点"},
+                      priority=8, block=True, force_whitespace=True)
 filter_query = on_command("武器筛选", aliases={"d2武器筛选", "d2筛选", "筛选武器"},
                           priority=8, block=True, force_whitespace=True)
 
@@ -774,6 +777,33 @@ async def _(event: Event):
         ls = {"ok": False}
     await _send_card(rot_query, event, bot_cards.rotation_card(rot, d2.distortion_now(), ls, gm),
                      "本周轮换", "本周轮换数据获取失败")
+
+
+# ---------- 进度：/进度（d2checkpoint.com 尾王存档点实时列表） ----------
+# 先发一条可复制的文字（小日向式：点位行 + /j CheckpointBot#编号 整行可长按复制），
+# 再跟一张紧凑卡片图。_reply/_reply_image 都会 finish 结束处理器，所以文字用 matcher.send。
+@cp_query.handle()
+async def _(event: Event):
+    if not _allowed_group(event):
+        return
+    try:
+        data = await d2.fetch_checkpoints()
+    except Exception as exc:  # noqa: BLE001
+        await _notice(cp_query, event, "进度获取失败",
+                      [f"d2checkpoint.com 暂时不可用：{_exc_msg(exc)}"],
+                      kind="err", fallback=f"进度获取失败：{_exc_msg(exc)}")
+        return
+    text = d2.checkpoints_text(data)
+    _log_out(event, text)
+    try:
+        await cp_query.send(_at_sender(event, bp.text_seg(event, text)))
+    except FinishedException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log_out(event, f"[发送失败] 进度文字：{exc}")
+    if data.get("rows"):
+        await _send_card(cp_query, event, bot_cards.checkpoint_card(data),
+                         "进度", "进度数据获取失败")
 
 
 # ---------- 掉落表：/掉落 克洛塔、/ron掉落、/ce掉落 …（Saya 掉落图） ----------

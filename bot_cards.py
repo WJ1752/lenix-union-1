@@ -587,7 +587,7 @@ def help_card() -> str:
         cat("玩家", f"{c('/玩家')} {c('/生涯')} {c('/raid')} {c('/地牢')} {c('/pvp')} {c('/pve')} {c('/智谋')} {c('/队伍')}") +
         cat("记录", f"{c('/战绩')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
             "pvp 版同理") +
-        cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲查询 护甲名')} {c('/护甲套装')} {c('/每日光尘')} {c('/老九')} {c('/轮换')}") +
+        cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲查询 护甲名')} {c('/护甲套装')} {c('/每日光尘')} {c('/老九')} {c('/轮换')} {c('/进度')}") +
         cat("掉落表", f"{c('/掉落 副本名')}", "裸指令也行：/二象性掉落、/ron掉落…，发 /掉落 看列表") +
         cat("武器筛选", f"{c('/武器筛选 关键词…')}", "空格分隔多词，例：/武器筛选 主手 锻造 微冲 900") +
         cat("账号", f"{c('/绑定 玩家名#1234')} {c('/我的')} {c('/解绑')}") +
@@ -2033,3 +2033,83 @@ def fireteam_card(data: dict) -> str:
             + (rows or "<div class='nt warn'>没拿到成员数据</div>")
             + f"<div class='foot'>{foot}</div>")
     return _page(body)
+
+
+# ---------- /进度（d2checkpoint.com 尾王存档点） ----------
+
+_CP_CSS = """
+.cp-list{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}
+.cp-row{display:flex;align-items:center;gap:11px;background:rgba(255,255,255,.045);
+        border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:8px 11px;min-width:0}
+.cp-img{width:48px;height:48px;border-radius:8px;object-fit:cover;flex:none;
+        background:#1a1a1a;border:1px solid rgba(255,255,255,.08)}
+.cp-main{flex:1;min-width:0}
+.cp-act{font-size:16px;font-weight:700;color:#f0f0f0;white-space:nowrap;
+        overflow:hidden;text-overflow:ellipsis}
+.cp-sub{font-size:13px;color:#a8a8a8;margin-top:2px;white-space:nowrap;
+        overflow:hidden;text-overflow:ellipsis}
+.cp-sub .gw{color:#e6d9a8;font-weight:700}
+.cp-n{flex:none;font-size:15px;font-weight:700;color:#9a9a9a}
+.cp-n.ok{color:#3ddc7a}
+.cp-n.warn{color:#e0a53a}
+.cp-row.dim{opacity:.55}
+.cp-tip{font-size:14px;line-height:1.7;color:#c9c9c9;background:rgba(255,255,255,.035);
+        border:1px dashed rgba(255,255,255,.16);border-radius:10px;padding:10px 14px;margin-top:2px}
+.cp-tip code{color:#e6d9a8;background:rgba(0,0,0,.4);border-radius:5px;padding:1px 6px}
+.cp-tip b{color:#f0f0f0}
+"""
+
+
+def checkpoint_card(data: dict) -> str:
+    """进度点紧凑卡：两列并排小卡（官方活动小图 + 副本 + 第几关/尾王 + 人数）；
+    /j 指令在随行的文字消息里可复制"""
+    import time as _time
+    rows = data.get("rows") or []
+    ready_n = sum(1 for r in rows if r.get("state") == "ready")
+    if rows:
+        items = []
+        for r in rows:
+            st = r.get("state") or "unknown"
+            act, boss = r.get("act") or "", r.get("boss") or ""
+            stage = r.get("stage") or ""
+            if boss:
+                pos = (f"<span class='gw'>{esc(stage)}</span> · {esc(boss)}"
+                       if stage == "尾王" else f"{esc(stage)} · {esc(boss)}")
+            else:
+                pos = f"<span class='gw'>{esc(stage)}</span>" if stage == "尾王" else esc(stage)
+            if st == "ready":
+                n, ncls = f"{r.get('players')}/{r.get('fireteam')}", "ok"
+            elif st == "full":
+                n, ncls = "满员", "warn"
+            elif st == "gone":
+                n, ncls = "离场", ""
+            else:
+                n, ncls = "未知", ""
+            dot = {"ready": "ready", "full": "full", "gone": "gone"}.get(st, "")
+            img = r.get("img") or ""
+            img_tag = (f"<img class='cp-img' src='{esc(img)}'>" if img
+                       else "<span class='cp-img'></span>")
+            dim = " dim" if st in ("gone", "unknown") else ""
+            items.append(
+                f"<div class='cp-row{dim}'>{img_tag}"
+                f"<div class='cp-main'><div class='cp-act'>{esc(act)}</div>"
+                f"<div class='cp-sub'>{pos}</div></div>"
+                f"<span class='cp-n {ncls}'>{esc(n)}</span></div>")
+        rows_html = f"<div class='cp-list'>{''.join(items)}</div>"
+    else:
+        rows_html = ("<div class='nt warn'>当前没有可用进度点（bot 都在休息）"
+                     "<br><span style='font-size:14px'>每周三凌晨 1 点周重置后点位最全，稍后再来</span></div>")
+    ts = data.get("ts") or 0
+    when = _time.strftime("%H:%M", _time.localtime(ts)) if ts else ""
+    sub = (f"D2Checkpoint 实时尾王点位 · 可进 <b>{ready_n}</b>/共 {len(rows)} 个"
+           + (f" · {when} 核对" if when else ""))
+    body = (f"<style>{_CP_CSS}</style>"
+            f"<div class='nt'>进度<span style='font-weight:400;font-size:14px;margin-left:12px'>{sub}</span></div>"
+            + rows_html
+            + "<div class='cp-tip'>"
+              "<b>进车</b>：轨道界面聊天框粘贴上方文字里的 <code>/j</code> 指令；"
+              "进本开打 → 团灭 → 退队即存点（周重置前有效）；挤不进去＝满员，换绿点的"
+              "</div>"
+            + "<div class='foot'>命运2 查询 · 点位数据 d2checkpoint.com · 只显示能用（有位/满员）的车</div>")
+    return _page(body)
+

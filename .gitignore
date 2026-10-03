@@ -95,3 +95,10 @@ qq_official_menu_backup.json
 
 # 模糊搜索的玩家索引（运行期生成，含玩家名）
 /seen_players.json
+
+# ===== _rtest 一次性产物（探针日志 / HTML/PNG 转储 / 构建日志）=====
+_rtest/*.log
+_rtest/*.html
+_rtest/*.png
+_rtest/_build_log*.txt
+_rtest/tmp_manifest/
