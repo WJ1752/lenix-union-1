@@ -62,7 +62,9 @@ async def _token_job() -> None:
     if left > TOKEN_REFRESH_AHEAD:
         return
     try:
-        await bungie_auth.access_token()
+        # 必须带提前量：access_token() 默认把缓存 token 用到最后一刻才刷，
+        # 不传参的话这个「临期续期」任务永远只返回旧 token，一次也不会真刷
+        await bungie_auth.access_token(refresh_ahead=TOKEN_REFRESH_AHEAD)
         print(f"[sched] Bungie token 已续期（上次剩余 {left/60:.0f} 分钟）")
     except Exception as exc:  # noqa: BLE001
         print(f"[sched] Bungie token 刷新失败（去面板重新授权前先别急）："

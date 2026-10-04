@@ -270,8 +270,12 @@ def _lock():
     return _refresh_lock["lock"]
 
 
-async def access_token() -> str:
+async def access_token(refresh_ahead: int = 0) -> str:
     """取一个有效的 access token（过期就地刷新）；未授权返回空串。
+
+    refresh_ahead：剩余寿命不足该秒数就提前刷新（0=用到最后一刻）。
+    调度器传 3600 做「临期 1 小时保活」——否则本函数会一直返回缓存旧 token，
+    调度器的提前续期等于白调，面板上 token 总是拖到过期才恢复。
 
     刷新失败不再吞掉：Bungie 的 refresh_token 是一次性的，且偶发返回非 JSON 的
     错误页，此前吞掉会让上层误报「未授权」；这里抛出真实原因，并把失败时正在
@@ -280,13 +284,13 @@ async def access_token() -> str:
     t = _load()
     if not t:
         return ""
-    if t.get("access_token") and time.time() < t.get("expires_at", 0):
+    if t.get("access_token") and time.time() + refresh_ahead < t.get("expires_at", 0):
         return t["access_token"]
     if not t.get("refresh_token"):
         return t.get("access_token", "")
     async with _lock():
         t = _load()          # 锁内重读：别的请求可能刚刷新完
-        if t.get("access_token") and time.time() < t.get("expires_at", 0):
+        if t.get("access_token") and time.time() + refresh_ahead < t.get("expires_at", 0):
             return t["access_token"]
         try:
             d = await _token_call({"grant_type": "refresh_token",
