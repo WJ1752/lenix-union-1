@@ -2,6 +2,35 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 后台调度器：每日预取 + token 保活 + 新轮换群推送 + 图标缓存清理
+
+- **新模块 `bot_scheduler.py`**：常驻 daemon 线程，每 30 分钟一个 tick，协程全部投递到
+  nonebot 驱动循环（`bot_runtime._serve` 里 `driver.on_bot_connect` 钩子把
+  `asyncio.get_running_loop()` 交给它，协议端每次重连幂等重挂）。不引 APScheduler，
+  sleep 循环够用少一个依赖。
+- **每日预取**：光尘商店 / 遗失区域 / 轮换 / 宗师 / 老九五类缓存定时预热——这些缓存键
+  按日（每天 1 点）/按周（周三 1 点）翻转，tick 里不带 force 重调即可，键没换是纯内存/
+  落盘命中近零成本，换了键就把新一轮拉好，用户首次查询从十几秒抖动变秒回。
+  未授权（BungieAuthRequired）静默跳过等面板授权。
+- **token 保活**：`expires_at` 剩余不足 1 小时就调 `bungie_auth.access_token()` 续期，
+  失败打 `[sched]` 日志提示去面板重新授权。原有按需刷新（带锁+重试）保留不动。
+- **新轮换推送**：`rotation_week_key()` 算最近周三 01:00 的 ISO 日期当周期键；与
+  bot_config.json 的 `rot_push_day` 不同 → 渲染 `bot_cards.rotation_card` 完整卡推给
+  `enabled_groups`（含扭曲星球/宗师/遗失区域附属板块，单板块失败不挡主卡）。只走
+  NapCat 通道（官方机器人只有 5 分钟被动窗口发不了主动消息）；**enabled_groups 为空
+  不推**（它兼作指令白名单，「空=所有群」对推送不可枚举）。推送成功才写
+  `rot_push_day`，取数据失败/NapCat 未连接下个 tick 重试，exe 中途重启自动补推。
+  推送记录进 bot_log（面板消息日志可见）。
+- **icon_cache 清理（card_render.cleanup_icon_cache）**：bot_runtime.start() 时执行，
+  两级哈希子目录 walk 递归——先删 45 天未用的，再按最久未用补删到 800 个以内，删了
+  多少打一行日志。此前只写不删（内容寻址安全但 19MB 起步无限涨）。
+- **吞异常补日志**：配置/凭证路径上的裸 `except: return` 拆开——文件不存在是常态
+  静默，其余（JSON 损坏等）打 `[bot]`/`[platform]`/`[auth]` 日志按默认值继续
+  （bot_runtime official_creds/load_config/max_concurrency、bot_platform._cfg、
+  bungie_auth._load/_save）。
+- **核实**：`.gitignore` 已完备（`*_cache.json`/dist_*/icon_cache 均已排除），无需改。
+  本地验证：py_compile 全过；rotation_week_key 边界 5 用例（周三 0:30 归上周、1:00 归新周等）全对。
+
 ## 2026-10-04 面板新增「运行状态」页：进程资源实时监控 + 并发上限可调
 
 - **动机**：用户希望后台能看到机器人实时占用（CPU/内存/网络），且能把并发压低以减少对电脑的影响。

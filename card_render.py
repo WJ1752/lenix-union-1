@@ -20,6 +20,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 import weakref
 
 import bot_runtime
@@ -40,6 +41,49 @@ _ICON_DIR = os.path.join(_base_dir(), "icon_cache")
 _ICON_URL = re.compile(r"https://www\.bungie\.net/[A-Za-z0-9_./\-]+")
 _ICON_MIME = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
               ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+# 内容寻址缓存只写不删会一直涨；启动时清一次：单文件过期 + 总量兜底。
+_ICON_KEEP_DAYS = 45
+_ICON_MAX_FILES = 800
+
+
+def cleanup_icon_cache(keep_days: int = _ICON_KEEP_DAYS,
+                       max_files: int = _ICON_MAX_FILES) -> None:
+    """启动时清理图标缓存：先删超过 keep_days 天没用过的，不够再按最久未用
+    补删到 max_files 以内。目录是两级哈希子目录，walk 着收。"""
+    try:
+        cutoff = time.time() - keep_days * 86400
+        entries = []                                  # (mtime, size, path)
+        for root, _dirs, files in os.walk(_ICON_DIR):
+            for name in files:
+                p = os.path.join(root, name)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, p))
+    except OSError:
+        return
+    dead = [e for e in entries if e[0] < cutoff]
+    victims = set(e[2] for e in dead)
+    if len(entries) - len(dead) > max_files:
+        for e in sorted(entries):
+            if e[2] in victims:
+                continue
+            victims.add(e[2])
+            if len(entries) - len(victims) <= max_files:
+                break
+    if not victims:
+        return
+    freed = 0
+    for p in victims:
+        try:
+            freed += os.stat(p).st_size
+            os.remove(p)
+        except OSError:
+            continue
+    print(f"[icons] 图标缓存清理：删 {len(victims)} 个文件，释放 {freed/1048576:.1f} MB"
+          f"（现存 {len(entries) - len(victims)} 个）")
 _ICONS: dict[str, str] = {}          # url → data URI（进程内）
 _ICON_MISS: set[str] = set()         # 拉不到的，本次进程别再试
 _ICON_LIMIT = 8                      # 并发下载数

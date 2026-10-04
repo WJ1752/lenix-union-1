@@ -10,6 +10,7 @@
   {"enabled_groups": ["123456"]}   # NapCat 群白名单（QQ 群号），空 = 所有群都响应
   {"official_groups": ["4A7B47…"]} # 官方群白名单（group_openid），空 = 全部响应
 """
+import asyncio
 import json
 import os
 import socket
@@ -38,7 +39,10 @@ def official_creds() -> tuple[str, str] | None:
     """官方机器人 AppID/AppSecret；没配或还是占位文本时返回 None"""
     try:
         data = json.load(open(CREDS_FILE, encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        return None                # 没配官方通道是常态
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] {CREDS_FILE} 读取失败（将按未配置处理）：{type(exc).__name__}: {exc}")
         return None
     appid = str(data.get("appid") or "").strip()
     secret = str(data.get("secret") or "").strip()
@@ -50,7 +54,10 @@ def official_creds() -> tuple[str, str] | None:
 def load_config() -> dict:
     try:
         return json.load(open(CONFIG_FILE, encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        return {}                  # 首次运行还没有配置文件
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] {CONFIG_FILE} 读取失败（将按默认配置处理）：{type(exc).__name__}: {exc}")
         return {}
 
 
@@ -75,7 +82,8 @@ def concurrency_limit(default: int) -> int:
     """
     try:
         n = int(load_config().get("max_concurrency") or 0)
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError) as exc:
+        print(f"[bot] max_concurrency 配置值不合法（按默认并发处理）：{exc}")
         n = 0
     if n <= 0:
         return default
@@ -164,6 +172,14 @@ def _serve(state: dict) -> None:
     state["inited"] = True          # 到这里之后再失败就不能重来了，见 _run
     driver = nonebot.get_driver()
     driver.register_adapter(Adapter)
+    # 把驱动的事件循环交给调度线程（每日预取 / token 保活 / 轮换推送都在这条
+    # 循环上跑；协议端每次重连都会触发一次，幂等）
+    import bot_scheduler
+
+    def _sched_attach(_bot) -> None:
+        bot_scheduler.attach_loop(asyncio.get_running_loop())
+
+    driver.on_bot_connect(_sched_attach)
     if creds:
         try:
             from nonebot.adapters.qq import Adapter as QQOfficialAdapter
@@ -205,4 +221,8 @@ def _run():
 
 
 def start():
+    import card_render
+    card_render.cleanup_icon_cache()
+    import bot_scheduler
+    bot_scheduler.start()
     threading.Thread(target=_run, daemon=True, name="qq-bot").start()

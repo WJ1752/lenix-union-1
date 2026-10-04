@@ -110,7 +110,10 @@ def _load() -> dict:
         return _mem["tok"]
     try:
         _mem["tok"] = json.load(open(_writable_path(TOKEN_FILE), encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        _mem["tok"] = {}           # 还没授权过是常态
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auth] {TOKEN_FILE} 读取失败（按未授权处理）：{type(exc).__name__}: {exc}")
         _mem["tok"] = {}
     return _mem["tok"]
 
@@ -120,8 +123,9 @@ def _save(tok: dict):
     try:
         json.dump(tok, open(_writable_path(TOKEN_FILE), "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auth] {TOKEN_FILE} 写盘失败（本次会话内 token 仍可用）："
+              f"{type(exc).__name__}: {exc}")
 
 
 def authorized() -> bool:

@@ -32,7 +32,11 @@ CONFIG_FILE = "bot_config.json"
 def _cfg() -> dict:
     try:
         return json.load(open(CONFIG_FILE, encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[platform] {CONFIG_FILE} 读取失败（按默认配置处理）："
+              f"{type(exc).__name__}: {exc}")
         return {}
 
 
