@@ -13,6 +13,7 @@ import weakref
 import httpx
 
 import bot_runtime
+from jsonio import dump_json
 
 
 def _idx_file(name: str) -> str:
@@ -357,7 +358,7 @@ def harvest_player(name: str, mid, mtype):
 
 def save_seen_players():
     if _SEEN:
-        json.dump(_SEEN, open(_SEEN_PATH, "w", encoding="utf-8"), ensure_ascii=False)
+        dump_json(_SEEN_PATH, _SEEN)
 
 
 def search_seen(prefix: str) -> list[tuple[str, int, str]]:
@@ -598,8 +599,7 @@ def _load_time_cache():
 
 def _save_time_cache():
     try:
-        with open(_writable_path(_TIME_CACHE_FILE), "w", encoding="utf-8") as f:
-            json.dump(_time_cache, f, ensure_ascii=False, separators=(",", ":"))
+        dump_json(_writable_path(_TIME_CACHE_FILE), _time_cache, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重拉
         pass
 
@@ -1319,8 +1319,7 @@ def _rr_ranks() -> dict:
 
 def _rr_save() -> None:
     try:
-        json.dump(_rr_ranks(), open(_RR_RANK_PATH, "w", encoding="utf-8"),
-                  ensure_ascii=False)
+        dump_json(_RR_RANK_PATH, _rr_ranks())
     except Exception:  # noqa: BLE001
         pass
 
@@ -1462,8 +1461,7 @@ def _rr_stats_cache() -> dict:
 
 def _rr_stats_save() -> None:
     try:
-        json.dump(_rr_stats_cache(), open(_RR_STATS_PATH, "w", encoding="utf-8"),
-                  ensure_ascii=False)
+        dump_json(_RR_STATS_PATH, _rr_stats_cache())
     except Exception:  # noqa: BLE001
         pass
 
@@ -2112,8 +2110,7 @@ def _load_pvp_cache():
 
 def _save_pvp_cache():
     try:
-        with open(_writable_path(_PVP_CACHE_FILE), "w", encoding="utf-8") as f:
-            json.dump(_PVP_MATCH_CACHE, f, ensure_ascii=False, separators=(",", ":"))
+        dump_json(_writable_path(_PVP_CACHE_FILE), _PVP_MATCH_CACHE, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重拉
         pass
 
@@ -2144,8 +2141,7 @@ def _load_agg_cache():
 
 def _save_agg_cache():
     try:
-        with open(_writable_path(_AGG_CACHE_FILE), "w", encoding="utf-8") as f:
-            json.dump(_AGG_CACHE, f, ensure_ascii=False, separators=(",", ":"))
+        dump_json(_writable_path(_AGG_CACHE_FILE), _AGG_CACHE, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重算
         pass
 
@@ -2174,8 +2170,7 @@ def load_binding_meta() -> dict:
 
 def save_binding_meta(meta: dict):
     try:
-        json.dump(meta, open(bind_meta_path(), "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=1)
+        dump_json(bind_meta_path(), meta, indent=1)
     except Exception as exc:  # noqa: BLE001
         print(f"[bind] {bind_meta_path()} 写盘失败：{type(exc).__name__}: {exc}")
 
@@ -2237,8 +2232,7 @@ async def sync_bindings() -> dict:
                 out["updated"].append((uid, name, new))
     if out["updated"]:
         try:
-            json.dump(binds, open(bind_path(), "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=1)
+            dump_json(bind_path(), binds, indent=1)
         except Exception as exc:  # noqa: BLE001
             print(f"[bind] 同步结果写回失败：{type(exc).__name__}: {exc}")
     if dirty_meta:
@@ -2859,8 +2853,7 @@ def _save_heat_cache():
         for k in stale[: _HEAT_CACHE_MAX // 4]:
             _HEAT_CACHE.pop(k, None)
     try:
-        with open(_writable_path(_HEAT_CACHE_FILE), "w", encoding="utf-8") as f:
-            json.dump(_HEAT_CACHE, f, ensure_ascii=False, separators=(",", ":"))
+        dump_json(_writable_path(_HEAT_CACHE_FILE), _HEAT_CACHE, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重算
         pass
 
@@ -3175,8 +3168,8 @@ def _ev_cache_load(day: str) -> dict | None:
 
 def _ev_cache_save(day: str, data: dict):
     try:
-        json.dump({"ver": EV_CACHE_VER, "day": day, "at": time.time(), "data": data},
-                  open(_ev_cache_path(), "w", encoding="utf-8"), ensure_ascii=False)
+        dump_json(_ev_cache_path(),
+                  {"ver": EV_CACHE_VER, "day": day, "at": time.time(), "data": data})
     except Exception:  # noqa: BLE001
         pass
 
@@ -3535,8 +3528,7 @@ async def _kyber_xur() -> dict | None:
             return None
     if data and (not c["data"] or data.get("generatedAt") != c["data"].get("generatedAt")):
         try:
-            json.dump(data, open(os.path.join(base, _KYBER_CACHE_FILE), "w",
-                                 encoding="utf-8"), ensure_ascii=False)
+            dump_json(os.path.join(base, _KYBER_CACHE_FILE), data)
         except Exception:  # noqa: BLE001
             pass
     c.update(at=now, data=data)
@@ -3837,8 +3829,7 @@ async def rotation_week(force: bool = False) -> dict:
             "matched": k >= 0, "source": "bungie"}
     _ROT_CACHE.update(key=key, data=data)
     try:
-        json.dump({"ver": ROT_CACHE_VER, "key": key, "data": data},
-                  open(_rot_cache_path(), "w", encoding="utf-8"), ensure_ascii=False)
+        dump_json(_rot_cache_path(), {"ver": ROT_CACHE_VER, "key": key, "data": data})
     except Exception:  # noqa: BLE001
         pass
     return data
@@ -3971,9 +3962,8 @@ def _json_cache(base: str, name: str, ver: int, key: str):
 
 def _json_cache_save(base: str, name: str, ver: int, key: str, data):
     try:
-        json.dump({"ver": ver, "key": key, "at": time.time(), "data": data},
-                  open(os.path.join(base, name), "w", encoding="utf-8"),
-                  ensure_ascii=False)
+        dump_json(os.path.join(base, name),
+                  {"ver": ver, "key": key, "at": time.time(), "data": data})
     except Exception:  # noqa: BLE001
         pass
 

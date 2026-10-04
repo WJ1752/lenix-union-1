@@ -244,8 +244,8 @@ async def _settle(page) -> None:
 async def html_to_png(html: str, width: int = 760, scale: int = 2) -> bytes:
     """完整 HTML 文档 → PNG 字节（宽度固定，高度自适应内容）"""
     st = _state()
+    html = await inline_icons(html)   # 图标下载/落盘在锁外：一张慢图标不该卡住所有通道的出图
     async with st.lock:  # 浏览器/页面不是并发安全的，串行渲染
-        html = await inline_icons(html)   # 图标先落到本地缓存并内联，渲染不等 CDN
         for attempt in (1, 2):
             try:
                 page = await _page(st, width, scale)

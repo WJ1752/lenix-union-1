@@ -18,9 +18,15 @@ import sys
 import threading
 import time
 
+from jsonio import dump_json
+
 CONFIG_FILE = "bot_config.json"
 CREDS_FILE = "qq_official_creds.json"
 BOT_PORT = 8901
+
+# bot_config.json 读改写互斥：调度线程(rot_push_day)与面板(群开关/并发)分属不同
+# 线程，无锁的 load→改→save 会互相覆盖丢更新（读端因原子写不会看到半截文件，无需锁）。
+_CONFIG_LOCK = threading.RLock()
 
 # 只要群 @ 消息这一个 intent；其余显式关掉——申请了没审批的 intent 会被网关拒绝。
 # 与 qq_official_smoke.py 里验证通过的那份保持一致。
@@ -62,7 +68,17 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    json.dump(cfg, open(CONFIG_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    with _CONFIG_LOCK:
+        dump_json(CONFIG_FILE, cfg, indent=1)
+
+
+def update_config(mutate) -> dict:
+    """读取→mutate→写回全程持锁；调度线程和面板并发改配置必须走这里。"""
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        mutate(cfg)
+        save_config(cfg)
+        return cfg
 
 
 def enabled_groups() -> list:
@@ -70,9 +86,9 @@ def enabled_groups() -> list:
 
 
 def set_enabled_groups(gids: list):
-    cfg = load_config()
-    cfg["enabled_groups"] = [str(g) for g in gids]
-    save_config(cfg)
+    def _set(cfg):
+        cfg["enabled_groups"] = [str(g) for g in gids]
+    update_config(_set)
 
 
 def concurrency_limit(default: int) -> int:
@@ -91,9 +107,9 @@ def concurrency_limit(default: int) -> int:
 
 
 def set_concurrency(n: int):
-    cfg = load_config()
-    cfg["max_concurrency"] = max(0, min(int(n), 64))
-    save_config(cfg)
+    def _set(cfg):
+        cfg["max_concurrency"] = max(0, min(int(n), 64))
+    update_config(_set)
 
 
 def get_bots() -> dict:

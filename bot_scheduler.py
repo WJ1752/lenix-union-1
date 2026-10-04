@@ -17,6 +17,7 @@ import datetime
 import threading
 import time
 import traceback
+from concurrent import futures
 
 import bot_log
 import bot_runtime
@@ -161,6 +162,20 @@ def _submit(coro):
     return asyncio.run_coroutine_threadsafe(coro, loop)
 
 
+def _wait(fut, timeout: int, what: str):
+    """等协程结果；超时必须 cancel——否则协程还在事件循环上继续跑，
+    下个 tick 再提交一次就出现同一任务两份实例（轮换会向全部群重复推送）。"""
+    try:
+        return fut.result(timeout=timeout)
+    except futures.TimeoutError:
+        fut.cancel()   # 取消会传播到 loop 上的 Task
+        print(f"[sched] {what}超时（>{timeout}s），已取消")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sched] {what}异常：{type(exc).__name__}: {exc}")
+        return None
+
+
 async def _binding_sync_job() -> None:
     """绑定改名同步：玩家在棒鸡侧改名后自动更新绑定表（详情见 destiny_data.sync_bindings）"""
     import destiny_data as d2
@@ -191,50 +206,32 @@ def _tick() -> None:
     import bungie_auth
     fut = _submit(_token_job())
     if fut:
-        try:
-            fut.result(timeout=120)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sched] token 任务异常：{type(exc).__name__}: {exc}")
+        _wait(fut, 120, "token 任务")
 
     today = datetime.date.today()
     if _STATE["sync_day"] != today:       # 绑定改名核对：启动后第一轮 + 每天一次
         _STATE["sync_day"] = today
         fut = _submit(_binding_sync_job())
         if fut:
-            try:
-                fut.result(timeout=600)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[sched] 绑定同步任务异常：{type(exc).__name__}: {exc}")
+            _wait(fut, 600, "绑定同步任务")
 
     fut = _submit(_prefetch_job())
     if fut:
-        try:
-            for name, err in fut.result(timeout=600):
-                if err:
-                    print(f"[sched] 预取 {name} 失败：{err}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sched] 预取任务异常：{type(exc).__name__}: {exc}")
+        for name, err in (_wait(fut, 600, "预取任务") or []):
+            if err:
+                print(f"[sched] 预取 {name} 失败：{err}")
 
     key = rotation_week_key()
-    cfg = bot_runtime.load_config()
-    if cfg.get("rot_push_day") == key:
+    if bot_runtime.load_config().get("rot_push_day") == key:
         return
     groups = bot_runtime.enabled_groups()
     if not groups:
         # 没配推送目标：只把本周期标记掉，避免每次 tick 都白跑一遍渲染
-        cfg["rot_push_day"] = key
-        bot_runtime.save_config(cfg)
+        bot_runtime.update_config(lambda cfg: cfg.__setitem__("rot_push_day", key))
         return
     fut = _submit(_push_rotation())
-    if fut:
-        try:
-            ok = fut.result(timeout=300)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sched] 轮换推送任务异常：{type(exc).__name__}: {exc}")
-            ok = False
-        if ok:
-            cfg["rot_push_day"] = key
-            bot_runtime.save_config(cfg)
+    if fut and _wait(fut, 300, "轮换推送任务"):
+        bot_runtime.update_config(lambda cfg: cfg.__setitem__("rot_push_day", key))
 
 
 def start() -> None:

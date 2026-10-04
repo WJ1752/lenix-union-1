@@ -17,6 +17,8 @@ import time
 
 import qr_png  # 本地二维码出图（纯标准库）
 
+from jsonio import dump_json
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATES = [os.path.join(ROOT, "napcat_shell"),
                os.path.join(os.path.dirname(sys.executable), "napcat_shell"),
@@ -167,8 +169,7 @@ def start(qq_path: str = "") -> dict:
         os.makedirs(cfg_dir, exist_ok=True)
         webui_cfg = os.path.join(cfg_dir, "webui.json")
         if not os.path.exists(webui_cfg):
-            json.dump({"port": WEBUI_PORT, "token": WEBUI_TOKEN, "login": True},
-                      open(webui_cfg, "w", encoding="utf-8"))
+            dump_json(webui_cfg, {"port": WEBUI_PORT, "token": WEBUI_TOKEN, "login": True})
         loader = os.path.join(NAPCAT_DIR, "loadNapCat.js")
         mjs = os.path.join(NAPCAT_DIR, "napcat.mjs").replace(os.sep, "/")
         with open(loader, "w", encoding="utf-8") as f:
@@ -514,7 +515,7 @@ def ensure_onebot_config(uin: str) -> bool:
              "heartInterval": 30000, "reconnectInterval": 5000}
     rest = [c for c in existing if not (isinstance(c, dict) and c.get("url") == ONEBOT_WS_URL)]
     net["websocketClients"] = rest + [entry]
-    json.dump(cfg, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    dump_json(p, cfg, indent=2)
     return True
 
 

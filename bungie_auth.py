@@ -34,6 +34,8 @@ import time
 
 import httpx
 
+from jsonio import dump_json
+
 BASE = "https://www.bungie.net"
 AUTHORIZE_URL = BASE + "/en/OAuth/Authorize"
 TOKEN_URL = BASE + "/Platform/App/OAuth/Token/"
@@ -121,8 +123,7 @@ def _load() -> dict:
 def _save(tok: dict):
     _mem["tok"] = tok
     try:
-        json.dump(tok, open(_writable_path(TOKEN_FILE), "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=1)
+        dump_json(_writable_path(TOKEN_FILE), tok, indent=1)
     except Exception as exc:  # noqa: BLE001
         print(f"[auth] {TOKEN_FILE} 写盘失败（本次会话内 token 仍可用）："
               f"{type(exc).__name__}: {exc}")

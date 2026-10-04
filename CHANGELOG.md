@@ -2,6 +2,25 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-05 五处并发/数据安全隐患修复
+
+- **面板事件循环不再被卡死**：`/api/napcat/status`、`/api/bot/status` 里的
+  `napcat_runtime.status()`（同步 httpx，NapCat 不在线时单次可卡 10~15s，面板 5s 一轮询）
+  改 `asyncio.to_thread`；`/api/napcat/start`、`/api/napcat/reset` 改同步 def（内含
+  sleep/netstat/tasklist，FastAPI 自动丢线程池）。此前面板所有页面会被一起卡住。
+- **全项目 JSON 原子写**：新增 `jsonio.dump_json`（同目录临时文件 + `os.replace`），
+  替换 destiny_data / bungie_auth / napcat_runtime / bot_runtime 共 15 处
+  `json.dump` 直写——写一半崩溃/断电不再损坏绑定表、token、各缓存。
+- **bot_config.json 读改写加锁**：调度线程写 `rot_push_day` 与面板保存群开关/并发
+  分属不同线程，无锁 load→改→save 会互相覆盖丢更新（典型：当周轮换重复推送）。
+  新增 `bot_runtime.update_config()`（RLock 全程持锁），调度器两处、面板 setter 已改走它。
+- **调度器任务超时补 `fut.cancel()`**：`run_coroutine_threadsafe(...).result(timeout)`
+  超时后协程原本还在事件循环上跑，下个 tick 重复提交——轮换推送存在向全部群重复
+  推送的可能。统一收口到 `_wait()`（超时取消 + 传播到 Task）。
+- **图标下载移出渲染锁**：`card_render.html_to_png` 原本在 `st.lock` 内做图标 CDN
+  下载和落盘 IO，一张慢图标卡住所有通道出图十几秒；`inline_icons` 移到锁外
+  （模块级缓存本身线程安全，逐事件循环各持客户端）。
+
 ## 2026-10-04 绑定核验说明 + 改名自动同步（含实例：万籁皆为我而歌 → 绀野）
 
 - **澄清**：/绑定 本来就过棒鸡核验——`resolve_member` 走 `SearchDestinyPlayerByBungieName`

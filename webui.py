@@ -399,7 +399,8 @@ async def panel():
 
 @app.get("/api/napcat/status")
 async def napcat_status():
-    st = napcat_runtime.status()
+    # status() 里是同步 httpx（NapCat 不在线时单次可卡十几秒），丢线程池别阻塞事件循环
+    st = await asyncio.to_thread(napcat_runtime.status)
     if st.get("isLogin") and not st.get("uin"):
         bots = bot_runtime.get_bots()
         for bot in bots.values():
@@ -414,13 +415,14 @@ async def napcat_status():
 
 
 @app.post("/api/napcat/start")
-async def napcat_start():
+def napcat_start():
+    # 同步函数（FastAPI 丢线程池跑）：start() 里有 sleep / netstat / tasklist，很慢
     return napcat_runtime.start()
 
 
 @app.post("/api/napcat/reset")
-async def napcat_reset():
-    # 退出登录并重置：杀掉 NapCat/QQ，回到未启动态，需要重新扫码
+def napcat_reset():
+    # 退出登录并重置：杀掉 NapCat/QQ，回到未启动态，需要重新扫码（同上，必须丢线程池）
     return napcat_runtime.reset()
 
 
@@ -476,7 +478,7 @@ async def bot_status():
     if not bots:
         # 已登录但协议端没接入：多半是 NapCat 登录时反向 WS 配置没生效
         # （watcher 不在/下发失败）。面板轮询在这里低频补发，热更即生效。
-        st = napcat_runtime.status()
+        st = await asyncio.to_thread(napcat_runtime.status)
         if st.get("isLogin") and time.time() - _ob11_recheck_at > 60:
             _ob11_recheck_at = time.time()
             await asyncio.get_event_loop().run_in_executor(
