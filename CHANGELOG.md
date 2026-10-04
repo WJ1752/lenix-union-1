@@ -2,6 +2,25 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-05 /raid /地牢 缓存提速 + 后台任务进度 + 地牢徽章对齐（二）
+
+- **对局历史落盘缓存 + 增量翻页**：官方对局历史只增不减（倒序返回、旧场不改），新增
+  `raid_history_cache.json`（per 玩家×模式：对局列表 + gate=最新一场 period）。已统计过
+  的人再查只补 gate 之后的新场——老玩家从「40 页/角色全量翻几分钟」降到几秒；全量翻过
+  且一场没有的（角色没变）直接复用。翻了 40 页仍翻不到底的极端长历史不受影响（超出
+  部分本来也拿不到，口径不变）。
+- **PGCR 复核永久缓存**：`raid_pgcr_cache.json` 按 instance 缓存「是否从头开始/账号数/
+  私局」（定局数据）。冷查询里占大头的特殊通关逐场复核，第二次起零网络。
+- **/raid /地牢 走后台任务队列**：新增 `start_raid_report`/`_run_raid_job`，与热力图/
+  生涯武器同一条串行队列（去重、复用窗口、面板后台任务列表全套生效）。群里发指令先回
+  「统计中」卡（含队列位次），跑完出结果卡；面板能看到实时进度条。此前的痛点：同步
+  直调几分钟无任何回复、面板也没进度。
+- **地牢徽章再对齐 dungeon.report**：抓 dungeon.report 前端 bundle 核对，徽章全集只有
+  Solo / Solo Flawless / Flawless / Day One / Contest Day One / Contest / Week One /
+  All Feats——**没有 Duo 系**。地牢卡去掉「双人无暇」徽章与摘要行（上一轮保留错了），
+  详情页同口径（单人通关/单人无暇）。raid 卡不动（raid.report 有 Duo/Trion 系）。
+- 增量合并逻辑抽成 `_merge_hist_page` 纯函数，口径单测在 `_rtest/test_raid_hist_gate.py`。
+
 ## 2026-10-05 五处并发/数据安全隐患修复
 
 - **面板事件循环不再被卡死**：`/api/napcat/status`、`/api/bot/status` 里的

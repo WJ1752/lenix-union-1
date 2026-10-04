@@ -1563,12 +1563,81 @@ def _merge_rr_stats(groups: dict, acts: dict) -> None:
             g["ffc"] = ffc
 
 
+# ---------- /raid /地牢 缓存 ----------
+# 对局历史只增不减（官方按时间倒序返回，旧场永不改动），翻过的页不必重翻：
+# 落盘每人的对局列表 +「统计到哪一场」(gate=最新对局 period)，下次只补 gate 之后的新场。
+# PGCR 局面信息（是否从头开始/账号数/私局）是定局数据，一次拉取永久缓存。
+_RAID_HIST_PATH = os.path.join("raid_history_cache.json")
+_RAID_HIST: dict | None = None
+_RAID_PGCR_PATH = os.path.join("raid_pgcr_cache.json")
+_RAID_PGCR: dict | None = None
+
+
+def _raid_hist_cache() -> dict:
+    global _RAID_HIST
+    if _RAID_HIST is None:
+        try:
+            _RAID_HIST = json.load(open(_RAID_HIST_PATH, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _RAID_HIST = {}
+    return _RAID_HIST
+
+
+def _raid_hist_save() -> None:
+    try:
+        dump_json(_RAID_HIST_PATH, _RAID_HIST)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _pgcr_run_info_cached(instance: str) -> dict:
+    """_pgcr_run_info + 永久缓存；拉取失败（空 dict）不缓存，下次再试"""
+    global _RAID_PGCR
+    if _RAID_PGCR is None:
+        try:
+            _RAID_PGCR = json.load(open(_RAID_PGCR_PATH, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _RAID_PGCR = {}
+    ent = _RAID_PGCR.get(instance)
+    if ent is not None:
+        return ent
+    info = await _pgcr_run_info(instance)
+    if info:
+        _RAID_PGCR[instance] = info
+        dump_json(_RAID_PGCR_PATH, _RAID_PGCR)
+    return info
+
+
 @_traced(lambda name, mode: (f"/地牢 {name}" if mode == 82 else f"/raid {name}"))
 async def raid_report(name: str, mode: int) -> dict:
     """Raid(4)/地牢(82) 报告：跨角色合并对局，按副本分组统计（标准与大师各成一组）"""
     member = await resolve_member(name)
     if not member:
         raise LookupError(f"没找到玩家 {name}")
+    return await raid_report_member(member, mode)
+
+
+@_traced(lambda member, mode, jid=None: (f"/地牢 {member['display']}" if mode == 82
+                                         else f"/raid {member['display']}"))
+def _merge_hist_page(acts: list[dict], gate: str, seen: set, matches: list) -> bool:
+    """把一页对局历史并入增量结果（gate=缓存里已统计到的最新对局 period，分钟精度）。
+
+    对局历史按时间倒序且只增不减：早于 gate 的旧场必定已在缓存里，跳过；
+    gate 那一分钟内的新场（上一轮统计后才打的）靠 seen 去重兜住。
+    返回 True = 该继续翻下一页。"""
+    oldest = min((m["period"] for m in acts), default="")
+    for m in acts:
+        if gate and m["period"] < gate:
+            continue
+        key = m["instance"] or f"{m['ref']}{m['period']}"
+        if key not in seen:
+            seen.add(key)
+            matches.append(m)
+    # 页没满=到底了；整页不晚于缓存门=后面全是旧场，不用再翻
+    return len(acts) >= 250 and not (gate and acts and oldest <= gate)
+
+
+async def raid_report_member(member: dict, mode: int, jid: str | None = None) -> dict:
     mtype, mid = member["mtype"], member["mid"]
     # 跨存档全家桶：raid.report 页面把同一 bungie 账号下所有平台的历史合并显示，
     # 只拉主平台会少算跨平台前打的那些场（实测 Benson 克洛塔 页面87 vs 主平台86）
@@ -1585,42 +1654,60 @@ async def raid_report(name: str, mode: int) -> dict:
     seen, matches = set(), []
     rname = "地牢" if mode == 82 else "raid"
     disp = f"{member['display']}#{fmt_code(member['code'])}"
+    # 增量缓存：历史只增不减，已统计到 gate（最新一场）的旧场直接吃缓存，只补新场
+    ckey = f"{mid}:{mode}"
+    hist = _raid_hist_cache().get(ckey) or {}
+    gate = hist.get("gate") or ""
+    cplan: list[tuple[tuple[int, str], list[str]]] = []
     nunits = 0
     for at, am in accts:
         try:
             prof = await get_profile(at, am)
-            nunits += len(prof.get("characters", {}).get("data", {}) or {})
+            chars_p = list((prof.get("characters", {}).get("data") or {}))
         except Exception:  # noqa: BLE001
-            pass
-    if not nunits:
-        nunits = 1
-    log_progress(f"raid:{mid}:{mode}", 0, nunits * 40, label=f"/{rname} {disp}", force=True,
-                 extra=f"翻取副本对局历史（{len(accts)} 个平台 · 每人最多 40 页 × 250 场）")
-    unit = 0
-    for at, am in accts:
-        try:
-            prof = await get_profile(at, am)
-            chars_p = prof.get("characters", {}).get("data", {})
-        except Exception:  # noqa: BLE001
-            chars_p = {}
-        for cid in chars_p:
-            unit += 1
-            # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
-            page = 0
-            while page < 40:
-                acts = await activity_history(at, am, cid, mode, count=250, page=page)
-                for m in acts:
-                    key = m["instance"] or f"{m['ref']}{m['period']}"
-                    if key not in seen:
-                        seen.add(key)
-                        matches.append(m)
-                if len(acts) < 250:
-                    break
-                page += 1
-                log_progress(f"raid:{mid}:{mode}", unit * 40 - 40 + page, nunits * 40,
-                             label=f"/{rname} {disp}",
-                             extra=f"平台 {accts.index((at, am)) + 1}/{len(accts)} · "
-                                   f"角色 {unit}/{nunits} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
+            chars_p = []
+        cplan.append(((at, am), chars_p))
+        nunits += len(chars_p) or 1
+    cur_chars = sorted(f"{at}:{am}:{cid}" for (at, am), cids in cplan for cid in cids)
+
+    def _jp(done: int, total: int) -> None:
+        if jid and jid in JOBS:  # 同步进面板后台任务进度条
+            JOBS[jid].update(done=int(done), total=int(total))
+
+    if not hist.get("matches") and hist.get("chars") == cur_chars:
+        # 上次全量翻过且一场没有、角色没变：不可能冒出旧场，直接复用
+        log_progress(f"raid:{mid}:{mode}", 0, 0, label=f"/{rname} {disp}", force=True,
+                     extra="上次已全量翻过且无对局，直接复用缓存")
+    else:
+        seen = {m["instance"] or f"{m['ref']}{m['period']}" for m in (hist.get("matches") or [])}
+        matches = list(hist.get("matches") or [])
+        _jp(0, nunits * 40)
+        log_progress(f"raid:{mid}:{mode}", 0, nunits * 40, label=f"/{rname} {disp}", force=True,
+                     extra=(f"命中缓存（已有 {len(matches)} 场），只补新对局"
+                            if gate else
+                            f"翻取副本对局历史（{len(accts)} 个平台 · 每人最多 40 页 × 250 场）"))
+        unit = 0
+        for ai, ((at, am), cids) in enumerate(cplan):
+            for cid in cids:
+                unit += 1
+                # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
+                page = 0
+                while page < 40:
+                    acts = await activity_history(at, am, cid, mode, count=250, page=page)
+                    page += 1
+                    if not _merge_hist_page(acts, gate, seen, matches):
+                        break
+                    _jp(unit * 40 - 40 + page, nunits * 40)
+                    log_progress(f"raid:{mid}:{mode}", unit * 40 - 40 + page, nunits * 40,
+                                 label=f"/{rname} {disp}",
+                                 extra=f"平台 {ai + 1}/{len(accts)} · "
+                                       f"角色 {unit}/{nunits} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
+        _raid_hist_cache()[ckey] = {
+            "ts": time.time(), "chars": cur_chars,
+            "gate": max((m["period"] for m in matches), default=gate),
+            "matches": matches}
+        _raid_hist_save()
+    _jp(nunits * 40, nunits * 40)
     log_progress(f"raid:{mid}:{mode}", nunits * 40, nunits * 40, label=f"/{rname} {disp}",
                  force=True, extra=f"历史翻取完成，共 {len(matches)} 场，开始统计")
     matches.sort(key=lambda m: m["period"], reverse=True)
@@ -1644,9 +1731,10 @@ async def raid_report(name: str, mode: int) -> dict:
     if cand:
         log_progress(f"raid:{mid}:{mode}", 0, len(cand), label=f"/{rname} {disp}", force=True,
                      extra=f"复核 {len(cand)} 场特殊通关（全程 / 低人口径）")
+        _jp(0, len(cand))
         for i in range(0, len(cand), 6):
             chunk = cand[i:i + 6]
-            infos = await asyncio.gather(*[_pgcr_run_info(m["instance"]) for m in chunk])
+            infos = await asyncio.gather(*[_pgcr_run_info_cached(m["instance"]) for m in chunk])
             for m, info in zip(chunk, infos):
                 if info:
                     m["full_run"] = info["fresh"] is not False
@@ -1656,6 +1744,7 @@ async def raid_report(name: str, mode: int) -> dict:
                     # 6 人团中途退到剩 2 人通关，靠 PGCR 账号数戳穿不算双人；
                     # 老对局 PGCR 被官方裁剪只剩 1 条时，回落历史 player_count
                     m["low_accounts"] = max(info["accounts"], m["player_count"])
+            _jp(min(i + 6, len(cand)), len(cand))
             log_progress(f"raid:{mid}:{mode}", min(i + 6, len(cand)), len(cand),
                          label=f"/{rname} {disp}")
 
@@ -1756,6 +1845,37 @@ async def raid_report(name: str, mode: int) -> dict:
         "raids": std,
         "raids_master": mst,
     }
+
+
+async def start_raid_report(name: str, mode: int, who: str = "") -> str | None:
+    """突袭/地牢战绩走后台任务队列（翻历史+PGCR 复核耗时以分钟计，群里先回「统计中」）"""
+    member = await resolve_member(name)
+    if not member:
+        return None
+    mtype, mid = member["mtype"], member["mid"]
+    key = f"{mtype}:{mid}:raidrep:{mode}"
+    hit = _reuse_job(key)
+    if hit:
+        _mark_reused(hit, who)
+        return hit
+    jid = f"{mid}_rr{mode}_{len(JOBS)}"
+    _register_job(key, jid, {
+        "done": 0, "total": 0, "status": "queued",
+        "name": f"{member['display']}#{fmt_code(member['code'])}", "result": None,
+        "kind": "dungeon" if mode == 82 else "raid", "who": who or "网页",
+        "ts": time.time(), "label": "地牢战绩" if mode == 82 else "突袭战绩"})
+    _enqueue_job(jid, lambda: _run_raid_job(jid, member, mode))
+    return jid
+
+
+async def _run_raid_job(jid: str, member: dict, mode: int):
+    try:
+        rep = await raid_report_member(member, mode, jid=jid)
+        # matches 只服务网页的逐场明细，卡片渲染用不到；别把几千场挂进 JOBS 占内存
+        rep.pop("matches", None)
+        JOBS[jid].update(status="done", result=rep)
+    except Exception as exc:  # noqa: BLE001
+        JOBS[jid].update(status="error", error=str(exc))
 
 
 @_traced(lambda name, per_char=50: f"/战绩 {name}")

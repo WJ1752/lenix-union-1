@@ -1186,8 +1186,9 @@ def _raid_badges(g: dict, dungeon: bool = False) -> str:
     「参与」= 该副本该难度的总场次（含没打完的），这样中途散的团也看得见；
     大师不再单独出徽章——它已经是卡片里的独立分栏。
 
-    地牢（dungeon.report 口径，2026-10-05 实测）：满编就是 3 人，没有
-    单人/双人/三人这类低人徽章，特殊通关只有 无暇/单人无暇/双人无暇。
+    地牢（dungeon.report 口径，2026-10-05 前端代码核对）：徽章全集只有
+    Solo / Solo Flawless / Flawless / Day One / Contest Day One / Contest /
+    Week One / All Feats——没有 Duo（双人）系，特殊通关只出 无暇/单人无暇。
     2024-06 起官方把首日赛改叫竞赛模式（dungeon.report/raid.report 显示
     Contest）：发售时间在 2024-06-07（救赎的边缘）及之后的副本标签用「竞赛」。
     """
@@ -1195,6 +1196,9 @@ def _raid_badges(g: dict, dungeon: bool = False) -> str:
     out.append(_badge("通关", g["clears"], "cl"))
     pairs = (("无暇", "flawless", "fw"),
              ("单人无暇", "solo_fl", "sf"), ("双人无暇", "duo_fl", "sf"))
+    if dungeon:
+        # dungeon.report 没有 Duo 系徽章，双人无暇不显示（详见函数头注释）
+        pairs = pairs[:2]
     if not dungeon:
         pairs += (("单人", "solo", "lm"), ("双人", "duo", "lm"), ("三人", "trio", "lm"),
                   ("三人无暇", "trio_fl", "sf"))
@@ -1258,10 +1262,10 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
     if not sections:
         sections = ("<h2>副本统计</h2>"
                     "<p class='empty'>该玩家没有相关通关记录（对局历史按官方接口深度回溯，每人最多 40 页 × 250 场）</p>")
-    # 地牢满编 3 人，三人无暇没意义（dungeon.report 也不显示），摘要行去掉
-    fl_label = ("无暇 / 单人无暇 / 双人无暇" if dungeon
+    # 地牢对齐 dungeon.report：特殊通关只有 无暇/单人无暇（前端没有 Duo 系徽章）
+    fl_label = ("无暇 / 单人无暇" if dungeon
                 else "无暇 / 单人无暇 / 双人无暇 / 三人无暇")
-    fl_vals = (f"{rep['flawless']} / {rep['solo_fl']} / {rep['duo_fl']}" if dungeon
+    fl_vals = (f"{rep['flawless']} / {rep['solo_fl']}" if dungeon
                else f"{rep['flawless']} / {rep['solo_fl']} / {rep['duo_fl']} / {rep['trio_fl']}")
     top = "".join([
         f"<div class='row hl'><span>总通关次数</span><b>{rep['total_clears']}</b></div>",
@@ -1315,6 +1319,7 @@ def render_raid_detail(rep: dict, base: str, month: str, amode: int = 4, diff: s
                   and not m.get("private") and 0 < m.get("low_accounts", m["player_count"]) <= 3)
     master = sum(1 for m in done if m.get("diff") == "大师")
     best = min((m["duration"] for m in done), default=None)
+    dungeon = amode == 82
     rname = base or (ms[0]["base"] if ms else "副本")
     months = sorted({(m.get("period_cn") or m["period"])[:7] for m in rep["matches"]
                      if m["base"] == base and (not diff or m.get("diff") == diff)}, reverse=True)
@@ -1331,8 +1336,10 @@ def render_raid_detail(rep: dict, base: str, month: str, amode: int = 4, diff: s
         f"<div class='row hl'><span>通关次数</span><b>{len(done)}</b></div>"
         f"<div class='row'><span>难度</span><b>{diffs}</b></div>"
         f"<div class='row'><span>无暇</span><b>{flawless}</b></div>"
-        f"<div class='row'><span>单人 / 双人 / 三人通关</span><b>{solo} / {duo} / {trio}</b></div>"
-        f"<div class='row'><span>单人无暇 / 双人无暇 / 三人无暇</span><b>{solo_fl} / {duo_fl} / {trio_fl}</b></div>"
+        + (f"<div class='row'><span>单人通关</span><b>{solo}</b></div>"
+           f"<div class='row'><span>单人无暇</span><b>{solo_fl}</b></div>" if dungeon else
+           f"<div class='row'><span>单人 / 双人 / 三人通关</span><b>{solo} / {duo} / {trio}</b></div>"
+           f"<div class='row'><span>单人无暇 / 双人无暇 / 三人无暇</span><b>{solo_fl} / {duo_fl} / {trio_fl}</b></div>")
         + (f"<div class='row'><span>大师通关</span><b>{master}</b></div>" if master else "")
         + f"<div class='row'><span>最快通关</span><b>{_fmat(best)}</b></div>"
         f"<div class='row'><span>总击杀</span><b>{sum(m['kills'] for m in done):,}</b></div>"

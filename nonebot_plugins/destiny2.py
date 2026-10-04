@@ -1071,13 +1071,19 @@ async def _raid_cmd(matcher, event: Event, args: Message, mode: int, title: str)
     name = await _need_player(matcher, event, args)
     if not name:
         return
-    try:
-        data = await d2.raid_report(name, mode)
-    except LookupError:
+    jid = await d2.start_raid_report(name, mode, who=_who(event))
+    if not jid:
         await _not_found(matcher, event, name)
         return
-    await _send_card(matcher, event, bot_cards.raid_card(data, title, name, mode),
-                     f"{title} {data['display']}", f"{data['display']} · {title}")
+    # 翻历史（每人最多 40 页 × 250 场）+ 逐场复核以分钟计；先回「统计中」，跑完出结果卡。
+    # 命中缓存/复用任务时 _queue_line 会自动换成「直接给结果」的说法
+    await _working(matcher, event, f"{title}统计中",
+                   [*_queue_line(jid),
+                    "要翻取副本对局历史再逐场复核，冷数据约 1~3 分钟，请稍候…",
+                    "面板「后台任务」里能看到实时进度"])
+    await _jobs_card(matcher, event, jid, title,
+                     lambda rep: bot_cards.raid_card(rep, title, name, mode),
+                     f"{title} {name}")
 
 
 @raid_query.handle()
