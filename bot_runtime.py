@@ -189,8 +189,14 @@ def _serve(state: dict) -> None:
     driver = nonebot.get_driver()
     driver.register_adapter(Adapter)
     # 把驱动的事件循环交给调度线程（每日预取 / token 保活 / 轮换推送都在这条
-    # 循环上跑；协议端每次重连都会触发一次，幂等）
+    # 循环上跑）。驱动一起就挂（on_startup），不能等 on_bot_connect——NapCat
+    # 没扫码时协议端不上线，token 保活会跟着停摆直到过期。
     import bot_scheduler
+
+    async def _sched_attach_startup() -> None:
+        bot_scheduler.attach_loop(asyncio.get_running_loop())
+
+    driver.on_startup(_sched_attach_startup)
 
     def _sched_attach(bot) -> None:   # 参数名必须是 bot：NoneBot 会按名字校验钩子签名
         bot_scheduler.attach_loop(asyncio.get_running_loop())
