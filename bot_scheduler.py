@@ -28,6 +28,7 @@ PUSH_GROUP_GAP = 1.5      # 逐群推送的间隔，避免触发频控
 
 _LOOP: dict = {"loop": None}
 _WOKEN = threading.Event()
+_STATE: dict = {"sync_day": None}     # 绑定改名同步上次跑的日期（每天一次）
 
 
 def attach_loop(loop) -> None:
@@ -160,6 +161,20 @@ def _submit(coro):
     return asyncio.run_coroutine_threadsafe(coro, loop)
 
 
+async def _binding_sync_job() -> None:
+    """绑定改名同步：玩家在棒鸡侧改名后自动更新绑定表（详情见 destiny_data.sync_bindings）"""
+    import destiny_data as d2
+    r = await d2.sync_bindings()
+    for uid, old, new in r["updated"]:
+        print(f"[sched] 绑定改名同步：{old} → {new}（uid {uid}）")
+    if r["seeded"]:
+        print(f"[sched] 绑定 meta 补种子 {r['seeded']} 条（老绑定补存 membershipId）")
+    for uid, name in r["stale"]:
+        print(f"[sched] 绑定 uid {uid} 的 {name} 在棒鸡侧搜不到（多半已改名），需人工核实新名字")
+    if not any((r["updated"], r["seeded"], r["stale"])):
+        print("[sched] 绑定核对完成：现名全部一致")
+
+
 def _run() -> None:
     # 第一轮：等协议端连上后跑一次（顺带把「重启后错过的推送」补上）
     _WOKEN.wait(timeout=600)
@@ -180,6 +195,17 @@ def _tick() -> None:
             fut.result(timeout=120)
         except Exception as exc:  # noqa: BLE001
             print(f"[sched] token 任务异常：{type(exc).__name__}: {exc}")
+
+    today = datetime.date.today()
+    if _STATE["sync_day"] != today:       # 绑定改名核对：启动后第一轮 + 每天一次
+        _STATE["sync_day"] = today
+        fut = _submit(_binding_sync_job())
+        if fut:
+            try:
+                fut.result(timeout=600)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[sched] 绑定同步任务异常：{type(exc).__name__}: {exc}")
+
     fut = _submit(_prefetch_job())
     if fut:
         try:

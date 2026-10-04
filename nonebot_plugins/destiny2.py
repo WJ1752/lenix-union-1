@@ -388,14 +388,21 @@ async def _(event: Event, args: Message = CommandArg()):
         await _notice(bind_query, event, "绑定账号",
                       ["用法：<code>/绑定 玩家名#1234</code>（例如 <code>/绑定 小日向#21662</code>）"],
                       fallback="用法：/绑定 玩家名#1234")
+        return
     member = await d2.resolve_member(name)
     if not member:
         await _notice(bind_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
                       kind="warn", fallback=f"没找到玩家 {name}")
+        return
     canonical = f"{member['display']}#{d2.fmt_code(member['code'])}"
     d = _load_bindings()
     d[_uid(event)] = canonical
     _save_bindings(d)
+    # 存 membershipId：以后玩家在棒鸡侧改名，每日同步能靠它对回同一个人
+    meta = d2.load_binding_meta()
+    meta[_uid(event)] = {"mid": str(member["mid"]), "mtype": member["mtype"],
+                         "name": canonical, "checked": time.time()}
+    d2.save_binding_meta(meta)
     await _notice(bind_query, event, "绑定成功", [f"已绑定 <b>{canonical}</b>",
                  "以后直接发 <code>/生涯</code>、<code>/玩家</code> 即可，不用再带名字"],
                   kind="ok", fallback=f"绑定成功：{canonical}")
@@ -408,6 +415,9 @@ async def _(event: Event, args: Message = CommandArg()):
     d = _load_bindings()
     old = d.pop(_uid(event), None)
     _save_bindings(d)
+    meta = d2.load_binding_meta()
+    if meta.pop(_uid(event), None) is not None:
+        d2.save_binding_meta(meta)
     if old:
         await _notice(unbind_query, event, "已解绑", [f"解除了 <b>{old}</b>"], kind="ok",
                       fallback=f"已解绑 {old}")

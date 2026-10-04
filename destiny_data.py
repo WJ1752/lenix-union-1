@@ -2155,6 +2155,97 @@ def bind_path() -> str:
     return _writable_path("user_bindings.json")
 
 
+def bind_meta_path() -> str:
+    """绑定元数据：uid → {mid, mtype, name, checked}。绑定表值只存「名#编号」，
+    改名同步得靠 membershipId 才能对回同一个人，meta 与绑定表同目录同生死。"""
+    return _writable_path("user_bindings_meta.json")
+
+
+def load_binding_meta() -> dict:
+    try:
+        d = json.load(open(bind_meta_path(), encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bind] {bind_meta_path()} 读取失败：{type(exc).__name__}: {exc}")
+        return {}
+
+
+def save_binding_meta(meta: dict):
+    try:
+        json.dump(meta, open(bind_meta_path(), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bind] {bind_meta_path()} 写盘失败：{type(exc).__name__}: {exc}")
+
+
+async def sync_bindings() -> dict:
+    """绑定改名同步：核对绑定表里每个玩家在棒鸡侧的现名，改了就写回绑定表。
+
+    有 meta（绑定时存了 membershipId）的走 GetMembershipsById 对现名，改名照跟；
+    老绑定没有 meta 的先 SearchDestinyPlayerByBungieName 补种子——精确搜索本身
+    就是「核验这个 ID 在棒鸡侧存在」；搜不到说明已改名（或不存在），没有
+    membershipId 无从对回，只能留人工核实。返回给调度器打日志。
+    """
+    out: dict = {"updated": [], "seeded": 0, "stale": [], "errors": 0}
+    try:
+        with open(bind_path(), encoding="utf-8") as f:
+            binds = json.load(f)
+    except Exception:  # noqa: BLE001
+        return out
+    if not isinstance(binds, dict) or not binds:
+        return out
+    meta = load_binding_meta()
+    dirty_meta = False
+    for uid, name in list(binds.items()):
+        if not isinstance(name, str) or "#" not in name:
+            continue
+        me = meta.get(uid) or {}
+        cur = None
+        if me.get("mid"):
+            try:
+                r = await client().get(
+                    f"/User/GetMembershipsById/{me['mid']}/{me.get('mtype', -1)}/")
+                mems = ((r.json().get("Response") or {}).get("destinyMemberships") or [])
+                if mems:
+                    cur = (mems[0].get("bungieGlobalDisplayName") or "",
+                           int(mems[0].get("bungieGlobalDisplayNameCode") or -1))
+            except Exception as exc:  # noqa: BLE001  单个失败不挡其余
+                out["errors"] += 1
+                print(f"[bind] 改名核对失败（{name}）：{type(exc).__name__}: {exc}")
+        else:
+            try:
+                m = await resolve_member(name)
+            except Exception:  # noqa: BLE001
+                m = None
+            if m:
+                meta[uid] = {"mid": str(m["mid"]), "mtype": m["mtype"],
+                             "name": name, "checked": time.time()}
+                dirty_meta = True
+                out["seeded"] += 1
+            else:
+                out["stale"].append((uid, name))
+                continue
+        if cur and cur[0]:
+            new = f"{cur[0]}#{fmt_code(cur[1])}"
+            if new != name:
+                binds[uid] = new
+                me = meta.setdefault(uid, {})
+                me.update({"name": new, "checked": time.time()})
+                dirty_meta = True
+                out["updated"].append((uid, name, new))
+    if out["updated"]:
+        try:
+            json.dump(binds, open(bind_path(), "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bind] 同步结果写回失败：{type(exc).__name__}: {exc}")
+    if dirty_meta:
+        save_binding_meta(meta)
+    return out
+
+
 def bindings_snapshot() -> list[dict]:
     """面板用：QQ → 绑定账号 一览（编号已补零，和卡片/进度条一致）"""
     try:

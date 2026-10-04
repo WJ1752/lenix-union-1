@@ -2,6 +2,29 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 绑定核验说明 + 改名自动同步（含实例：万籁皆为我而歌 → 绀野）
+
+- **澄清**：/绑定 本来就过棒鸡核验——`resolve_member` 走 `SearchDestinyPlayerByBungieName`
+  精确搜索，查不到直接回「没找到玩家」，存的是大小写规范的官方名。带错编号绑不进去。
+- **别人网站的「模糊搜索」**：不是棒鸡官方接口（免鉴权模糊搜索 SearchDestinyPlayers 已
+  404 下线），是它们自己长年爬 PGCR 攒的本地玩家索引——先在自己库里模糊匹配，再拿精确
+  `名字#编号` 回棒鸡核实。本项目同款设计（seen_players.json），索引小是因为只从查过的
+  对局里采集。
+- **改名自动同步（新机制）**：绑定值原本只存「名#编号」，改了名就对不回去。新增
+  `user_bindings_meta.json`（uid → membershipId/mtype/name/checked，与绑定表同目录）：
+  - /绑定 时随 resolve_member 存下 membershipId；/解绑 一并清掉；
+  - `destiny_data.sync_bindings()`：有 meta 的走 `GetMembershipsById` 对现名（Bungie
+    改名不变 #编号，membershipId 终身不变），现名 != 绑定名就自动写回；老绑定没 meta
+    的先精确搜索补种子，搜不到=已改名或不存在，打 `[sched]` 日志留人工核实；
+  - bot_scheduler 每天一次（启动后第一轮也跑），逐条失败不挡其余。
+- **实例核实**：万籁皆为我而歌#4916 → 绀野#4916（#编号一致+精确搜索命中
+  mid 4611686018540633354，跨存档主平台 PSN）。已改生产绑定并种 meta。
+  线索来自用户截图 Guardian.Report 的搜索结果——它家也是自建索引。
+- **顺手修**：/绑定 空参数时发完用法卡会继续往下走报「没找到玩家 」，补了 return。
+- **坑**：直接 httpx 调 Bungie 别漏 `/Platform` 前缀（404 返回 HTML 页，json() 直接炸）；
+  PGCR 连发会限流返回非 JSON，需限速+重试；跨平台玩家 `LastSeenDisplayName` 是各平台
+  平台名（PSN/Steam 昵称），不是棒鸡曾用名，别拿它对改名。
+
 ## 2026-10-04 官方通道 @别人 查询修通：at_target mentions 兜底 + 双通道身份桥
 
 - **现象**：官方 QQ 通道 `@bot /队伍 @别的人` 不生效。两层原因：① 官方群@消息里
