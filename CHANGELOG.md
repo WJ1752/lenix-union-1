@@ -2,6 +2,25 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 武器卡「获取方式」补全：爬 light.gg source-hint 填世界掉落老枪
+
+- **缺口**：pattern_sources.json 依赖 Bungie 藏品 sourceString，36 个名字（51 hash）无来源——
+  往季世界掉落老枪官方已撤藏品，卡片上「获取方式」整行缺失。
+- **通道**：light.gg 物品页的 `<div class="source-hint">` 仍给这批枪维护来源
+  （zh-chs 页物品名是中文但 hint 恒英文）；直连必被 Cloudflare 拦，走 weapon_usage 同款
+  CDP 通道（9222 已验证 Edge，独立调试 profile 可与日常 Edge 共存，无需先杀当前 Edge）。
+- **新脚本 `build_pattern_sources_lightgg.py`**：抓缺失 hash → 落 `manifest_index/
+  lightgg_sources_raw.json` 断点缓存 → 8 种去重句式手工翻译（仄/萨瓦拉/萨克斯/班西-44/圣-14/
+  先锋军械库周常/日晷水晶/无法之地边境）→ 按名合并进 pattern_sources.json（同名多版本
+  多来源用「/」拼接）。补齐 25/36 个名字。
+- **剩余 11 个名字三处皆无数据**（官方藏品无 sourceString/无藏品 + light.gg 无 hint +
+  全量扫描 2170 个商人定义 itemList 也不在）：S1 远古世界掉落（超级坏蛋/考勤卡/责难AX-GL/
+  急板-48）、S27 狼毒、S28 无投放变体（塔霍马01/艾伦05 等 6 把，当季 light.gg 尚未维护）
+  留空不硬编；审判（专家）按基础版补「“预言”地牢（专家版）」。
+- **坑**：商人定义缓存 `manifest_index/raw_vendors.json`（41MB，gitignore 内）可复用于
+  以后查「哪个商人卖什么」；数据 json 只需同步 `dist_new/D2Query/_internal/manifest_index/`
+  并重启 exe 生效，无需重打包。
+
 ## 2026-10-04（二）raid 卡多账号比对：修「同副本多 hash 求和」+ 跨存档全平台历史合并
 
 - **多账号验证**（5 名榜单玩家 + Wj，覆盖 steam/psn/xbox/epic；对比脚本 `_rtest/multi_compare_raid.py`）：
