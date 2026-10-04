@@ -176,7 +176,7 @@ def _serve(state: dict) -> None:
     # 循环上跑；协议端每次重连都会触发一次，幂等）
     import bot_scheduler
 
-    def _sched_attach(_bot) -> None:
+    def _sched_attach(bot) -> None:   # 参数名必须是 bot：NoneBot 会按名字校验钩子签名
         bot_scheduler.attach_loop(asyncio.get_running_loop())
 
     driver.on_bot_connect(_sched_attach)
