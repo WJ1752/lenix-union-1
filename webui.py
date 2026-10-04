@@ -25,7 +25,7 @@ app = FastAPI()
 # 各页面统一挂同一排导航，任意页面都能一步直达其他页面。
 _NAV_ITEMS = (("/", "玩家查询"), ("/catalog", "武器图鉴"),
               ("/perks", "Perk查询"), ("/eververse", "光尘商店"), ("/rotation", "本周轮换"),
-              ("/armorsets", "护甲套装"),
+              ("/armorsets", "护甲套装"), ("/runtime", "运行状态"),
               ("/panel", "Bot面板"))
 
 
@@ -509,6 +509,152 @@ async def bot_groups():
 async def bot_groups_save(request: dict):
     bot_runtime.set_enabled_groups(request.get("enabled") or [])
     return {"ok": True}
+
+
+# ---------- 运行状态页：进程资源占用 + 并发上限设置 ----------
+# psutil 打进 exe 后才有进程级数据；没装时页面降级成提示 + 并发设置仍可用。
+try:
+    import psutil as _psutil
+except Exception:  # noqa: BLE001
+    _psutil = None
+
+_PROC = _psutil.Process(os.getpid()) if _psutil else None
+_NET_LAST = {"t": 0.0, "sent": 0, "recv": 0}
+
+
+@app.get("/api/runtime/stats")
+def runtime_stats():
+    """同步函数（丢线程池跑）：psutil 采样有阻塞调用，别卡事件循环。"""
+    out = {"ok": False, "concurrency": bot_runtime.load_config().get("max_concurrency") or 0}
+    if not _psutil or _PROC is None:
+        out["error"] = "psutil 未随 exe 打包，请重新打包后使用"
+        return out
+    mem = _PROC.memory_info()
+    create_time = _PROC.create_time()
+    scpu = _psutil.cpu_percent(None)
+    svm = _psutil.virtual_memory()
+    net = _psutil.net_io_counters()
+    now = time.time()
+    up = down = 0.0
+    if _NET_LAST["t"]:
+        dt = now - _NET_LAST["t"]
+        if dt > 0:
+            up = max(0, net.bytes_sent - _NET_LAST["sent"]) / dt
+            down = max(0, net.bytes_recv - _NET_LAST["recv"]) / dt
+    _NET_LAST.update(t=now, sent=net.bytes_sent, recv=net.bytes_recv)
+    out.update(
+        ok=True,
+        proc={"cpu": _PROC.cpu_percent(None), "rss": mem.rss, "threads": _PROC.num_threads(),
+              "uptime": max(0, now - create_time),
+              "read_bytes": _PROC.io_counters().read_bytes, "write_bytes": _PROC.io_counters().write_bytes},
+        sys={"cpu": scpu, "mem_total": svm.total, "mem_used": svm.total - svm.available},
+        net={"up": up, "down": down, "sent_total": net.bytes_sent, "recv_total": net.bytes_recv})
+    return out
+
+
+@app.get("/api/settings/concurrency")
+async def get_concurrency():
+    return {"value": bot_runtime.load_config().get("max_concurrency") or 0}
+
+
+@app.post("/api/settings/concurrency")
+async def set_concurrency(request: dict):
+    try:
+        n = int(request.get("value") or 0)
+    except Exception:  # noqa: BLE001
+        n = 0
+    bot_runtime.set_concurrency(n)
+    return {"ok": True, "value": bot_runtime.load_config().get("max_concurrency") or 0}
+
+
+RUNTIME_PAGE = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>运行状态</title>
+<style>
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;padding:22px}
+h1{font-size:20px;margin:0 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:18px}
+.tile{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:12px 14px}
+.tile .k{font-size:12px;color:#9aa0a6;margin-bottom:6px}
+.tile .v{font-size:22px;font-weight:600;line-height:1.2}
+.tile .s{font-size:12px;color:#9aa0a6;margin-top:4px}
+.bar{height:5px;background:#24282d;border-radius:3px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;background:#35c66b;border-radius:3px;transition:width .4s}
+.sec{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:14px 16px;max-width:560px}
+.sec h2{font-size:15px;margin:0 0 8px}
+.sec p{font-size:12px;color:#9aa0a6;line-height:1.7;margin:0 0 10px}
+select,button{font-family:inherit;font-size:14px;background:#0f1113;color:#e8e6e3;
+border:1px solid #2a2e33;border-radius:8px;padding:8px 12px}
+button{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold;cursor:pointer}
+#msg{font-size:13px;color:#35c66b;margin-left:10px}
+</style></head><body>
+<h1>运行状态</h1>
+<div class="grid">
+ <div class="tile"><div class="k">进程 CPU</div><div class="v" id="pcpu">–</div>
+  <div class="bar"><i id="pcpu_b"></i></div></div>
+ <div class="tile"><div class="k">进程内存</div><div class="v" id="pmem">–</div><div class="s" id="pmem_s"></div>
+  <div class="bar"><i id="pmem_b"></i></div></div>
+ <div class="tile"><div class="k">进程线程数</div><div class="v" id="pth">–</div><div class="s" id="puptime"></div></div>
+ <div class="tile"><div class="k">系统 CPU</div><div class="v" id="scpu">–</div>
+  <div class="bar"><i id="scpu_b"></i></div></div>
+ <div class="tile"><div class="k">系统内存</div><div class="v" id="smem">–</div><div class="s" id="smem_s"></div>
+  <div class="bar"><i id="smem_b"></i></div></div>
+ <div class="tile"><div class="k">网络 ↑ 发送</div><div class="v" id="nup">–</div><div class="s" id="nup_s"></div></div>
+ <div class="tile"><div class="k">网络 ↓ 接收</div><div class="v" id="ndown">–</div><div class="s" id="ndown_s"></div></div>
+</div>
+<div class="sec">
+ <h2>并发上限</h2>
+ <p>限定查询任务同时发起的请求数（PvP/PvE 逐场对局拉取、卡片图标下载共用）。
+ 调小可降低对电脑 CPU/带宽的占用，代价是大数据量统计耗时变长；保存即生效，无需重启。
+ 「默认」= 程序内置值（对局 16 路 / 图标 8 路）。</p>
+ <select id="conc">
+  <option value="0">默认（对局 16 / 图标 8）</option>
+  <option value="2">2（最省资源）</option><option value="4">4</option><option value="6">6</option>
+  <option value="8">8</option><option value="12">12</option><option value="16">16</option>
+  <option value="24">24</option><option value="32">32</option>
+ </select>
+ <button onclick="save()">保存</button><span id="msg"></span>
+</div>
+<script>
+function fmtB(n){if(!isFinite(n))return'–';if(n<1024)return n.toFixed(0)+' B';
+ const u=['KB','MB','GB','TB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<3);return n.toFixed(1)+' '+u[i]}
+function pct(a,b){return b>0?Math.min(100,a/b*100):0}
+function bar(id,p){const e=document.getElementById(id);e.style.width=p+'%';
+ e.style.background=p>80?'#e05252':p>50?'#e0b452':'#35c66b'}
+async function refresh(){
+ try{
+  const d=await (await fetch('/api/runtime/stats')).json();
+  if(!d.ok){document.getElementById('pcpu').textContent='不可用';
+   document.getElementById('pcpu').style.fontSize='14px';return}
+  document.getElementById('pcpu').textContent=d.proc.cpu.toFixed(1)+'%';bar('pcpu_b',d.proc.cpu);
+  document.getElementById('pmem').textContent=fmtB(d.proc.rss);
+  document.getElementById('pmem_s').textContent='占系统内存 '+pct(d.proc.rss,d.sys.mem_total).toFixed(1)+'%';
+  bar('pmem_b',pct(d.proc.rss,d.sys.mem_total));
+  document.getElementById('pth').textContent=d.proc.threads;
+  const h=Math.floor(d.proc.uptime/3600),m=Math.floor(d.proc.uptime%3600/60);
+  document.getElementById('puptime').textContent='已运行 '+(h?h+' 小时 ':'')+m+' 分钟';
+  document.getElementById('scpu').textContent=d.sys.cpu.toFixed(1)+'%';bar('scpu_b',d.sys.cpu);
+  document.getElementById('smem').textContent=fmtB(d.sys.mem_used);
+  document.getElementById('smem_s').textContent='共 '+fmtB(d.sys.mem_total);
+  bar('smem_b',pct(d.sys.mem_used,d.sys.mem_total));
+  document.getElementById('nup').textContent=fmtB(d.net.up)+'/s';
+  document.getElementById('nup_s').textContent='累计 '+fmtB(d.net.sent_total);
+  document.getElementById('ndown').textContent=fmtB(d.net.down)+'/s';
+  document.getElementById('ndown_s').textContent='累计 '+fmtB(d.net.recv_total);
+  document.getElementById('conc').value=String(d.concurrency||0);
+ }catch(e){}}
+async function save(){
+ const v=parseInt(document.getElementById('conc').value);
+ await fetch('/api/settings/concurrency',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+ const m=document.getElementById('msg');m.textContent='已保存，即刻生效';
+ setTimeout(()=>m.textContent='',2500)}
+refresh();setInterval(refresh,2000);
+</script></body></html>"""
+
+
+@app.get("/runtime", response_class=HTMLResponse)
+async def runtime_page():
+    return HTMLResponse(RUNTIME_PAGE.replace(
+        "<h1>运行状态</h1>", navbar("/runtime") + "<h1>运行状态</h1>", 1))
 
 
 # ---------- 首页（输入一次 ID，标签页切换视图） ----------

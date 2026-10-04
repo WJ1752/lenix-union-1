@@ -22,6 +22,8 @@ import re
 import sys
 import weakref
 
+import bot_runtime
+
 
 def _base_dir() -> str:
     """图标缓存落盘位置：打包后放 exe 旁边，源码运行放本文件旁边"""
@@ -103,7 +105,7 @@ async def inline_icons(html: str) -> str:
     urls = sorted(set(_ICON_URL.findall(html)))
     if not urls:
         return html
-    sem = asyncio.Semaphore(_ICON_LIMIT)
+    sem = asyncio.Semaphore(bot_runtime.concurrency_limit(_ICON_LIMIT))
     for url, uri in zip(urls, await asyncio.gather(*(_icon(sem, u) for u in urls))):
         if uri != url:
             html = html.replace(url, uri)

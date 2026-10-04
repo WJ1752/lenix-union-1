@@ -8,6 +8,7 @@ python-dotenv==1.2.3
 playwright==1.63.0
 pywebview==6.2.1
 pythonnet==3.1.0
+psutil==7.2.2
 
 # 打包（可选，仅 build_exe.bat 需要）
 pyinstaller==6.22.3

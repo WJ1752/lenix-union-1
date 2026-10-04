@@ -68,6 +68,26 @@ def set_enabled_groups(gids: list):
     save_config(cfg)
 
 
+def concurrency_limit(default: int) -> int:
+    """并发上限：bot_config.json 的 max_concurrency（面板可调），0/未设 = 各模块默认值。
+
+    三个事件循环（主界面/TLS/bot）都会读，所以每次从文件取而不是缓存内存值。
+    """
+    try:
+        n = int(load_config().get("max_concurrency") or 0)
+    except Exception:  # noqa: BLE001
+        n = 0
+    if n <= 0:
+        return default
+    return max(1, min(n, 64))
+
+
+def set_concurrency(n: int):
+    cfg = load_config()
+    cfg["max_concurrency"] = max(0, min(int(n), 64))
+    save_config(cfg)
+
+
 def get_bots() -> dict:
     """已连接的协议端 bot {uin: Bot}；nonebot 未启动时返回空"""
     try:

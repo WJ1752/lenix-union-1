@@ -12,6 +12,8 @@ import weakref
 
 import httpx
 
+import bot_runtime
+
 
 def _idx_file(name: str) -> str:
     """manifest_index 数据文件定位：源码目录 → PyInstaller 打包资源 → 当前目录"""
@@ -2379,7 +2381,7 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         log_progress(jid, 0, len(matches), label=_job_label(jid), force=True,
                      extra="开始逐场拉取对局明细")
         missed = 0
-        sem = asyncio.Semaphore(_PVP_CONCURRENCY)
+        sem = asyncio.Semaphore(bot_runtime.concurrency_limit(_PVP_CONCURRENCY))
         lock = asyncio.Lock()
 
         async def one(m: dict):

@@ -2,6 +2,13 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 面板新增「运行状态」页：进程资源实时监控 + 并发上限可调
+
+- **动机**：用户希望后台能看到机器人实时占用（CPU/内存/网络），且能把并发压低以减少对电脑的影响。
+- **运行状态页（导航新增，/runtime）**：2 秒轮询 `/api/runtime/stats`（psutil）——进程 CPU/内存(RSS+占系统比)/线程数/运行时长、系统 CPU/内存、系统网络 ↑↓ 速率与累计；均带进度条与阈值变色。psutil 7.2.2 已进 requirements 与 D2Query.spec hiddenimports。
+- **并发上限设置（bot_config.json 的 max_concurrency）**：面板下拉（0=默认/2/4/6/8/12/16/24/32），保存即生效无需重启；`bot_runtime.concurrency_limit(default)` 每次从文件读（三个事件循环共享），PvP/PvE 逐场对局拉取（destiny_data `_PVP_CONCURRENCY`）与卡片图标下载（card_render `_ICON_LIMIT`）两处 Semaphore 改走该值。
+- **坑**：进程级「网络速率」拿不到（Windows 无按进程的 net 计数，io_counters 是磁盘 IO），网络瓦片显示系统级 net_io_counters 差分速率；`/api/runtime/stats` 写成同步 def 让 FastAPI 丢线程池，psutil 采样不卡事件循环。
+
 ## 2026-10-04 武器卡「获取方式」补全：爬 light.gg source-hint 填世界掉落老枪
 
 - **缺口**：pattern_sources.json 依赖 Bungie 藏品 sourceString，36 个名字（51 hash）无来源——
