@@ -128,9 +128,13 @@ async def _profile_ex(mtype: int, mid: str, components: str) -> dict:
     return resp["Response"]
 
 
-async def _pgcr(instance: str) -> dict:
-    """本场对局的原始 PGCR（含 entries 的 team / characterId / iconPath 全字段）"""
-    r = await d2.client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance}/")
+async def _pgcr(instance: str, fresh: bool = False) -> dict:
+    """本场对局的原始 PGCR（含 entries 的 team / characterId / iconPath 全字段）
+
+    fresh=True 强制绕过缓存实时拉：对局还在进行时 PGCR 会随队友进本逐个补全，
+    走 6 小时缓存会把开局那一份「只有一个人」的名单冻住（2026-10-04 用户实测）。"""
+    r = await d2.client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance}/",
+                              **({"no_cache": True} if fresh else {}))
     resp = json.loads(r.content.decode("utf-8-sig"))
     if resp.get("ErrorCode") != 1:
         raise RuntimeError(resp.get("Message", "PGCR 拉取失败"))
@@ -522,7 +526,7 @@ async def collect(name: str) -> dict:
             started_text = _cn(match["period"])
             duration_min = int(e["duration"] // 60)
             try:
-                pgcr = await _pgcr(e["instance"])
+                pgcr = await _pgcr(e["instance"], fresh=bool(match["live"]))
             except Exception:  # noqa: BLE001
                 pgcr = {}
             modes = ((pgcr.get("activityDetails") or {}).get("modes") or e.get("modes") or [])

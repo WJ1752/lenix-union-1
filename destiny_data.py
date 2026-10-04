@@ -128,9 +128,11 @@ class _CachedClient:
                 _RESP.pop(k, None)
 
     async def _call(self, method: str, url, **kw):
+        # no_cache=True：跳过读缓存也不写缓存（进行中的 PGCR 实时名单等）
+        no_cache = kw.pop("no_cache", False)
         params = kw.get("params") or {}
         body = kw.get("json") if isinstance(kw.get("json"), dict) else None
-        ttl = _ttl_for(url, params)
+        ttl = 0 if no_cache else _ttl_for(url, params)
         key = self._key(url, params, body) if ttl else ""
         if key:
             hit = self._hit(key, url)

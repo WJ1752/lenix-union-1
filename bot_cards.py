@@ -250,6 +250,7 @@ body.pgw{width:900px;background:#0f1113;color:#e8e6e3;padding:12px}
           white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 12px rgba(0,0,0,.65)}
 .w2-sub{font-size:20px;color:#9aa0a6}
 .w2-season{font-size:14px;color:#6d737b;margin-top:5px}
+.w2-acq{font-size:14px;color:#d4b26a;margin-top:5px}
 /* 2. 特长横条 */
 .w2-int{display:flex;align-items:center;gap:14px;background:#16181b;border:1px solid #2a2e33;
         border-radius:12px;padding:10px 16px}
@@ -789,6 +790,20 @@ def _wcat(hash_: str) -> dict:
     return _WCAT.get(str(hash_ or "")) or {}
 
 
+_WSRC = None
+
+
+def _wsrc(name: str) -> str:
+    """pattern_sources.json 懒加载查询（藏品 sourceString →「获取方式」行），无则空串"""
+    global _WSRC
+    if _WSRC is None:
+        try:
+            _WSRC = json.load(open(d2._idx_file("pattern_sources.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _WSRC = {}
+    return ((_WSRC.get(name or "") or {}).get("raw") or "").strip()
+
+
 # 赛季→年份（按 d2ai d2-season-info 发布日期与资料片分界推算：Y7=S24-26、Y8=S27 起）
 SEASON_YEAR = {1: 1, 2: 1, 3: 1, 4: 2, 5: 2, 6: 2, 7: 2, 8: 3, 9: 3, 10: 3, 11: 3, 12: 4,
                13: 4, 14: 4, 15: 4, 16: 5, 17: 5, 18: 5, 19: 5, 20: 6, 21: 6, 22: 6, 23: 6,
@@ -898,6 +913,10 @@ def weapon_card(w: dict, others: list[str] | None = None,
         else:
             season = " · ".join(x for x in (tag, nm) if x)
         head += f"<div class='w2-season'>{esc(season)}</div>"
+    # 获取方式：游戏内收藏品页的「来源：…」原文（Bungie Manifest 藏品定义）
+    src = _wsrc(w.get("name") or "").rstrip("。.")
+    if src:
+        head += f"<div class='w2-acq'>{esc(src)}</div>"
     head += "</div></div>"
 
     # ---- 2. 特长（intrinsic）横条 ----
