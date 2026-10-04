@@ -2,6 +2,26 @@
 
 > 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-04 官方通道 @别人 查询修通：at_target mentions 兜底 + 双通道身份桥
+
+- **现象**：官方 QQ 通道 `@bot /队伍 @别的人` 不生效。两层原因：① 官方群@消息里
+  @成员 是 `<qqbot-at-user id="openid"/>` 标记（adapter 解析成 mention_user 段），
+  拿到 openid 后去绑定表查——表里全是大家 NapCat 侧 /绑定 存的 **QQ 号键**，
+  openid 必然查不到（QQ 官方 API 刻意不提供 openid↔QQ号 映射）；② 部分场景
+  content 不带成员标记、只带事件 `mentions` 数组，旧 at_target 就连人都取不到。
+- **修复 ①（bot_platform.at_target）**：官方事件在 mention_user 段找不到时，从
+  `event.mentions`（GroupMentionUser，带 member_openid/username/bot 标记）兜底取
+  被@成员，过滤 bot 自己。
+- **修复 ②（身份桥 official_binding_bridge）**：官方 openid 无绑定时，用 mention
+  自带 username（QQ 昵称）去 NapCat 的群成员列表（get_group_member_list，
+  enabled_groups 逐群拉，群名片/昵称双键，10 分钟 TTL 缓存）里**唯一匹配**出
+  QQ 号，借他在 NapCat 侧的既有绑定。同名不唯一/匹配不到都放弃，走原有
+  「对方还没绑定账号」提示卡——宁可让他绑一次，不能错查别人的账号。
+- **接线（destiny2._resolve_name）**：`if not b and bp.is_official(event)` 才试桥，
+  NapCat 通道行为完全不变；/队伍 /生涯 /战绩 等所有带 @目标 的指令一起受益。
+- **验证**：py_compile + 伪造事件单测（mention 段/mentions 数组/唯一命中/重名
+  放弃/无 username 五例）全过；打包部署后 8900/8901/8902 监听、bot 已连接。
+
 ## 2026-10-04 后台调度器：每日预取 + token 保活 + 新轮换群推送 + 图标缓存清理
 
 - **新模块 `bot_scheduler.py`**：常驻 daemon 线程，每 30 分钟一个 tick，协程全部投递到

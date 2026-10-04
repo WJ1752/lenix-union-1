@@ -13,6 +13,7 @@ QQ 官方机器人（q.qq.com，nonebot-adapter-qq）：
 没装/没配官方适配器时全部按 NapCat 行为走。
 """
 import json
+import time
 
 from nonebot.adapters.onebot.v11 import MessageSegment as OBSegment
 
@@ -114,10 +115,12 @@ def at_target(args, event) -> str:
 
     群里 `/生涯 @小明` 就是查小明的号（用小明的绑定），比 `/生涯 小明#1234` 少打字。
     @ 机器人自己被适配器摘掉了或带 is_bot 标记；qq=0（协议端没解析出号码）不算数。
-    官方通道要 mentions 数组里有别的成员才会出 mention_user 段——平台不给就查不到。
+    官方通道分两层：content 里的 `<qqbot-at-user id="openid"/>` 标记会解析成
+    mention_user 段；某些场景 content 不带标记、只有事件 mentions 数组
+    （GroupMentionUser.member_openid）——两处都找一遍。
     """
     if not args:
-        return ""
+        args = ()
     me = self_id(event)
     for seg in args:
         data = seg.data or {}
@@ -133,6 +136,75 @@ def at_target(args, event) -> str:
                 continue
         if target and target != me:
             return target
+    if is_official(event):
+        # content 没给 mention 段时从事件 mentions 数组兜底（@机器人自己带 bot 标记）
+        for m in getattr(event, "mentions", None) or []:
+            mid = str(getattr(m, "member_openid", "") or "")
+            if mid and not getattr(m, "bot", False) and mid != me:
+                return mid
+    return ""
+
+
+# ---------- 官方 ↔ NapCat 身份桥 ----------
+# 官方通道 @某人 拿到的是 openid，而绑定表里大多是 TA 在 NapCat 通道 /绑定 存的
+# QQ 号——QQ 官方 API 刻意不给 openid↔QQ 号映射。桥接思路：官方 mention 自带
+# username（QQ 昵称），拿它去 NapCat 的群成员列表里按群名片/昵称唯一匹配出 QQ 号。
+# 只在唯一命中时采用，避免同名误查别人的账号。
+
+_MEMBER_CACHE: dict = {"at": 0.0, "maps": None}   # 群成员名→QQ号 映射，10 分钟 TTL
+
+
+async def _napcat_name_maps() -> list[dict]:
+    now = time.time()
+    if _MEMBER_CACHE["maps"] is not None and now - _MEMBER_CACHE["at"] < 600:
+        return _MEMBER_CACHE["maps"]
+    maps: list[dict] = []
+    try:
+        import bot_runtime
+        bots = bot_runtime.get_bots()
+        groups = bot_runtime.enabled_groups()
+    except Exception:  # noqa: BLE001
+        return maps
+    for bot in bots.values():
+        if "onebot" not in type(bot).__module__:
+            continue
+        for gid in groups:
+            try:
+                members = await bot.call_api("get_group_member_list", group_id=int(gid))
+            except Exception as exc:  # noqa: BLE001  单群失败不影响其余
+                print(f"[platform] 拉群 {gid} 成员列表失败（桥接用）：{type(exc).__name__}: {exc}")
+                continue
+            m: dict[str, str] = {}
+            for mem in members or []:
+                qq = str((mem or {}).get("user_id") or "")
+                if not qq:
+                    continue
+                for nm in ((mem or {}).get("card"), (mem or {}).get("nickname")):
+                    nm = (nm or "").strip()
+                    if nm and nm not in m:
+                        m[nm] = qq
+            maps.append(m)
+    _MEMBER_CACHE["at"] = now
+    _MEMBER_CACHE["maps"] = maps
+    return maps
+
+
+async def official_binding_bridge(event, openid: str) -> str:
+    """官方通道 @了人但 openid 没有绑定时，按 username 唯一匹配回 QQ 号；失败返回空串"""
+    username = ""
+    for m in getattr(event, "mentions", None) or []:
+        if str(getattr(m, "member_openid", "") or "") == openid:
+            username = (getattr(m, "username", "") or "").strip()
+            break
+    if not username:
+        return ""
+    hits: set[str] = set()
+    for m in await _napcat_name_maps():
+        qq = m.get(username)
+        if qq:
+            hits.add(qq)
+    if len(hits) == 1:
+        return hits.pop()
     return ""
 
 

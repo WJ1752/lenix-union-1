@@ -274,6 +274,12 @@ async def _resolve_name(matcher, event: Event, raw: str,
     qq = _at_target(args, event)
     if qq:
         b = _load_bindings().get(qq, "")
+        if not b and bp.is_official(event):
+            # 官方通道的 openid 多半没绑过（大家都在 NapCat 侧 /绑定）：用 mention
+            # 自带的 username 去 NapCat 群成员里唯一匹配 QQ 号，借他的既有绑定
+            qq2 = await bp.official_binding_bridge(event, qq)
+            if qq2:
+                b = _load_bindings().get(qq2, "")
         if b:
             return b
         # 明确 @ 了人却查不到：报「TA 没绑定」，不要悄悄退回发起人自己的账号
