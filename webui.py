@@ -1179,36 +1179,48 @@ def _badge(label: str, n: int, cls: str = "") -> str:
     return f"<span class='bd {cls}{'' if n else ' off'}'>{label}<b>{n}</b></span>"
 
 
-def _raid_badges(g: dict) -> str:
+def _raid_badges(g: dict, dungeon: bool = False) -> str:
     """raid.report 式徽章：参与/通关恒显；无暇/低人/首日/首周这类特殊通关只在有数时出现，
     为 0 不再压暗占位（用户 2026-10-02：直接只显示已完成的特殊通关）。
 
     「参与」= 该副本该难度的总场次（含没打完的），这样中途散的团也看得见；
     大师不再单独出徽章——它已经是卡片里的独立分栏。
+
+    地牢（dungeon.report 口径，2026-10-05 实测）：满编就是 3 人，没有
+    单人/双人/三人这类低人徽章，特殊通关只有 无暇/单人无暇/双人无暇。
+    2024-06 起官方把首日赛改叫竞赛模式（dungeon.report/raid.report 显示
+    Contest）：发售时间在 2024-06-07（救赎的边缘）及之后的副本标签用「竞赛」。
     """
     out = [_badge("参与", g.get("plays", g["clears"]), "pl")]
     out.append(_badge("通关", g["clears"], "cl"))
-    for lab, key, cls in (("无暇", "flawless", "fw"),
-                          ("单人", "solo", "lm"), ("双人", "duo", "lm"), ("三人", "trio", "lm"),
-                          ("单人无暇", "solo_fl", "sf"), ("双人无暇", "duo_fl", "sf"),
-                          ("三人无暇", "trio_fl", "sf")):
+    pairs = (("无暇", "flawless", "fw"),
+             ("单人无暇", "solo_fl", "sf"), ("双人无暇", "duo_fl", "sf"))
+    if not dungeon:
+        pairs += (("单人", "solo", "lm"), ("双人", "duo", "lm"), ("三人", "trio", "lm"),
+                  ("三人无暇", "trio_fl", "sf"))
+    for lab, key, cls in pairs:
         if g[key]:
             out.append(_badge(lab, g[key], cls))
     if g.get("day_one"):
-        # 首日徽章带 raid.report 首日赛名次（api.raidreport.dev；查不到/没进榜就只显示次数）
-        txt = f"首日 {g['day_one']}"
-        tip = f"首日窗口内通关 ×{g['day_one']}"
+        # 首日/竞赛徽章带 raid.report 首日赛名次（api.raidreport.dev；查不到/没进榜就只显示次数）
+        # rel_d1 = 发售+24h 的字符串时间戳；≥ 救赎的边缘的 rel_d1（2024-06-08 17:00）
+        # 即 2024-06 竞赛时代之后的副本（该格式字典序与时间序一致）
+        rel = str(g.get("rel_d1") or "")
+        d1_lab = "竞赛" if rel and rel >= _CONTEST_ERA_TS else "首日"
+        txt = f"{d1_lab} {g['day_one']}"
+        tip = f"{d1_lab}窗口内通关 ×{g['day_one']}"
         r = g.get("d1_rank")
         if r and r.get("rank"):
-            txt = f"首日 #{r['rank']}" + (f"/{r['total']}" if r.get("total") else "")
-            tip = f"首日通关 ×{g['day_one']} · raid.report 首日赛第 {r['rank']} 名"
+            txt = f"{d1_lab} #{r['rank']}" + (f"/{r['total']}" if r.get("total") else "")
+            tip = f"{d1_lab}通关 ×{g['day_one']} · 首日赛第 {r['rank']} 名（共 {r.get('total') or '?'} 队）"
         out.append(f"<span class='bd d1' title='{tip}'>{txt}</span>")
     if g.get("week_one"):
         out.append(_badge("首周", g["week_one"], "w1"))
     return "".join(out)
 
 
-def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "") -> str:
+def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "",
+               dungeon: bool = False) -> str:
     """一栏副本行（同一难度口径）；diff 非空时链接带上难度，详情页只看该难度"""
     from urllib.parse import quote
     dq = f"&diff={quote(diff)}" if diff else ""
@@ -1222,16 +1234,22 @@ def _raid_rows(groups: list[dict], qname: str, amode: int, diff: str = "") -> st
                  f"&base={quote(g['name'])}{dq}'>"
                  f"<img src='{g['pgcr']}'>"
                  f"<div class='rin'><div class='rname'><b>{g['name']}</b>{dtag}</div>"
-                 f"<div class='rbads'>{_raid_badges(g)}</div></div>"
+                 f"<div class='rbads'>{_raid_badges(g, dungeon)}</div></div>"
                  f"<span class='dim'>最快全程 {_fmat(g.get('ffc'))}<br>最近 {(g['last'] or '—')[:10]}</span></a>")
     return rows
 
 
+# 官方从 2024-06 救赎的边缘起把「首日赛」改叫「竞赛模式」——发售在此之后的
+# 副本，首日徽章标签用「竞赛」（dungeon.report/raid.report 同期显示 Contest）
+_CONTEST_ERA_TS = "2024-06-08 17:00"   # 救赎的边缘 rel+24h；之后的发售=竞赛时代
+
+
 def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> str:
     from urllib.parse import quote
+    dungeon = amode == 82
     qname = quote(name)
-    std = _raid_rows(rep.get("raids") or [], qname, amode)
-    mst = _raid_rows(rep.get("raids_master") or [], qname, amode, "大师")
+    std = _raid_rows(rep.get("raids") or [], qname, amode, dungeon=dungeon)
+    mst = _raid_rows(rep.get("raids_master") or [], qname, amode, "大师", dungeon=dungeon)
     sections = ""
     if std:
         sections += f"<h2>标准难度</h2>{std}"
@@ -1240,11 +1258,15 @@ def render_raid_card(rep: dict, title: str, name: str = "", amode: int = 4) -> s
     if not sections:
         sections = ("<h2>副本统计</h2>"
                     "<p class='empty'>该玩家没有相关通关记录（对局历史按官方接口深度回溯，每人最多 40 页 × 250 场）</p>")
+    # 地牢满编 3 人，三人无暇没意义（dungeon.report 也不显示），摘要行去掉
+    fl_label = ("无暇 / 单人无暇 / 双人无暇" if dungeon
+                else "无暇 / 单人无暇 / 双人无暇 / 三人无暇")
+    fl_vals = (f"{rep['flawless']} / {rep['solo_fl']} / {rep['duo_fl']}" if dungeon
+               else f"{rep['flawless']} / {rep['solo_fl']} / {rep['duo_fl']} / {rep['trio_fl']}")
     top = "".join([
         f"<div class='row hl'><span>总通关次数</span><b>{rep['total_clears']}</b></div>",
         f"<div class='row'><span>总参与次数（含未通关）</span><b>{rep.get('total_plays', rep['total_clears'])}</b></div>",
-        f"<div class='row'><span>无暇 / 单人无暇 / 双人无暇 / 三人无暇</span>"
-        f"<b>{rep['flawless']} / {rep['solo_fl']} / {rep['duo_fl']} / {rep['trio_fl']}</b></div>",
+        f"<div class='row'><span>{fl_label}</span><b>{fl_vals}</b></div>",
         f"<div class='row'><span>大师通关</span><b>{rep['master']}</b></div>",
     ])
     body = (f"<h1>{rep['display']}</h1>"
