@@ -103,3 +103,10 @@ _rtest/*.png
 _rtest/_build_log*.txt
 _rtest/tmp_manifest/
 raidreport_stats.json
+
+# ===== 登录/运行态（含 token，绝不提交）=====
+bungie_tokens.json
+user_bindings_meta.json
+
+# ===== 第三方大文件（deploy 脚本另行复制）=====
+cloudflared.exe

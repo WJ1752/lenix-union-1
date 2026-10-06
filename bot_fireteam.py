@@ -467,6 +467,7 @@ async def _career_brief(member: dict, mtype: int, mid: str, prof: dict, party: l
         "duration_min": 0,
         "members": rows,
         "last_text": last_text,
+        "roster": roster,   # [{mid, mtype, name}]，/队伍配装 复用名单发现
     }
 
 
@@ -583,6 +584,8 @@ async def collect(name: str) -> dict:
             "started_text": started_text,
             "duration_min": duration_min,
             "members": rows,
+            "roster": [{"mid": r["mid"], "mtype": r["mtype"], "name": r.get("name") or ""}
+                       for r in roster],   # /队伍配装 复用名单发现
         }
 
     # ---- 没在打：在世界里（轨道/塔/组队待机）或不在线（选人界面/已退出，transitory 都没了）----

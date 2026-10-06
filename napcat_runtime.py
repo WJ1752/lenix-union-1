@@ -246,7 +246,24 @@ def reset() -> dict:
     注意：重置后再扫码＝一次重新登录，短时间反复操作可能触发 QQ 风控"""
     stop()
     _cred_cache["v"] = ""
+    try:  # 清掉登录记录：重置意味着"下次要重新扫码"，启动时不再自动重连
+        os.remove(_uin_file())
+    except OSError:
+        pass
     return {"reset": True, "webui": webui_url()}
+
+
+def autostart() -> dict:
+    """程序启动时自动重连：上次登录成功过（面板记住了 uin）就直接拉起 NapCat
+    走快速登录，不用每次开机手点「启动并扫码登录」。
+    首次使用 / 手动重置过（登录记录已清）不自动启，仍走面板扫码。"""
+    try:
+        uin = open(_uin_file(), encoding="utf-8").read().strip()
+    except OSError:
+        uin = ""
+    if not uin.isdigit():
+        return {"started": False, "reason": "没有登录记录，等面板手动扫码"}
+    return start()
 
 
 def login_qr_ready() -> bool:

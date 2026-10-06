@@ -38,19 +38,47 @@ def _serve(port):
     import bot_runtime
     import webui
     bot_runtime.start()
+    threading.Thread(target=_autostart_napcat, daemon=True).start()
     uvicorn.run(webui.app, host="127.0.0.1", port=port, log_level="warning")
 
 
+def _autostart_napcat():
+    """启动时自动重连 NapCat：上次登录过就走快速登录，不用手点「启动并扫码登录」。
+    首次使用 / 手动重置过则不动（napcat_runtime.autostart 里判断）"""
+    try:
+        time.sleep(3)  # 等面板端口先起来，扫码页/状态轮询才正常
+        import napcat_runtime
+        r = napcat_runtime.autostart()
+        print(f"[napcat] 自动重连：{'已拉起' if r.get('started') else r}")
+    except Exception as exc:  # noqa: BLE001  自动重连失败不影响主程序
+        print(f"[napcat] 自动重连失败：{exc}")
+
+
 def _serve_tls():
-    """另起一个带自签证书的 https 口，专门收 Bungie 授权回跳（Bungie 只认 https）"""
+    """带自签证书的 https 口，专门收 Bungie 授权回跳（Bungie 只认 https）。
+
+    绑 0.0.0.0：/登录 的局域网链接把回跳指到本机内网 IP，同一 Wi-Fi 下的玩家
+    点完「允许」直接落到授权成功页，不用再手动粘贴回调。这里只挂 bungie_tls_app
+    （仅回调路由），不把整个面板暴露给局域网。"""
     try:
         import bungie_auth
         import webui
         cert, key = bungie_auth.cert_files()
         if not (cert and key):
             return
-        uvicorn.run(webui.app, host="127.0.0.1", port=bungie_auth.TLS_PORT,
+        uvicorn.run(webui.bungie_tls_app, host="0.0.0.0", port=bungie_auth.TLS_PORT,
                     ssl_certfile=cert, ssl_keyfile=key, log_level="warning")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _serve_tunnel_http():
+    """本机 8903：给 cloudflared 隧道转发的 HTTP 回调口（只挂 Bungie 回调路由，
+    只听 127.0.0.1，公网流量经 Cloudflare 进来也只能碰到授权回调这一条路由）"""
+    try:
+        import webui
+        uvicorn.run(webui.bungie_tls_app, host="127.0.0.1", port=8903,
+                    log_level="warning")
     except Exception:  # noqa: BLE001
         pass
 
@@ -60,6 +88,7 @@ if __name__ == "__main__":
     url = f"http://127.0.0.1:{port}"
     threading.Thread(target=_serve, args=(port,), daemon=True).start()
     threading.Thread(target=_serve_tls, daemon=True).start()
+    threading.Thread(target=_serve_tunnel_http, daemon=True).start()
     for _ in range(50):
         try:
             socket.create_connection(("127.0.0.1", port), 0.3).close()

@@ -138,6 +138,9 @@ section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:1
 .evbigg b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
           text-shadow:0 1px 4px #000}
 .evbigg .ty{color:#9aa0a6;font-size:12px;text-shadow:0 1px 4px #000}
+.gmw{display:flex;align-items:center;gap:6px;margin-top:4px;color:#c5cacd;font-size:12px;text-shadow:0 1px 4px #000}
+.gmw img{width:24px;height:24px;border-radius:4px;background:#22262b;border:1px solid #3a3f45}
+.gmw b{display:inline;font-size:13px;color:#e8c15a}
 .evgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .evcard{display:flex;align-items:center;gap:12px;background:#1b1e22;border:1px solid #2a2e33;
         border-radius:12px;padding:10px 12px}
@@ -586,7 +589,7 @@ def help_card() -> str:
     c = lambda s: f"<code>{esc(s)}</code>"
     rows = (
         cat("玩家", f"{c('/玩家')} {c('/生涯')} {c('/raid')} {c('/地牢')} {c('/pvp')} {c('/pve')} {c('/智谋')} {c('/队伍')}") +
-        cat("记录", f"{c('/战绩')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
+        cat("记录", f"{c('/战绩')} {c('/热力图')} {c('/称号')} {c('/锻造')} {c('/催化')} {c('/生涯武器')} {c('/pve生涯武器')} {c('/宗师')}",
             "pvp 版同理") +
         cat("资料", f"{c('/武器查询 武器名')} {c('/perk查询 perk名')} {c('/护甲查询 护甲名')} {c('/护甲套装')} {c('/每日光尘')} {c('/老九')} {c('/轮换')} {c('/进度')}") +
         cat("掉落表", f"{c('/掉落 副本名')}", "裸指令也行：/二象性掉落、/ron掉落…，发 /掉落 看列表") +
@@ -1457,6 +1460,15 @@ def _gm_block(gm: dict) -> str:
     style = (f" style=\"background-image:url('{esc(shot)}')\""
              if shot and "missing_icon" not in shot else "")
     sub = " · ".join(x for x in (gm.get("dest_zh") or "", "先锋警戒") if x)
+    wep = gm.get("weapon") or {}
+    wline = ""
+    if wep.get("zh") or wep.get("en"):
+        ico = (f"<img src='{esc(wep['icon'])}'>" if wep.get("icon") else "")
+        nm = esc(wep.get("zh") or wep.get("en"))
+        ty = esc(wep.get("type") or wep.get("type_en") or "")
+        wline = ("<div class='gmw'>" + ico +
+                 f"<span>首通掉落 · <b>{nm}</b>" + (f"（{ty}）" if ty else "") +
+                 "</span></div>")
     return ("<div class='evhead'>当前宗师<span>宗师征服 · 每周三凌晨 1 点换</span></div>"
             "<div class='evhero one'>"
             "<div class='evbig'" + style + ">"
@@ -1464,7 +1476,7 @@ def _gm_block(gm: dict) -> str:
             "<span class='evtier'>宗师</span>"
             "<div class='evbigg'><div class='who'>"
             f"<b>{esc(gm.get('zh') or gm.get('en') or '？')}</b>"
-            f"<span class='ty'>{esc(sub)}</span></div></div></div></div>")
+            f"<span class='ty'>{esc(sub)}</span>{wline}</div></div></div></div>")
 
 
 def _ls_block(ls: dict) -> str:
@@ -2064,6 +2076,227 @@ def fireteam_card(data: dict) -> str:
             f"<h2>队伍成员（{len(members)}）</h2>"
             + (rows or "<div class='nt warn'>没拿到成员数据</div>")
             + f"<div class='foot'>{foot}</div>")
+    return _page(body)
+
+
+# ---------- /队伍配装（成员已装备栏：超能/武器/护甲/模组） ----------
+
+_LO_CSS = """
+.lo-head{position:relative;height:78px;border-radius:12px;overflow:hidden;
+         border:1px solid #2a2e33;background:#141619 center/cover no-repeat;margin-bottom:8px}
+.lo-crest{position:absolute;left:12px;top:50%;transform:translateY(-50%);
+          width:60px;height:60px;border-radius:10px;border:1px solid rgba(255,255,255,.14);
+          box-shadow:0 0 0 3px rgba(0,0,0,.28)}
+.lo-head .scrim{position:absolute;left:0;top:0;right:0;bottom:0;
+                background:linear-gradient(90deg,rgba(10,12,14,.92),rgba(10,12,14,.55) 45%,rgba(10,12,14,.12))}
+.lo-who{position:absolute;left:88px;bottom:10px;line-height:1.45}
+.lo-who .nm{font-size:20px;font-weight:700;color:#fff;text-shadow:0 1px 4px #000}
+.lo-who .mt{font-size:12.5px;color:#c5cacd;text-shadow:0 1px 4px #000}
+.lo-pw{position:absolute;right:12px;bottom:12px;font-size:12px;color:#c5cacd;text-shadow:0 1px 4px #000}
+.lo-pw b{font-size:24px;color:#e8c15a;margin-left:6px}
+.lo-stats{display:flex;gap:6px;margin-bottom:8px}
+.lo-stat{flex:1;background:#1b1e22;border:1px solid #2a2e33;border-radius:8px;text-align:center;padding:5px 0}
+.lo-stat span{display:block;font-size:11px;color:#6d737b}
+.lo-stat b{font-size:15px;color:#e8e6e3}
+.lo-sub{display:flex;align-items:flex-start;gap:11px;background:#1b1e22;
+        border:1px solid #2a2e33;border-radius:10px;padding:9px 12px;margin-bottom:8px}
+.lo-sub>img{width:46px;height:46px;border-radius:8px;background:#22262b;
+            border:1px solid #2a2e33;flex-shrink:0;padding:3px}
+.lo-srows{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.lo-row{display:flex;flex-wrap:wrap;gap:4px;align-items:center;min-width:0}
+.lo-lab{font-size:11px;color:#6d737b;width:34px;flex-shrink:0}
+.lo-chip{display:inline-flex;align-items:center;gap:5px;background:#22262b;
+         border:1px solid #2a2e33;border-radius:6px;padding:2px 8px 2px 3px;
+         font-size:12px;color:#c5cacd;max-width:150px;white-space:nowrap}
+.lo-chip img{width:20px;height:20px;border-radius:3px;flex-shrink:0}
+.lo-chip b{font-weight:400;overflow:hidden;text-overflow:ellipsis}
+.lo-chip.sup b{color:#e8c15a;font-weight:700}
+.lo-chip.frag{border-color:#2b3d4d}.lo-chip.frag b{color:#8fd0ff}
+.lo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:start}
+.lo-col{display:flex;flex-direction:column;gap:6px;min-width:0}
+.lo-item{display:flex;gap:9px;background:#1b1e22;border:1px solid #2a2e33;
+         border-radius:10px;padding:8px 10px;min-width:0}
+.lo-item>img{width:44px;height:44px;border-radius:8px;flex-shrink:0;
+             background:#22262b;border:1px solid #2a2e33;padding:2px}
+.lo-itx{flex:1;min-width:0}
+.lo-itx b{display:block;font-size:13.5px;color:#e8e6e3;line-height:1.3;
+          white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lo-itx b.ex{color:#e8c15a}
+.lo-itx .ty{font-size:11px;color:#6d737b}
+.lo-chips{display:flex;flex-wrap:wrap;gap:3px;margin-top:5px}
+.lo-chips img{width:22px;height:22px;border-radius:4px;background:#22262b;border:1px solid #2a2e33}
+.lo-hidden{font-size:13px;color:#6d737b;background:#1b1e22;border:1px dashed #2a2e33;
+           border-radius:10px;padding:12px;text-align:center}
+.lo-mem{margin-bottom:14px}
+.lo-h2{display:flex;align-items:baseline;gap:8px;font-size:13.5px;color:#c5cacd;font-weight:700;
+       letter-spacing:1.5px;border-left:3px solid #35c66b;padding-left:9px;margin:16px 0 8px}
+.lo-h2 span{color:#9aa0a6;font-size:12px;font-weight:400}
+"""
+
+
+def _lo_chips_html(chips: list[dict], cls: str = "") -> str:
+    out = ""
+    for c in chips:
+        if not c.get("name"):
+            continue
+        ico = f"<img src='{esc(c['icon'])}'>" if c.get("icon") else ""
+        out += f"<span class='lo-chip {cls}' title='{esc(c['name'])}'>{ico}<b>{esc(c['name'])}</b></span>"
+    return out
+
+
+def _lo_srow(label: str, chips: list[dict], cls: str = "") -> str:
+    if not chips:
+        return ""
+    return (f"<div class='lo-row'><span class='lo-lab'>{label}</span>"
+            f"{_lo_chips_html(chips, cls)}</div>")
+
+
+def _lo_item_html(it: dict, cls: str = "") -> str:
+    """武器/护甲一行：图标 + 名字/类型 + perk/模组芯片排"""
+    if not it.get("name"):
+        return ""
+    tier_cls = " ex" if it.get("tier") == "异域" else ""
+    ty = it.get("slot") or ""
+    if it.get("power"):
+        ty += f" · {it['power']}"
+    ty_html = f"<span class='ty'>{esc(ty)}</span>" if ty else ""
+    chips = "".join(f"<img src='{esc(c['icon'])}' title='{esc(c.get('name') or '')}'>"
+                    for c in (it.get("chips") or []) if c.get("icon"))
+    chips_html = f"<div class='lo-chips'>{chips}</div>" if chips else ""
+    ico = f"<img src='{esc(it['icon'])}'>" if it.get("icon") else "<img src=''>"
+    return (f"<div class='lo-item'>{ico}"
+            f"<div class='lo-itx'><b class='{cls}{tier_cls}'>{esc(it['name'])}</b>{ty_html}"
+            f"{chips_html}</div></div>")
+
+
+def loadout_card(data: dict) -> str:
+    """「/队伍配装」：当前队伍各成员已装备的 超能/武器/护甲/模组。
+
+    名单复用 /队伍 的队伍发现；每人装备来自官方 GetProfile（对方库存隐私
+    公开才可见，隐藏的成员出占位行，不拖垮整卡）。
+    data["slot"] 存在 = 游戏内配装槽位模式（/配装 数字，发起者本人授权读取）。"""
+    members = data.get("members") or []
+    if not members:
+        return notice("没拿到配装数据",
+                      ["队伍名单是空的（对方隐私设置可能隐藏了实时队伍），稍后再试。"],
+                      kind="warn")
+    slot = data.get("slot")
+    if slot:
+        body = (f"<style>{_LO_CSS}</style>"
+                f"<h1>游戏内配装 {int(slot)}</h1>"
+                f"<div class='sub'>{esc(data.get('name') or '')} · "
+                f"游戏内存的第 {int(slot)} 套（官方仅本人可见，/登录 授权后可查）</div>")
+    else:
+        n_vis = sum(1 for m in members if not m.get("hidden"))
+        body = (f"<style>{_LO_CSS}</style>"
+                "<h1>队伍配装</h1>"
+                f"<div class='sub'>{esc(data.get('name') or '')} · 当前队伍 {len(members)} 人 · "
+                f"已装备栏实盘卷 · {n_vis} 人装备可见</div>")
+    for m in members:
+        # 名牌：纹章方块（96×96 原尺寸，不拉伸）+ 宽幅底图（474×96 原比例左铺）
+        # + 右侧渐隐进背景；底图缺失时退回整条拉伸
+        crest, bg = m.get("emblem") or "", m.get("emblem_bg") or ""
+        if bg:
+            bstyle = (" style=\"background-image:"
+                      "linear-gradient(90deg,rgba(13,15,17,.72),rgba(13,15,17,.3) 26%,"
+                      "rgba(13,15,17,.94) 56%,#101214 76%),"
+                      f"url('{esc(bg)}');"
+                      "background-size:cover,auto 100%;"
+                      "background-position:left center,88px center;"
+                      "background-repeat:no-repeat\"")
+        elif crest:
+            bstyle = f" style=\"background-image:url('{esc(crest)}')\""
+        else:
+            bstyle = ""
+        crest_img = f"<img class='lo-crest' src='{esc(crest)}'>" if crest else ""
+        mt = esc(m.get('class') or '')
+        if m.get("slot_label"):
+            mt += f" · {esc(m['slot_label'])}"
+        elif m.get("is_self"):
+            mt += " · 本人"
+        who = (f"{crest_img}<div class='lo-who'><div class='nm'>{esc(m['name'])}</div>"
+               f"<div class='mt'>{mt}</div></div>")
+        pw = f"<div class='lo-pw'>光等<b>{m.get('light') or 0}</b></div>"
+        scrim = "" if bg else "<div class='scrim'></div>"
+        head = f"<div class='lo-head'{bstyle}>{scrim}{who}{pw}</div>"
+        if m.get("hidden"):
+            body += ("<div class='lo-mem'>" + head +
+                     "<div class='lo-hidden'>该成员的库存隐私未公开，装备不可见</div></div>")
+            continue
+        stats = "".join(f"<div class='lo-stat'><span>{esc(s['zh'])}</span>"
+                        f"<b>{int(s['v'])}</b></div>" for s in (m.get("stats") or []))
+        stats_html = f"<div class='lo-stats'>{stats}</div>" if stats else ""
+        sub_html = ""
+        sc = m.get("subclass")
+        if sc:
+            rows = (_lo_srow("超能", sc.get("super") or [], "sup")
+                    + _lo_srow("技能", sc.get("abilities") or [])
+                    + _lo_srow("分支", sc.get("aspects") or [])
+                    + _lo_srow("碎片", sc.get("fragments") or [], "frag"))
+            sico = f"<img src='{esc(sc.get('icon') or '')}'>" if sc.get("icon") else ""
+            sub_html = (f"<div class='lo-sub'>{sico}"
+                        f"<div class='lo-srows'>"
+                        f"<div class='lo-row'><span class='lo-lab'></span>"
+                        f"<b style='font-size:14px;color:#e8e6e3'>{esc(sc.get('name') or '')}</b></div>"
+                        + rows + "</div></div>")
+        wcol = "".join(_lo_item_html(w) for w in (m.get("weapons") or []))
+        acol = "".join(_lo_item_html(a) for a in (m.get("armor") or []))
+        grid = ""
+        if wcol or acol:
+            grid = ("<div class='lo-grid'>"
+                    f"<div class='lo-col'>{wcol}</div><div class='lo-col'>{acol}</div></div>")
+        body += f"<div class='lo-mem'>{head}{stats_html}{sub_html}{grid}</div>"
+    if slot:
+        body += ("<div class='foot'>命运2 查询 · 数据来自 Bungie.net · 游戏内 20 套配装槽位，"
+                 "按 /配装 序号读取（官方仅本人可见）</div>")
+    else:
+        body += ("<div class='foot'>命运2 查询 · 数据来自 Bungie.net · 只显示已装备栏；"
+                 "队友装备可见与否取决于对方游戏内库存隐私设置</div>")
+    return _page(body)
+
+
+_VL_CSS = """
+.vl-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.vl-row{display:flex;align-items:center;gap:9px;background:#1b1e22;
+        border:1px solid #2a2e33;border-radius:9px;padding:6px 10px;min-width:0}
+.vl-row img,.vl-row .noi{width:36px;height:36px;border-radius:7px;flex-shrink:0;
+        background:#22262b;border:1px solid #2a2e33;object-fit:contain;padding:2px}
+.vl-tx{flex:1;min-width:0;line-height:1.35}
+.vl-tx b{display:block;font-size:13px;color:#e8e6e3;white-space:nowrap;
+         overflow:hidden;text-overflow:ellipsis}
+.vl-tx b.ex{color:#e8c15a}
+.vl-tx span{font-size:11px;color:#6d737b}
+.lo-pwv{font-size:14px;color:#d4b26a;font-weight:700;flex-shrink:0}
+"""
+
+
+def vault_card(data: dict) -> str:
+    """「/仓库 关键词」：发起者本人 仓库/背包/已装备 里的按名搜索结果。"""
+    items = data.get("items") or []
+    if not items:
+        return notice("没搜到物品",
+                      [f"「{data.get('kw') or ''}」在你可见的 仓库/背包/已装备 里没有命中，"
+                       "换个关键词试试（中文名，如 琥珀 / 隐秘）。"], kind="warn")
+    rows = ""
+    for it in items:
+        tier_cls = " ex" if it.get("tier") == "异域" else ""
+        pwv = it.get("power")
+        pw = f"<span class='lo-pwv'>{pwv}</span>" if (isinstance(pwv, int) and pwv > 0) else ""
+        qty = f" ×{it['quantity']}" if (it.get("quantity") or 1) > 1 else ""
+        ico = f"<img src='{esc(it['icon'])}'>" if it.get("icon") else "<span class='noi'></span>"
+        ty = " · ".join(x for x in (it.get("type") or "", it.get("loc") or "") if x)
+        rows += (f"<div class='vl-row'>{ico}"
+                 f"<div class='vl-tx'><b class='{tier_cls}'>{esc(it['name'])}{esc(qty)}</b>"
+                 f"<span>{esc(ty)}</span></div>{pw}</div>")
+    body = (f"<style>{_LO_CSS}{_VL_CSS}</style>"
+            "<h1>仓库搜索</h1>"
+            f"<div class='sub'>{esc(data.get('name') or '')} · 关键词「{esc(data.get('kw') or '')}」 · "
+            f"命中 {data.get('total') or 0} 件"
+            + ("（只显示前 30）" if (data.get("total") or 0) > 30 else "")
+            + "</div>"
+            f"<div class='vl-grid'>{rows}</div>"
+            "<div class='foot'>命运2 查询 · 数据来自 Bungie.net · 搜索范围：仓库/角色背包/"
+            "已装备（官方仅本人可见，用你 /登录 授权的账号读取）</div>")
     return _page(body)
 
 

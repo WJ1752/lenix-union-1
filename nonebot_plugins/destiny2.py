@@ -12,6 +12,7 @@
 触发词对齐小日向（`/中文` 形式），**必须带 `/` 前缀**，且命令词后要紧跟空白或直接结束
 （`pve是顺手写的` 这种连写不会被当成指令）；旧 `d2` 系列保留为别名：
   /绑定 玩家名#1234   → 绑定自己的账号（之后玩家查询可省去名字）
+                         同名多平台账号时末尾可指定平台：/绑定 名字#1234 steam
   /解绑                → 解除绑定
   /我的                → 查看当前绑定账号（别名 账号）
   /玩家 玩家名#1234    → 基础信息（最高光能、各角色）      别名 d2；已绑定可省略名字
@@ -24,8 +25,13 @@
   /战绩                → 最近对局流（全模式）                别名 历史、最近对局、d2历史
   /热力图              → 按赛季分组的全历史活跃日历           别名 活跃、d2热力图
   /锻造                → 武器锻造图案进度                   别名 图案、d2锻造
+  /催化                → 异域武器催化进度（动能/能量/威能）    别名 异域催化、催化剂、d2催化
   /称号                → 称号进度（含镀金）                 别名 d2称号
   /队伍                → 当前活动队友简报（突袭/地牢/PvP/智谋通用）别名 队友、fireteam
+  /队伍配装            → 当前队伍各成员已装备栏（超能/武器perk/护甲模组）别名 配装、loadout
+  /配装 数字           → 游戏内 20 套配装槽位（仅本人可见，先 /登录）例：/配装 14
+  /仓库 关键词         → 搜自己 仓库/背包/已装备（中文名片段，先 /登录）
+  /登录                → 群友各自授权 Bungie 账号（token 只存本机）；/回调 地址 补完授权
   /常用武器 [范围]     → PVP 武器排名 + 爆头率（默认全生涯）      别名 生涯武器、pvp生涯武器、武器统计、mvp
                          范围可写 s27 / 赛季27 / 全生涯，例：/pvp生涯武器 s27
   /武器查询 <名称>     → 武器 perk 池（特性/枪管/弹匣/枪托）别名 d2武器
@@ -37,7 +43,7 @@
   @机器人 <名称>       → 群里直接 @ 机器人接武器名/护甲名/perk名，自动出对应卡片（小日向式）
   /帮助                → 指令一览                          别名 help、菜单
 
-玩家类指令（/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /锻造 /称号
+玩家类指令（/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /锻造 /催化 /称号
 /生涯武器 /pve生涯武器）后面可以跟一个 `@某人`：对方绑定过账号就直接查 TA 的，
 例 `/生涯 @小明`、`/pve生涯武器 @小明 s27`。**@ 必须放在指令后面**；对方没绑定时
 提示「TA 还没绑定」，不会悄悄退回发起人自己的账号。
@@ -62,7 +68,10 @@ from nonebot.rule import Rule
 
 import bot_cards
 import bot_fireteam
+import bot_loadout
 import bot_platform as bp
+import bot_tunnel
+import bungie_auth
 
 try:
     import weapon_usage
@@ -168,7 +177,7 @@ async def _reply(matcher, event: Event, text: str):
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"[发送失败] {text[:24]}：{exc}")
+        _log_out(event, f"{_send_err_tag(exc)} {text[:24]}：{exc}")
 
 
 async def _reply_image(matcher, event: Event, png: bytes, label: str):
@@ -187,7 +196,7 @@ async def _reply_image(matcher, event: Event, png: bytes, label: str):
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"[发送失败] {label}：{exc}")
+        _log_out(event, f"{_send_err_tag(exc)} {label}：{exc}")
 
 
 async def _send_card(matcher, event: Event, html: str, label: str, fallback: str):
@@ -210,6 +219,15 @@ def _exc_msg(exc: Exception) -> str:
     # 超时类异常（httpx.ReadTimeout 等）的 str() 是空串，只拼 exc 会显示成
     # 「接口暂时不可用：」，带上类型名才能看出是超时
     return f"{type(exc).__name__}: {exc}".strip()
+
+
+def _send_err_tag(exc: Exception) -> str:
+    """发送层异常分类：NapCat 调 QQ 的 sendMsg 等回执超时（retcode 1200 /
+    NTEvent Timeout）时消息其实多半已进群——只是 QQ 没在时限内回执，重发反而双发。
+    单独标「发送超时」，面板上一眼区分于真失败（掉线/风控）；其余照旧标「发送失败」"""
+    s = f"{type(exc).__name__}: {exc}"
+    return ("[发送超时·多半已送达]" if ("1200" in s or "Timeout" in s or "超时" in s)
+            else "[发送失败]")
 
 
 @run_postprocessor
@@ -383,28 +401,53 @@ mine_query = on_command("我的", aliases={"账号", "me"}, priority=7, block=Tr
 async def _(event: Event, args: Message = CommandArg()):
     if not _allowed_group(event):
         return
-    name = args.extract_plain_text().strip()
-    if not name:
+    raw = args.extract_plain_text().strip()
+    if not raw:
         await _notice(bind_query, event, "绑定账号",
-                      ["用法：<code>/绑定 玩家名#1234</code>（例如 <code>/绑定 小日向#21662</code>）"],
-                      fallback="用法：/绑定 玩家名#1234")
+                      ["用法：<code>/绑定 玩家名#1234</code>（例如 <code>/绑定 小日向#21662</code>）",
+                       "名字下挂多个平台账号时可在末尾指定平台："
+                       "<code>/绑定 玩家名#1234 steam</code>（steam/psn/xbox/epic）"],
+                      fallback="用法：/绑定 玩家名#1234 [平台]")
         return
-    member = await d2.resolve_member(name)
+    parts = raw.split()
+    plat = parts[-1].lower() if len(parts) >= 2 else ""
+    name = parts[0]
+    member = await d2.resolve_member(name, platform=plat)
     if not member:
-        await _notice(bind_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
-                      kind="warn", fallback=f"没找到玩家 {name}")
+        if plat:
+            await _notice(bind_query, event, "没找到这个平台的账号",
+                          [f"<code>{name}</code> 名下没有 {plat.upper()} 平台的成员号，"
+                           f"确认平台拼写（steam/psn/xbox/epic）后重试"],
+                          kind="warn", fallback=f"没找到 {name} 的 {plat} 账号")
+        else:
+            await _notice(bind_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
+                          kind="warn", fallback=f"没找到玩家 {name}")
         return
     canonical = f"{member['display']}#{d2.fmt_code(member['code'])}"
     d = _load_bindings()
     d[_uid(event)] = canonical
     _save_bindings(d)
-    # 存 membershipId：以后玩家在棒鸡侧改名，每日同步能靠它对回同一个人
+    # 存 membershipId：以后玩家在棒鸡侧改名，每日同步能靠它对回同一个人；
+    # platform 只在用户点名平台时记录——同名多真档案的玩家，查询时按它解析
     meta = d2.load_binding_meta()
     meta[_uid(event)] = {"mid": str(member["mid"]), "mtype": member["mtype"],
                          "name": canonical, "checked": time.time()}
+    if plat:
+        meta[_uid(event)]["platform"] = plat
     d2.save_binding_meta(meta)
-    await _notice(bind_query, event, "绑定成功", [f"已绑定 <b>{canonical}</b>",
-                 "以后直接发 <code>/生涯</code>、<code>/玩家</code> 即可，不用再带名字"],
+    lines = [f"已绑定 <b>{canonical}</b>（{member.get('platform', '?')}）",
+             "以后直接发 <code>/生涯</code>、<code>/玩家</code> 即可，不用再带名字"]
+    if member.get("candidates", 1) > 1:
+        tip = (f"注意：这个名字下有 <b>{member['candidates']}</b> 个平台账号，"
+               f"已自动选择有档案的 <b>{member.get('platform', '?')}</b> 号")
+        if plat:
+            tip = f"已按你的选择绑定 <b>{member.get('platform', '?')}</b> 号（名字下共 {member['candidates']} 个平台账号）"
+        tip += "；要换平台：/绑定 玩家名#编号 平台名"
+        lines.append(tip)
+    if not member.get("valid_account", True):
+        lines.append("<b>警告：这个平台号下没有命运2档案</b>，查询会报错——"
+                     "确认平台名是否写对（steam/psn/xbox/epic）")
+    await _notice(bind_query, event, "绑定成功", lines,
                   kind="ok", fallback=f"绑定成功：{canonical}")
 
 
@@ -444,14 +487,16 @@ async def _(event: Event, args: Message = CommandArg()):
     name = await _player_arg(base_query, event, args)
     if not name:
         return
-    try:
-        data = await d2.full_report(name)
-    except LookupError:
-        await _notice(base_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
+    jid = await d2.start_profile_job(name, "full", who=_who(event))
+    if not jid:
+        await _notice(base_query, event, "没找到玩家",
+                      [f"确认名字和 <code>#编号</code> 后重试：{name}"],
                       kind="warn", fallback=f"没找到玩家 {name}")
         return
-    await _send_card(base_query, event, bot_cards.player_card(data),
-                     f"玩家卡片 {data['display']}", f"【{data['display']}】的最高光能：{data['max_light']}")
+    await _working(base_query, event, "查询中",
+                   [*_queue_line(jid, serial=False), "拉取档案和三模式统计，请稍候…"])
+    await _jobs_card(base_query, event, jid, "玩家卡片",
+                     bot_cards.player_card, f"玩家卡片 {name}")
 
 
 @career_query.handle()
@@ -461,14 +506,17 @@ async def _(event: Event, args: Message = CommandArg()):
     name = await _player_arg(career_query, event, args)
     if not name:
         return
-    try:
-        data = await d2.career_report(name)
-    except LookupError:
-        await _notice(career_query, event, "没找到玩家", [f"确认名字和 <code>#编号</code> 后重试：{name}"],
+    jid = await d2.start_profile_job(name, "career", who=_who(event))
+    if not jid:
+        await _notice(career_query, event, "没找到玩家",
+                      [f"确认名字和 <code>#编号</code> 后重试：{name}"],
                       kind="warn", fallback=f"没找到玩家 {name}")
         return
-    await _send_card(career_query, event, bot_cards.career_card(data),
-                     f"生涯面板 {data['display']}", f"【{data['display']}】的生涯面板")
+    await _working(career_query, event, "生涯统计中",
+                   [*_queue_line(jid, serial=False),
+                    "要拉各角色分模式统计和逐赛季数据，第一次查要十几秒，请稍候…"])
+    await _jobs_card(career_query, event, jid, "生涯面板",
+                     bot_cards.career_card, f"生涯面板 {name}")
 
 
 weapon_query = on_command("武器查询", aliases={"d2武器"}, priority=8, block=True,
@@ -816,7 +864,7 @@ async def _(event: Event):
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"[发送失败] 进度文字：{exc}")
+        _log_out(event, f"{_send_err_tag(exc)} 进度文字：{exc}")
     if data.get("rows"):
         await _send_card(cp_query, event, bot_cards.checkpoint_card(data),
                          "进度", "进度数据获取失败")
@@ -880,7 +928,7 @@ async def _(event: Event, args: Message = CommandArg()):
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"[发送失败] 掉落表 {key}：{exc}")
+        _log_out(event, f"{_send_err_tag(exc)} 掉落表 {key}：{exc}")
         raise
 
 
@@ -972,6 +1020,8 @@ forge_query = on_command("锻造", aliases={"图案", "锻造图案", "d2锻造"
                          block=True, force_whitespace=True)
 title_query = on_command("称号", aliases={"d2称号"}, priority=8, block=True,
                          force_whitespace=True)
+cata_query = on_command("催化", aliases={"异域催化", "催化剂", "d2催化"}, priority=8,
+                        block=True, force_whitespace=True)
 wpvp_query = on_command("常用武器", aliases={"武器统计", "mvp", "d2武器统计",
                                           "生涯武器", "pvp生涯武器", "pvp武器"},
                         priority=8, block=True, force_whitespace=True)
@@ -1019,7 +1069,7 @@ async def _wait_job(jid: str, timeout: float = 1200.0) -> dict:
     return d2.JOBS.get(jid) or {}
 
 
-def _queue_line(jid: str) -> list[str]:
+def _queue_line(jid: str, serial: bool = True) -> list[str]:
     """任务状态提示。返回若干行：命中去重/缓存时不说「要翻几百页」，免得用户以为又在全量重跑"""
     j = d2.JOBS.get(jid) or {}
     if j.get("status") == "done":
@@ -1031,6 +1081,8 @@ def _queue_line(jid: str) -> list[str]:
     if d2.job_shared(jid):  # 复用了别人正在跑的那个任务
         return ["这份数据已经在统计了，跑完直接出图，不用重复排队"]
     pos = d2.queue_position(jid)
+    if not serial:
+        return ["正在查询，请稍候…"]
     if not pos:
         return ["生涯任务一个个跑（避免同时拉 PGCR 被 Bungie 限流拖慢），现在正在统计…"]
     return [f"前面还有 <b>{pos}</b> 位在统计，已排队；生涯任务一个个跑反而更快，跑完会自动出图"]
@@ -1040,9 +1092,14 @@ async def _jobs_card(matcher, event: Event, jid: str, title: str, card_fn, label
     """后台任务 → 等结果 → 出卡片（失败给提示卡）"""
     j = await _wait_job(jid)
     if j.get("status") != "done":
-        await _notice(matcher, event, f"{title}失败",
-                      ["统计没跑完（接口超时或网络中断），稍后再试"],
-                      kind="warn", fallback=f"{title}失败")
+        err = str(j.get("error") or "")
+        if "档案" in err:
+            # 私密档案 / 平台空号：这是明确的"查不了"，不是故障
+            await _notice(matcher, event, "查不了这个玩家", [err], kind="warn", fallback=err)
+        else:
+            await _notice(matcher, event, f"{title}失败",
+                          ["统计没跑完（接口超时或网络中断），稍后再试"],
+                          kind="warn", fallback=f"{title}失败")
         return
     await _send_card(matcher, event, card_fn(j["result"]), label, title)
 
@@ -1164,6 +1221,10 @@ async def _(event: Event, args: Message = CommandArg()):
         return
     try:
         data = await d2.node_report(name, "patterns")
+    except d2.PlayerLookupError as e:
+        await _notice(forge_query, event, "查不了这个玩家", [str(e)],
+                      kind="warn", fallback=str(e))
+        return
     except LookupError:
         await _not_found(forge_query, event, name)
         return
@@ -1181,12 +1242,33 @@ async def _(event: Event, args: Message = CommandArg()):
         return
     try:
         data = await d2.node_report(name, "titles")
+    except d2.PlayerLookupError as e:
+        await _notice(title_query, event, "查不了这个玩家", [str(e)],
+                      kind="warn", fallback=str(e))
+        return
     except LookupError:
         await _not_found(title_query, event, name)
         return
     await _send_card(title_query, event, bot_cards.nodes_card(data),
                      f"称号 {data['display']}",
                      f"{data['display']} · 称号 {data['done']}/{data['total']}")
+
+
+@cata_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    name = await _need_player(cata_query, event, args)
+    if not name:
+        return
+    jid = await d2.start_profile_job(name, "catalysts", who=_who(event))
+    if not jid:
+        await _not_found(cata_query, event, name)
+        return
+    await _working(cata_query, event, "催化统计中",
+                   [*_queue_line(jid, serial=False), "拉取全部异域催化记录，请稍候…"])
+    await _jobs_card(cata_query, event, jid, "异域催化",
+                     bot_cards.nodes_card, f"异域催化 {name}")
 
 
 @wpvp_query.handle()
@@ -1253,8 +1335,8 @@ async def _(event: Event, args: Message = CommandArg()):
                      f"宗师战绩 {name}")
 
 
-HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /称号 /锻造 "
-              "/生涯武器 /pve生涯武器 /宗师 /队伍 /武器查询 /perk查询 /护甲查询 /护甲套装 /每日光尘 /老九 /轮换 /绑定 /我的 /解绑")
+HELP_PLAIN = ("指令一览：/玩家 /生涯 /raid /地牢 /pvp /pve /智谋 /战绩 /热力图 /称号 /锻造 /催化 "
+              "/生涯武器 /pve生涯武器 /宗师 /队伍 /队伍配装 /配装数字 /仓库 /登录 /武器查询 /perk查询 /护甲查询 /护甲套装 /每日光尘 /老九 /轮换 /绑定 /我的 /解绑")
 
 
 @help_query.handle()
@@ -1290,3 +1372,150 @@ async def _(event: Event, args: Message = CommandArg()):
         return
     await _send_card(fireteam_query, event, bot_cards.fireteam_card(data),
                      f"当前队伍 {data['name']}", f"{data['name']} · 队伍简报")
+
+
+# ---------- /登录：群友各自授权 Bungie（/配装数字 /仓库 用） ----------
+login_query = on_command("登录", aliases={"绑定登录", "授权登录", "bungie登录"}, priority=8,
+                         block=True, force_whitespace=True)
+
+
+@login_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    if not bungie_auth.configured():
+        await login_query.send("未配置 BUNGIE_CLIENT_ID（.env），管理员先看面板的 Bungie 授权页。")
+        return
+    qq = event.get_user_id()
+    st = bungie_auth.user_status(qq)
+    cur = (f"当前已登录：{st['display_name']}；重新登录会覆盖。" if st.get("authorized")
+           else "登录后可用：/配装 数字（游戏内20套配装）、/仓库 关键词。")
+    # 公网隧道链接（任意网络全自动）优先；没起隧道退回 本机/局域网/粘贴
+    tun_origin = await asyncio.to_thread(bot_tunnel.callback_origin)
+    lines = ["Bungie 账号登录（仅本人可见的数据用你自己的授权读取，token 只存在本机）："]
+    if tun_origin:
+        lines += [
+            bungie_auth.auth_url(qq=qq, origin=tun_origin),
+            "↑ 任意网络的设备点这条：登录 Bungie 并点「允许」后**自动完成绑定**，"
+            "回群直接用 /配装 数字、/仓库 关键词。",
+        ]
+    url = bungie_auth.auth_url(qq=qq)
+    lines += [
+        url,
+        "↑ 在 bot 这台电脑上点这条（同样自动完成；提示证书不安全可先在面板点"
+        "「信任本机证书」）。",
+    ]
+    origin = bungie_auth.lan_redirect_origin()
+    if origin:
+        lines += [
+            bungie_auth.auth_url(qq=qq, origin=origin),
+            "↑ 和 bot 同一 Wi-Fi/局域网的设备点这条（自动完成，提示不安全→高级→继续访问）。",
+        ]
+    lines += [
+        "上面链接都点不通（隧道/局域网都不可用）时：点完「允许」复制地址栏整条，"
+        "发「/回调 那串地址」完成。",
+        cur,
+    ]
+    await login_query.send("\n\n".join(lines))
+
+
+callback_query = on_command("回调", aliases={"授权回调"}, priority=8, block=True,
+                            force_whitespace=True)
+
+
+@callback_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    text = str(args).strip()
+    code, state = bungie_auth.parse_code(text)
+    if not code:
+        await callback_query.send("没解析到授权码：把授权完跳转的那串地址（含 code=…&state=…）"
+                                  "整条发出来，如「/回调 https://127.0.0.1:8902/bungie/callback?code=…」")
+        return
+    if not bungie_auth.check_state(state):
+        await callback_query.send("state 校验失败（过期或不匹配）：重新发 /登录 再走一遍。")
+        return
+    try:
+        tok = await bungie_auth.exchange(code, bungie_auth.redirect_from_text(text), state)
+    except Exception as exc:  # noqa: BLE001
+        await callback_query.send(f"换取 token 失败：{_exc_msg(exc)}")
+        return
+    qq = event.get_user_id()
+    if tok.get("is_user") and str(tok.get("qq")) == str(qq):
+        await callback_query.send(f"登录成功：{tok.get('display_name') or 'Bungie 账号'}\n"
+                                  "现在可以用 /配装 数字、/仓库 关键词 了。")
+    elif tok.get("is_user"):
+        await callback_query.send(f"登录成功：{tok.get('display_name') or ''}\n"
+                                  f"但发起登录的是 QQ {tok.get('qq')}，请让本人粘贴回调地址。")
+    else:
+        await callback_query.send("这个授权码不是 /登录 发起的（面板主账号流程走面板），"
+                                  "群内请先 /登录。")
+
+
+# ---------- /仓库 关键词：搜自己的仓库/背包/已装备 ----------
+vault_query = on_command("仓库", aliases={"仓库搜索", "vault"}, priority=8, block=True,
+                         force_whitespace=True)
+
+
+@vault_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    kw = str(args).strip()
+    if not kw:
+        await vault_query.send("用法：/仓库 关键词（中文名片段，如 /仓库 隐秘）")
+        return
+    qq = event.get_user_id()
+    try:
+        data = await bot_loadout.vault_search(qq, kw[:24])
+    except Exception as exc:  # noqa: BLE001  未授权/刷新失败等都给提示
+        await _notice(vault_query, event, "仓库搜索失败",
+                      [f"<code>{_html.escape(_exc_msg(exc)[:120])}</code>"],
+                      kind="warn", fallback=f"仓库搜索失败：{_exc_msg(exc)}")
+        return
+    await _send_card(vault_query, event, bot_cards.vault_card(data),
+                     f"仓库 {kw}", f"仓库搜索 · {kw}")
+
+
+# ---------- /队伍配装：当前队伍各成员已装备栏 ----------
+loadout_query = on_command("队伍配装", aliases={"配装", "loadout", "d2配装"}, priority=8,
+                           block=True, force_whitespace=True)
+
+
+@loadout_query.handle()
+async def _(event: Event, args: Message = CommandArg()):
+    if not _allowed_group(event):
+        return
+    # /配装 数字 → 读发起者自己的第 N 套游戏内配装（官方仅本人可见，需 /登录）
+    arg_text = str(args).strip()
+    m = re.search(r"(?<!\S)(\d{1,2})(?!\S)", arg_text)
+    if m:
+        slot = int(m.group(1))
+        qq = event.get_user_id()
+        try:
+            data = await bot_loadout.collect_ingame(qq, slot)
+        except Exception as exc:  # noqa: BLE001  未授权/序号越界/组件私有 → 提示卡
+            await _notice(loadout_query, event, "游戏内配装读取失败",
+                          [f"<code>{_html.escape(_exc_msg(exc)[:120])}</code>"],
+                          kind="warn", fallback=f"游戏内配装读取失败：{_exc_msg(exc)}")
+            return
+        await _send_card(loadout_query, event, bot_cards.loadout_card(data),
+                         f"配装 {slot} {data['name']}", f"游戏内配装 {slot}")
+        return
+    name = await _need_player(loadout_query, event, args)
+    if not name:
+        return
+    try:
+        data = await bot_loadout.collect(name)
+    except LookupError:
+        await _not_found(loadout_query, event, name)
+        return
+    except Exception as exc:  # noqa: BLE001  接口/网络异常给提示卡，不静默
+        msg = _html.escape(_exc_msg(exc)[:80])   # 超时类 str() 为空，必须带类型名
+        await _notice(loadout_query, event, "配装查询失败",
+                      [f"接口异常：<code>{msg}</code>，稍后再试"],
+                      kind="warn", fallback=f"配装查询失败：{_exc_msg(exc)}")
+        return
+    await _send_card(loadout_query, event, bot_cards.loadout_card(data),
+                     f"队伍配装 {data['name']}", f"{data['name']} · 队伍配装")

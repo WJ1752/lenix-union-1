@@ -1,6 +1,83 @@
 # 开发记录与实现笔记
 
-> 本文件保留项目全部功能演进记录与踩坑笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
+> 本文件保留项目全部功能演进记录与实现笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
+
+## 2026-10-07 /登录 多用户授权 + /配装数字 + /仓库搜索
+
+- **公网隧道自动回跳（小日向同款单链接登录）**：仓库根放一份 cloudflared.exe（免费临时
+  隧道，免安装免注册），/登录 时按需拉起 `cloudflared tunnel --url http://127.0.0.1:8903`
+  → 得到 https://xxx.trycloudflare.com 公网地址，授权链接把回跳指过去——**任意网络的
+  设备点完「允许」直接落回 bot 自动绑定**，无需粘贴。隧道转发的本机口（8903，只听
+  127.0.0.1）与 TLS 口一样只挂 bungie_tls_app 单个回调路由；flow 记住每次授权的
+  redirect_uri，回调经隧道进来本机看到 127.0.0.1 也不会错配。隧道域名随机且只在
+  /登录 时按需常驻；没放 cloudflared.exe 或起不来时自动退回 局域网链接 + /回调 粘贴。
+  实测公网链路（边缘→隧道→本机回调）200 全通。注意本机若 DNS 解析不了
+  trycloudflare.com（实测这台机器 getaddrinfo 失败、nslookup 正常，疑似加速器 NRPT
+  残留），不影响远程用户打开，只影响本机自己点隧道链接。
+- **局域网设备免粘贴**：/登录 附第二条回跳指向本机内网 IP（lan_redirect_origin，
+  UDP connect 探测）的授权链接——同一 Wi-Fi 的设备点完「允许」直接落到 bot 的 TLS
+  授权成功页，自动完成，不用再 /回调 粘贴。为此：TLS 口改绑 0.0.0.0 且换成只含
+  /bungie/callback 的 `bungie_tls_app`（不把面板/管理接口暴露给局域网）；flow 里记住
+  每次授权的 redirect_uri，换 token 优先用它。跨网络的设备在隧道不可用时仍走
+  /回调 粘贴。首次从局域网访问浏览器会有自签证书警告（高级→继续访问），面板
+  「信任本机证书」按钮（certutil -user -addstore Root）可一次性消除。
+- **授权链接不再传 scope**：Bungie 对 authorize 里的 scope 参数直接报 invalid_scope
+  （「Scope is always configured value. Do not specify scope parameter.」），权限只认
+  开发者应用页注册值；去掉后实测旧 token 也能读游戏内配装 206 与完整库存。
+- **面板「信任本机证书」按钮**：/api/bungie/trust_cert 把 certs/localhost.pem 装进
+  当前用户受信任根，消除授权回跳的「不安全」警告。
+- **/登录（别名 绑定登录/授权登录）**：群友各自授权自己的 Bungie 账号——发 /登录 拿
+  授权链接（state 绑定发起 QQ），授权完浏览器落到 127.0.0.1:8902（本机操作直接成功；
+  手机/别的电脑打不开没关系，复制地址栏整条发 /回调 那串地址）。token 按 QQ 存
+  `bungie_tokens.json`（过期自动续，一次性 refresh_token 失败重试一次），与面板授权的
+  主账号（`bungie_token.json`，/每日光尘 用）互不影响；/绑定 玩家绑定保持原样。
+- **/配装 数字（1-20）**：读发起者自己的第 N 套**游戏内配装**（官方组件 206
+  CharacterLoadouts，DIM 同款；仅 token 本人可见）。实测要点：
+  - itemComponents(300/305) 只对「随请求一起拉了 102/201/205 的物品」生成——只给
+    206/300/305 时 instances 是空的，配装件拿不到 hash/光等；
+  - instances 组件**不带 itemHash/bucketHash**，要从 102/201/205 物品清单按
+    instanceId 反查；
+  - 配装件的 `plugItemHashes` = 逐插槽下标的当前插值（空插槽 = 2166136261，DIM 的
+    UNSET_PLUG_HASH 同值），碎片/模组/特长全在里面，芯片过滤与实装卡同一套口径。
+  卡片复用配装模板，标题「游戏内配装 N」。默认 /配装（不带数字）仍读当前已装备。
+- **/仓库 关键词**：搜发起者自己的 仓库/角色背包/已装备（组件 102/201/205+300，仅本人
+  可见），中文名片段匹配（含无符号归一化），按光等排序，最多 30 条双列卡片。
+- 未授权发 /配装数字 或 /仓库 会得到「先发 /登录」提示卡，不静默失败。
+
+## 2026-10-06 /队伍配装 + /轮换 宗师掉落武器
+
+- **新增 /队伍配装（别名 配装 / loadout）**：当前队伍各成员已装备栏整卡——徽标横幅 +
+  职业/光等 + 六维 + 子职业（超能/技能/分支/碎片四行芯片）+ 左武器右护甲两列（武器
+  固有/枪管/弹匣/双特长/原始特性芯片，护甲插着的模组芯片 + 光等）。
+  - 名单复用 `bot_fireteam.collect` 的队伍发现（对局里→本场 PGCR 名单，轨道/在线→
+    transitory 实时队伍），新增 `bot_fireteam` 两条返回路径带 `roster`（mid/mtype/name）。
+  - 每人一次 `GetProfile components=200,205,300,305`（免授权，走对方库存隐私设置；
+    205/305 缺 = 库存隐私私有，出「装备不可见」占位行不拖垮整卡）。命名/图标全走本地
+    manifest（raw_items zh + plug_meta），除名单发现外每人只发 1 个 API 请求。
+  - 插件分类按 zh manifest `itemTypeDisplayName`（2026-10 实测）：武器芯片白名单
+    「固有/枪管/弹匣/特性(强化特征变体)/原始特性」子串匹配，自动滤掉着色器/外观/
+    击杀记录器/塑形/空插槽；护甲芯片 = 「护甲模组」结尾 + 调谐模组（+属性/-属性）；
+    子职业 = 超能技能→超能、「星相」→分支、「碎片」→碎片、其余→技能。
+  - 新增 `bot_loadout.py`（采集）+ `bot_cards.loadout_card`（模板，样式内联 _LO_CSS）。
+- **配装卡三处修正（2026-10-07 首轮反馈）**：①六维换 Edge of Fate 新属性制——Bungie
+  沿用旧 stat hash 但含义已换成 武器/生命/职业/超能/手雷/近战（上限 200+），旧代码按
+  移动/韧性/恢复/纪律/智慧/力量标注全是错的；②子职业大图标：装备槽 def 的图标是通用
+  元素菱形（火焰等），好看的职业纹章在同名的 itemCategoryHashes 含 3109687656 的 def
+  上——`build_item_index.py` 新增 `sub_crest.json`（名→纹章图标，覆盖光系+棱镜，
+  冰影/缠绕无纹章 def 回退菱形）；③排版：武器行带光等、机灵（含机灵模组芯片）补进
+  武器列平衡左右高度、成员块间距收紧。
+- **配装卡名牌重做（同日反馈）**：原先把 96×96 的 `emblemPath` 纹章方块当横幅背景
+  整条拉伸，糊成一团。正确结构是两个字段各司其职——`emblemPath`（96×96 纹章）原
+  尺寸放左侧圆角方块，`emblemBackgroundPath`（474×96 宽幅底图）原比例左铺，右侧
+  渐隐进面板底色；底图缺失才回退拉伸。
+- **重要教训：改完必须重打包**——bot 跑的是 `dist_new\D2Query\D2Query.exe`（PyInstaller），
+  外置 .py 只是留档（FrozenImporter 优先），源码改了不 build+deploy_exe.ps1 等于没改；
+  且 raw_items.json / raw_items_en_lite.json（220MB/65MB）不进包，运行时需要它们的
+  新功能要先抽成紧凑索引（build_item_index.py）。
+- **/轮换 宗师板块加首通掉落武器**：lfcarry 轮换页本身带「weekly challenge weapon」
+  一句，`gm_this_week` 顺带解析——英文武器名经 raw_items_en_lite 反查 hash、过
+  weapons.json 映射中文名/类型/图标，宗师横图左下出「首通掉落 · 急锋（刀剑）」芯片。
+  `gm_cache.json` 缓存版本升 v2（本周缓存自动重取）。
 
 ## 2026-10-05 /raid /地牢 缓存提速 + 后台任务进度 + 地牢徽章对齐（二）
 

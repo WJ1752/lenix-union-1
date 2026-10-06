@@ -341,7 +341,8 @@ async function refreshBungie(){
   }
   box.innerHTML = '<span class="off">● 未授权</span>'
     + '<div class="dim" style="margin-top:6px">① 点下面按钮去 Bungie 登录并同意；'
-    + '② 跳回来时浏览器若提示「不安全」没关系，把<b>地址栏那一整条地址</b>复制下来，'
+    + '② 跳回来若提示「不安全」，点「信任本机证书」装一次证书（弹窗点「是」）后重试，'
+    + '即可直接落到授权成功页；不想装就把<b>地址栏那一整条地址</b>复制下来，'
     + '粘到下面框里点完成。</div>'
     + '<div style="margin-top:8px"><a href="/bungie/authorize" target="_blank">'
     + '<button>打开 Bungie 授权页</button></a></div>'
@@ -350,6 +351,8 @@ async function refreshBungie(){
     + 'border:1px solid #2a2e33;background:#1b1e22;color:#e8e6e3;font-size:12px">'
     + '<button onclick="bungieManual()">完成授权</button></div>'
     + '<div class="dim" id="bmsg" style="margin-top:6px"></div>'
+    + '<div style="margin-top:8px"><button class="ghost" onclick="trustCert()">信任本机证书'
+    + '（免「不安全」警告）</button> <span id="tmsg" class="dim"></span></div>'
     + '<div class="dim" style="margin-top:4px;word-break:break-all">程序使用的回调地址：<code>'
     + esc(s.redirect_uri || '') + '</code>（Bungie 应用里登记的 Redirect URL 必须与它完全一致，'
     + '换 token 时会先试你粘的地址、再试这条）</div>'
@@ -368,6 +371,15 @@ async function bungieManual(){
     if(r.ok){ refreshBungie(); }
     else if(msg){ msg.innerHTML = '<span class="off">' + esc(r.error||'授权失败') + '</span>'; }
   }catch(e){ if(msg) msg.textContent = '请求失败，稍后重试'; }
+}
+async function trustCert(){
+  const el = document.getElementById('tmsg');
+  if(el) el.textContent = '执行中…若弹出 Windows 安全提示请点「是」';
+  try{
+    const r = await (await fetch('/api/bungie/trust_cert',{method:'POST'})).json();
+    if(el) el.textContent = r.ok ? '✓ 已装入受信任根，重启浏览器后生效'
+                                 : ('失败：'+(r.error||'未知'));
+  }catch(e){ if(el) el.textContent = '失败：'+e; }
 }
 async function bungieRefresh(){
   const msg = document.getElementById('bmsg2');
@@ -860,7 +872,7 @@ async def card(name: str, mode: str = "all", base: str = "", month: str = "",
             data = await d2.raid_report(name, amode)
             return HTMLResponse(render_raid_detail(data, base, month, amode, diff))
         data = await d2.full_report(name)
-    except LookupError as e:
+    except (LookupError, RuntimeError) as e:
         return HTMLResponse(f"<h2 style='color:#eee;font-family:sans-serif'>{e}</h2>")
     return HTMLResponse(render_card(data, mode))
 
@@ -1081,6 +1093,28 @@ def bungie_status():
     return bungie_auth.status()
 
 
+@app.post("/api/bungie/trust_cert")
+async def bungie_trust_cert():
+    """把自签 localhost 证书装进当前用户的「受信任的根证书颁发机构」，
+    消除授权回跳时浏览器的「你的连接不是专用连接」警告（Windows，弹一次系统确认框）。"""
+    cert, _key = bungie_auth.cert_files()
+    if not cert:
+        return {"ok": False, "error": "没找到自签证书文件（certs/localhost.pem）"}
+    if os.name != "nt":
+        return {"ok": False, "error": "仅支持 Windows"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "certutil", "-user", "-addstore", "Root", cert,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        text = out.decode("gbk", "replace")
+        if proc.returncode == 0:
+            return {"ok": True}
+        return {"ok": False, "error": text.strip()[-300:] or f"certutil 退出码 {proc.returncode}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.post("/api/bungie/refresh")
 async def bungie_refresh():
     """手动续期：token 过期就用 refresh_token 换新的（refresh_token 一次性，失败报真实原因）"""
@@ -1127,25 +1161,43 @@ async def bungie_manual(request: dict):
     return {"ok": True, "display_name": st.get("display_name", ""), "state_ok": bungie_auth.check_state(state)}
 
 
-@app.get("/bungie/callback", response_class=HTMLResponse)
-async def bungie_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+async def _bungie_callback_page(request: Request, code: str = "", state: str = "", error: str = "") -> str:
+    """Bungie 授权回跳页（面板 8900 与 TLS 8902 口共用；TLS 口只挂这一个路由）"""
     back = ("<div style='margin-top:14px'><a href='/panel' "
             "style='color:#4b8fd4;font:14px sans-serif'>← 返回面板</a></div>")
     if error or not code:
-        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>{back}")
+        return f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>{back}"
     if not bungie_auth.check_state(state):
-        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>{back}")
+        return "<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>" + back
     try:
         # 实际落地 URL 的 scheme://host:port/path 才是发 code 那次授权真正用的 redirect_uri，
         # 拿它去换 token（换 token 的校验只认这个），配置值作为兜底重试
         ru = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
-        await bungie_auth.exchange(code, ru)
+        tok = await bungie_auth.exchange(code, ru, state)
     except Exception as exc:  # noqa: BLE001
-        return HTMLResponse(f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}")
-    return HTMLResponse("<h2 style='color:#35c66b;font-family:sans-serif'>授权成功</h2>"
-                        "<div style='font:14px sans-serif;color:#c5cacd'>可以关闭本页，回到面板或直接发 "
-                        "<code>/每日光尘</code>。</div>"
-                        "<script>setTimeout(function(){location.href='/panel'},2500)</script>" + back)
+        return f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}"
+    if tok.get("is_user"):
+        return (f"<h2 style='color:#35c66b;font-family:sans-serif'>授权成功：{d2.esc_err(tok.get('display_name') or '')}</h2>"
+                "<div style='font:14px sans-serif;color:#c5cacd'>已绑定该 QQ 用户，回群发 "
+                "<code>/配装 数字</code> 或 <code>/仓库 关键词</code> 即可。</div>" + back)
+    return ("<h2 style='color:#35c66b;font-family:sans-serif'>授权成功</h2>"
+            "<div style='font:14px sans-serif;color:#c5cacd'>可以关闭本页，回到面板或直接发 "
+            "<code>/每日光尘</code>。</div>"
+            "<script>setTimeout(function(){location.href='/panel'},2500)</script>" + back)
+
+
+@app.get("/bungie/callback", response_class=HTMLResponse)
+async def bungie_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    return HTMLResponse(await _bungie_callback_page(request, code, state, error))
+
+
+# TLS 口专用应用：只暴露授权回跳，不把面板/管理接口开放给局域网（_serve_tls 绑 0.0.0.0）
+bungie_tls_app = FastAPI()
+
+
+@bungie_tls_app.get("/bungie/callback", response_class=HTMLResponse)
+async def bungie_callback_tls(request: Request, code: str = "", state: str = "", error: str = ""):
+    return HTMLResponse(await _bungie_callback_page(request, code, state, error))
 
 
 @app.post("/api/bungie/logout")
@@ -1410,16 +1462,26 @@ def render_patterns(rep: dict) -> str:
             gild_note = (f"<span class='pgildcount'>镀金 {gd} / {len(gildable)}</span>")
         cards = ""
         for it in items:
-            cls = "pcard on" if it["completed"] else "pcard off"
+            # 三态：已获得（绿）／进行中（金，有进度没拿到）／未获得（灰暗）
+            if it["completed"]:
+                cls = "pcard on"
+            elif it.get("started"):
+                cls = "pcard mid"
+            else:
+                cls = "pcard off"
             if it.get("gilded"):
                 cls += " gold"
             tags = ""
+            # 可锻造异域的催化走"塑形应用"路线，单独立标（四选一的记得分清装了哪个）
+            if it.get("craftable"):
+                tags += "<span class='ptag craft'>锻造</span>"
             if it.get("gilded"):
                 tags += "<span class='ptag gold'>已镀金</span>"
             elif it.get("can_gild"):
                 tags += "<span class='ptag gild'>可镀金</span>"
             tags += ("<span class='ptag got'>已获得</span>" if it["completed"]
-                     else "<span class='ptag not'>未获得</span>")
+                     else ("<span class='ptag mid'>进行中</span>" if it.get("started")
+                           else "<span class='ptag not'>未获得</span>"))
             icon_cls = " class='gild'" if it.get("gilded") else (" class='gildable'" if it.get("can_gild") else "")
             sub = ""
             bar = ""
@@ -1429,6 +1491,8 @@ def render_patterns(rep: dict) -> str:
             if it.get("total_n"):
                 lab = "" if it.get("type") else "进度 "
                 bits.append(f"{lab}<b>{it['done_n']}/{it['total_n']}</b>")
+            if it.get("applied_name"):  # 可锻造异域实际装上的催化（读武器插槽）
+                bits.append(f"已装 <b>{esc(it['applied_name'])}</b>")
             if bits:
                 sub = f"<span class='psub'>{' · '.join(bits)}</span>"
             if it.get("total_n"):
@@ -1460,6 +1524,8 @@ def render_patterns(rep: dict) -> str:
             f"border:1px solid #2a2e33;border-radius:8px;padding:6px 8px;min-width:0}}"
             f".pcard.on{{border-color:rgba(53,198,107,.35)}}"
             f".pcard.off{{opacity:.45}}"
+            f".pcard.mid{{border-color:rgba(212,178,106,.5);opacity:.88}}"
+            f".pcard.mid .pbar i{{background:#d4b26a}}"
             f".pcard.gold{{border-color:rgba(212,178,106,.55);"
             f"background:linear-gradient(150deg,rgba(212,178,106,.10),#16181b 60%)}}"
             f".pcard img{{width:36px;height:36px;border-radius:6px;background:#0f1113;flex-shrink:0}}"
@@ -1478,6 +1544,8 @@ def render_patterns(rep: dict) -> str:
             f".ptag.gold{{color:#16181b;background:#d4b26a;font-weight:bold}}"
             f".ptag.gild{{color:#d4b26a;background:transparent;border:1px solid rgba(212,178,106,.5)}}"
             f".ptag.not{{color:#999;background:rgba(154,160,166,.15)}}"
+            f".ptag.mid{{color:#d4b26a;background:rgba(212,178,106,.15)}}"
+            f".ptag.craft{{color:#7ab7ff;background:transparent;border:1px solid rgba(122,183,255,.5)}}"
             f".pgildcount{{color:#d4b26a;font-size:12px;font-weight:normal;margin-left:2px}}"
             f"</style>")
     return CARD_CSS.replace("__BODY__", body)

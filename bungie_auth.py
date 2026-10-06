@@ -93,9 +93,12 @@ def cert_files() -> tuple[str, str]:
     return (cert, key) if cert and key else ("", "")
 
 TOKEN_FILE = "bungie_token.json"
+USER_TOKEN_FILE = "bungie_tokens.json"   # 多用户：QQ → token（/登录 授权，/配装数字 /仓库 用）
 _state: dict = {"v": ""}          # 防 CSRF 的 state（内存即可，进程内完成回跳）
 _pkce: dict = {"verifier": ""}    # 公开客户端用的 PKCE verifier
 _mem: dict = {"tok": None}        # token 缓存
+_flows: dict = {}                 # state → {"qq", "verifier", "at"}（面板与 /登录 共用）
+_utok: dict = {"data": None}      # 多用户 token 缓存
 
 
 def has_secret() -> bool:
@@ -148,21 +151,57 @@ def _b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 
-def auth_url() -> str:
-    """授权跳转地址（带一次性 state；公开客户端再带 PKCE）"""
+def lan_ip() -> str:
+    """本机局域网 IP（UDP connect 探测，不实际发包）；拿不到返回空串。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return ""
+    finally:
+        s.close()
+    return "" if ip.startswith("127.") else ip
+
+
+def lan_redirect_origin() -> str:
+    """局域网回跳源（https://内网IP:端口）；配置了固定 REDIRECT_URI 的端口沿用其端口。"""
+    ip = lan_ip()
+    if not ip:
+        return ""
+    from urllib.parse import urlparse
+    port = urlparse(REDIRECT_URI()).port or TLS_PORT
+    return f"https://{ip}:{port}"
+
+
+def auth_url(qq: str = "", origin: str = "") -> str:
+    """授权跳转地址（带一次性 state；公开客户端再带 PKCE）。
+
+    qq 非空 = 群里 /登录 发起的授权：state 记住发起者，回跳/回调后 token 落到
+    bungie_tokens.json[qq]（多用户），不影响面板授权的主账号。
+    origin 非空 = 回跳指向该源（如 https://内网IP:8902），供同局域网设备点完
+    「允许」直接落回 bot 完成授权；换 token 时用同一个地址即可。
+    """
     from urllib.parse import urlencode
-    _state["v"] = secrets.token_urlsafe(12)
+    state = secrets.token_urlsafe(12)
+    verifier = "" if has_secret() else _b64url(secrets.token_bytes(48))
+    redirect_uri = (origin.rstrip("/") + "/bungie/callback") if origin else REDIRECT_URI()
+    _flows[state] = {"qq": qq or "", "verifier": verifier, "at": time.time(),
+                     "redirect_uri": redirect_uri}
     params = {"client_id": CLIENT_ID(), "response_type": "code",
-              "state": _state["v"], "redirect_uri": REDIRECT_URI()}
-    if not has_secret():          # 公开客户端：PKCE
-        _pkce["verifier"] = _b64url(secrets.token_bytes(48))
-        params["code_challenge"] = _b64url(hashlib.sha256(_pkce["verifier"].encode()).digest())
+              "state": state, "redirect_uri": redirect_uri}
+    # 不要带 scope 参数：Bungie 现在直接报 invalid_scope
+    # 「Scope is always configured value. Do not specify scope parameter.」
+    # ——权限只认开发者应用页注册的 scope，链接里传什么都不行
+    if verifier:
+        params["code_challenge"] = _b64url(hashlib.sha256(verifier.encode()).digest())
         params["code_challenge_method"] = "S256"
     return f"{AUTHORIZE_URL}?{urlencode(params)}"
 
 
 def check_state(state: str) -> bool:
-    return bool(state) and state == _state["v"]
+    return bool(state) and state in _flows
 
 
 def parse_code(text: str) -> tuple[str, str]:
@@ -197,7 +236,7 @@ def redirect_from_text(text: str) -> str:
     return f"{u.scheme}://{u.netloc}{u.path}"
 
 
-async def _token_call(data: dict) -> dict:
+async def _token_call(data: dict, verifier: str = "") -> dict:
     """换/续 token。有 secret 走 Basic 认证；没有则把 client_id（和 PKCE verifier）放 body。"""
     d = dict(data)
     auth = None
@@ -205,8 +244,8 @@ async def _token_call(data: dict) -> dict:
         auth = (CLIENT_ID(), CLIENT_SECRET())
     else:
         d["client_id"] = CLIENT_ID()
-        if _pkce["verifier"] and d.get("grant_type") == "authorization_code":
-            d["code_verifier"] = _pkce["verifier"]
+        if verifier and d.get("grant_type") == "authorization_code":
+            d["code_verifier"] = verifier
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(TOKEN_URL, data=d, auth=auth,
                          headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -221,8 +260,34 @@ async def _token_call(data: dict) -> dict:
     return r.json()
 
 
-async def exchange(code: str, redirect_uri: str = "") -> dict:
+async def _membership_for(tok: dict) -> dict:
+    """用指定 token（而非主账号缓存）查命运2成员关系。"""
+    headers = {"X-API-Key": _env("BUNGIE_API_KEY"),
+               "Authorization": f"Bearer {tok.get('access_token', '')}"}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        r = await c.get(BASE + "/Platform/User/GetMembershipsForCurrentUser/", headers=headers)
+    try:
+        resp = r.json().get("Response") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    des = resp.get("destinyMemberships") or []
+    if not des:
+        return {}
+    primary = resp.get("primaryMembershipId")
+    pick = next((m for m in des if m.get("membershipId") == primary), des[0])
+    code = pick.get("bungieGlobalDisplayNameCode")
+    return {"display_name": (pick.get("bungieGlobalDisplayName") or "") +
+            (f"#{code:04d}" if code else ""),
+            "membership_type": pick.get("membershipType"),
+            "membership_id": pick.get("membershipId")}
+
+
+async def exchange(code: str, redirect_uri: str = "", state: str = "") -> dict:
     """用授权码换 token 并落盘（redirect_uri 必须与授权时一致，故一并带上）。
+
+    state 能对上 _flows 时按那次授权的 PKCE verifier 换，且：
+    - state 绑定了 qq → token 存 bungie_tokens.json[qq]（多用户），返回里带 qq
+    - 否则存主账号 bungie_token.json（面板授权，原行为）
 
     redirect_uri 校验只发生在 token 这一步（authorize 那步不拦），所以「浏览器
     拿到 code、换 token 却报 mismatch」= 发 code 的授权页用的地址与当前配置不同
@@ -230,15 +295,18 @@ async def exchange(code: str, redirect_uri: str = "") -> dict:
     传入 redirect_uri（从粘贴的回调地址或实际落地 URL 里取）后先试它，不行再退
     回当前配置值，两边各试一次，哪个匹配用哪个。
     """
+    flow = _flows.pop(state, None) if state else None
+    verifier = (flow or {}).get("verifier", "") or _pkce.get("verifier", "")
     candidates = []
-    for ru in (redirect_uri, REDIRECT_URI()):
+    for ru in ((flow or {}).get("redirect_uri"), redirect_uri, REDIRECT_URI()):
         if ru and ru not in candidates:
             candidates.append(ru)
     last_err: Exception | None = None
+    d = None
     for ru in candidates:
         try:
             d = await _token_call({"grant_type": "authorization_code", "code": code,
-                                   "redirect_uri": ru})
+                                   "redirect_uri": ru}, verifier)
             break
         except RuntimeError as exc:
             last_err = exc
@@ -250,13 +318,17 @@ async def exchange(code: str, redirect_uri: str = "") -> dict:
            "refresh_token": d.get("refresh_token", ""),
            "expires_at": time.time() + int(d.get("expires_in", 3600)) - 60,
            "membership_id": d.get("membership_id", "")}
-    _save(tok)
-    info = await membership()
+    info = await _membership_for(tok)
     if info:
         tok.update(display_name=info.get("display_name", ""),
                    membership_type=info.get("membership_type", 0),
                    membership_id=info.get("membership_id", ""))
-        _save(tok)
+    if flow and flow.get("qq"):
+        tok["qq"] = flow["qq"]
+        _users_store({**_users_load(), flow["qq"]: tok})
+        tok["is_user"] = True
+        return tok
+    _save(tok)
     return tok
 
 
@@ -348,6 +420,99 @@ async def membership() -> dict:
 
 def logout():
     _save({})
+
+
+# ---------- 多用户 token：群里 /登录 授权，/配装数字 与 /仓库 用 ----------
+# 玩家级私有数据（游戏内配装 206、完整库存 102/201）官方只对「token 本人」开放
+# （DIM 同款限制），所以每个 QQ 用户各自授权自己的账号，token 按 QQ 存。
+
+def _users_load() -> dict:
+    if _utok["data"] is not None:
+        return _utok["data"]
+    try:
+        _utok["data"] = json.load(open(_writable_path(USER_TOKEN_FILE), encoding="utf-8"))
+    except FileNotFoundError:
+        _utok["data"] = {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auth] {USER_TOKEN_FILE} 读取失败（按未授权处理）：{type(exc).__name__}: {exc}")
+        _utok["data"] = {}
+    return _utok["data"]
+
+
+def _users_store(d: dict):
+    _utok["data"] = d
+    try:
+        dump_json(_writable_path(USER_TOKEN_FILE), d, indent=1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[auth] {USER_TOKEN_FILE} 写盘失败：{type(exc).__name__}: {exc}")
+
+
+def user_status(qq: str) -> dict:
+    t = _users_load().get(str(qq)) or {}
+    return {"authorized": bool(t.get("refresh_token") or t.get("access_token")),
+            "display_name": t.get("display_name", ""),
+            "membership_id": t.get("membership_id", ""),
+            "membership_type": t.get("membership_type", 0),
+            "expires_at": t.get("expires_at", 0)}
+
+
+def user_logout(qq: str):
+    d = _users_load()
+    if str(qq) in d:
+        d.pop(str(qq))
+        _users_store(d)
+
+
+_user_locks: dict = {}
+
+
+async def user_access_token(qq: str) -> str:
+    """取该 QQ 用户的有效 access token（过期就地刷新）；未授权抛 RuntimeError。
+
+    refresh_token 一次性，失败重试一次，与主账号同样的口径。"""
+    t = _users_load().get(str(qq))
+    if not t or not (t.get("refresh_token") or t.get("access_token")):
+        raise RuntimeError("你还没登录 Bungie 账号：先发 /登录 完成授权，"
+                           "再回来用这个功能（游戏内配装/仓库是官方仅本人可见的数据）")
+    if t.get("access_token") and time.time() < t.get("expires_at", 0):
+        return t["access_token"]
+    if not t.get("refresh_token"):
+        return t.get("access_token", "")
+    lock = _user_locks.setdefault(str(qq), asyncio.Lock())
+    async with lock:
+        t = _users_load().get(str(qq)) or {}
+        if t.get("access_token") and time.time() < t.get("expires_at", 0):
+            return t["access_token"]
+        try:
+            d = await _token_call({"grant_type": "refresh_token",
+                                   "refresh_token": t["refresh_token"]})
+        except Exception as exc:  # noqa: BLE001
+            await asyncio.sleep(2)
+            try:
+                d = await _token_call({"grant_type": "refresh_token",
+                                       "refresh_token": t["refresh_token"]})
+            except Exception as exc2:  # noqa: BLE001
+                raise RuntimeError(f"Bungie token 刷新失败：{exc2}") from exc2
+        t.update(access_token=d.get("access_token", t.get("access_token", "")),
+                 refresh_token=d.get("refresh_token", t.get("refresh_token", "")),
+                 expires_at=time.time() + int(d.get("expires_in", 3600)) - 60)
+        _users_store({**_users_load(), str(qq): t})
+        return t["access_token"]
+
+
+async def authorized_get_as(qq: str, path: str, params: dict | None = None) -> dict:
+    """以某个 QQ 用户授权的 token 调 Bungie 接口，返回 Response 字段。"""
+    tok = await user_access_token(qq)
+    headers = {"X-API-Key": _env("BUNGIE_API_KEY"), "Authorization": f"Bearer {tok}"}
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as c:
+        r = await c.get(BASE + path, params=params or {}, headers=headers)
+    try:
+        d = r.json()
+    except ValueError:
+        raise RuntimeError(f"Bungie 返回了非 JSON 响应（HTTP {r.status_code}），稍后再试")
+    if d.get("ErrorCode") != 1:
+        raise RuntimeError(f"Bungie: {d.get('ErrorStatus')} {d.get('Message')}")
+    return d.get("Response") or {}
 
 
 if __name__ == "__main__":

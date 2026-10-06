@@ -59,12 +59,20 @@ if ($skipped -gt 0) { Write-Output ("_internal 有 $skipped 个文件被占用�
 #    注意：bot_cards/card_render/bot_platform 等在 spec hiddenimports 里，已被打进 exe
 #    归档，运行时 FrozenImporter 优先 —— 这里同步的外置副本**不会生效**，只是留档；
 #    改这些模块必须 build_exe.bat 重打包（2026-10-03 实证）。
-$ext = @("bot_cards.py", "bot_platform.py", "bot_fireteam.py", "card_render.py", "weapon_filter.py", "weapon_usage.py",
+$ext = @("bot_cards.py", "bot_platform.py", "bot_fireteam.py", "bot_loadout.py", "bot_tunnel.py", "card_render.py", "weapon_filter.py", "weapon_usage.py",
          "raid_loot.py", "nonebot_plugins\destiny2.py")
+# bot_loadout.py / bot_tunnel.py 必须同步：插件在 exe 旁按目录动态加载（bot_runtime
+# load_plugins），它 import 的这两个模块不在 spec hiddenimports 里，运行时从磁盘解析。
+# **每给插件新增一个本地 import 都要加进这个列表**，漏了=整个插件加载失败=所有指令没反应。
 foreach ($f in $ext) {
   $s = Join-Path $root $f
   $d = Join-Path $dst  $f
   if (Test-Path $s) { Copy-Item $s $d -Force; Write-Output "sync $f" }
+}
+# cloudflared.exe（/登录 公网隧道自动回跳用）保持外置：55MB 不进包
+if (Test-Path (Join-Path $root "cloudflared.exe")) {
+  Copy-Item (Join-Path $root "cloudflared.exe") (Join-Path $dst "cloudflared.exe") -Force
+  Write-Output "sync cloudflared.exe"
 }
 
 # 3.6) sync NapCat runtime files into dist's napcat_shell (that dir is created once by

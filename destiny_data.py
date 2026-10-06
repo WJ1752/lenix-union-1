@@ -288,13 +288,37 @@ def current_season() -> dict | None:
     return cur[-1] if cur else None
 
 
-async def resolve_member(name: str):
-    """玩家名#编号 → dict(mtype, mid, display, code)；
-    先精确查 Bungie，查不到（带错编号）再回落本地索引"""
+# 平台别名 → membershipType；PLATFORM_NAMES 反查显示名（绑定多平台提示用）
+_PLATFORM_IDS = {"steam": 3, "psn": 2, "playstation": 2, "ps": 2, "xbox": 1, "xbx": 1,
+                 "epic": 6, "stadia": 5, "bnet": 4, "战网": 4}
+PLATFORM_NAMES = {1: "Xbox", 2: "PSN", 3: "Steam", 4: "Battle.net", 5: "Stadia",
+                  6: "Epic", 10: "Demon", 254: "Bungie.net"}
+
+
+def _bound_platform(fname: str, code: int) -> str:
+    """绑定元数据里固化的平台选择（/绑定 名字#编号 平台 时记录）→ 后续查询都按它解析。
+    一个 bungie 名字挂多个**真**档案（双平台老玩家，无跨存档）时，光探测分不出该查哪个，
+    只有用户在绑定时表态才算数"""
+    try:
+        want = f"{fname}#{code}".lower()
+        for v in (load_binding_meta() or {}).values():
+            if isinstance(v, dict) and v.get("platform") and \
+                    str(v.get("name", "")).lower() == want:
+                return str(v["platform"])
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+async def resolve_member(name: str, platform: str = ""):
+    """玩家名#编号 → dict(mtype, mid, display, code, candidates, platform)；
+    先精确查 Bungie，查不到（带错编号）再回落本地索引。
+    platform（steam/psn/xbox/epic…）可强制平台：名字下挂多个真档案时由用户指定。"""
     if "#" not in name:
         return None
     fname, _, code = name.partition("#")
     code = int(code)
+    platform = (platform or _bound_platform(fname, code)).strip().lower()
     # 精确查询（对大小写敏感）
     r = await client().post(
         "/Platform/Destiny2/SearchDestinyPlayerByBungieName/-1/",
@@ -302,11 +326,32 @@ async def resolve_member(name: str):
     )
     resp = _parse(r)
     cands = resp.get("Response") or []
+    n_all = len(cands)
+    if platform:
+        want = _PLATFORM_IDS.get(platform)
+        cands = [p for p in cands if p["membershipType"] == want] if want else cands
+        if not cands:
+            return None
     # 注：Bungie 已下线免鉴权模糊搜索（SearchDestinyPlayers 404），带错编号只能报没找到
-    # 跨存档玩家：主平台(crossSaveOverride)那条才是有效数据；无跨存档取第一条
-    best = next((p for p in cands
-                 if p.get("crossSaveOverride") and p["membershipType"] == p["crossSaveOverride"]),
-                cands[0] if cands else None)
+    # 排序：跨存档主平台(crossSaveOverride)优先，其余候选跟后。
+    # 同一个 bungie 名字可能挂在多个平台成员号上，其中有的平台从没玩过 D2
+    # （搜"林黛玉倒拔垂杨柳#7437"会同时出 PSN 空号 + Steam 真号），不能盲取第一条：
+    # 逐个探测 GetProfile，第一个真有档案的才算数（1601 响应有 180s 缓存，重复查询不亏）
+    ordered = [p for p in cands
+               if p.get("crossSaveOverride") and p["membershipType"] == p["crossSaveOverride"]]
+    ordered += [p for p in cands if p not in ordered]
+    best = None
+    valid = True
+    for p in ordered:
+        mt_p = p.get("crossSaveOverride") or p["membershipType"]
+        # 单候选免探测（绝大多数人）；但用户点名了平台时必须探——绑错空号要在绑定时就提醒
+        if (len(ordered) == 1 and not platform) or \
+                await _has_destiny_account(mt_p, p["membershipId"]):
+            best = p
+            break
+    if best is None and ordered:
+        best = ordered[0]     # 全都探不到：沿用第一条，让后续查询报出正常错误
+        valid = False         # 用户点名了平台但没有档案 → 绑定时好给提示
     if best:
         mtype = best.get("crossSaveOverride") or best["membershipType"]
         display = best["bungieGlobalDisplayName"]
@@ -315,7 +360,10 @@ async def resolve_member(name: str):
         return {"mtype": mtype,
                 "mid": best["membershipId"], "display": display,
                 "code": dcode,
-                "icon": BASE + best["iconPath"] if best.get("iconPath") else ""}
+                "icon": BASE + best["iconPath"] if best.get("iconPath") else "",
+                "candidates": n_all,
+                "platform": PLATFORM_NAMES.get(mtype, str(mtype)),
+                "valid_account": valid}
     # Bungie 没查到：回落本地索引（PGCR 采集的 seen_players.json）
     seen = seen_players()
     if name in seen:
@@ -382,9 +430,30 @@ def _parse(r) -> dict:
     return json.loads(r.content.decode("utf-8-sig"))
 
 
+class PlayerLookupError(RuntimeError):
+    """玩家搜到了但档案不可用：message 是直接给用户看的提示"""
+
+
+class ProfilePrivateError(PlayerLookupError):
+    """该玩家的命运2档案设为了私密：API 拒绝返回角色/记录等数据"""
+
+
+async def _has_destiny_account(mtype: int, mid: str) -> bool:
+    """这个平台成员号下有没有真的命运2档案（没玩过 D2 的平台成员号 GetProfile 会 1601）"""
+    try:
+        r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/", params={"components": "100"})
+        return _parse(r).get("ErrorCode") == 1
+    except Exception:  # noqa: BLE001  探测失败按没有算
+        return False
+
+
 async def get_profile(mtype: int, mid: str) -> dict:
     r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/", params={"components": "100,200"})
     resp = r.json()
+    if resp.get("ErrorCode") == 1601:
+        if resp.get("ErrorStatus") == "DestinyAccountNotFound":
+            raise PlayerLookupError("这个平台成员号下没有命运2档案（对方可能主要玩别的平台）")
+        raise ProfilePrivateError("该玩家的命运2档案设为了私密，无法查询")
     if resp.get("ErrorCode") != 1:
         raise RuntimeError(resp.get("Message", "Bungie API 错误"))
     return resp["Response"]
@@ -420,21 +489,30 @@ def _sum(stats_list: list[dict], mode: str) -> dict:
 
 
 @_traced(lambda name: f"/玩家 {name}")
-async def full_report(name: str) -> dict:
+async def full_report(name: str, jid: str = "") -> dict:
     """玩家全量数据：档案 + 各角色 PVP/PVE/智谋 合并统计"""
     member = await resolve_member(name)
     if not member:
         raise LookupError(f"没找到玩家 {name}")
+    return await full_report_member(member, jid=jid)
+
+
+async def full_report_member(member: dict, jid: str = "") -> dict:
     mtype, mid = member["mtype"], member["mid"]
     profile = await get_profile(mtype, mid)
     chars = profile.get("characters", {}).get("data", {})
     if not chars:
         raise LookupError(f"{member['display']} 档案下没有角色")
 
+    def _jp(done: int, total: int) -> None:
+        if jid and jid in JOBS:  # 同步进面板后台任务进度条
+            JOBS[jid].update(done=int(done), total=int(total))
+
     chars_meta, pvp_list, pve_list, gmb_list = [], [], [], []
     nchars = len(chars)
     fdisp = f"{member['display']}#{fmt_code(member['code'])}"
-    log_progress(f"full:{mid}", 0, nchars, label=f"/玩家 {fdisp}", force=True,
+    _jp(0, nchars + 1)
+    log_progress(f"full:{mid}", 0, nchars + 1, label=f"/玩家 {fdisp}", force=True,
                  extra=f"拉取 {nchars} 个角色的 PVP/PVE/智谋生涯统计")
     for ci, (cid, c) in enumerate(chars.items(), 1):
         chars_meta.append({
@@ -447,11 +525,13 @@ async def full_report(name: str) -> dict:
         })
         st = await char_stats(mtype, mid, cid, "101,103,104")
         pvp_list.append(st); pve_list.append(st); gmb_list.append(st)
-        log_progress(f"full:{mid}", ci, nchars, label=f"/玩家 {fdisp}",
+        _jp(ci, nchars + 1)
+        log_progress(f"full:{mid}", ci, nchars + 1, label=f"/玩家 {fdisp}",
                      extra=f"角色 {ci}/{nchars} 统计完成")
 
     # 智谋：官方聚合接口已下线，从对局历史聚合（跨角色，去重）
-    log_progress(f"full:{mid}", nchars, nchars, label=f"/玩家 {fdisp}", force=True,
+    _jp(nchars, nchars + 1)
+    log_progress(f"full:{mid}", nchars, nchars + 1, label=f"/玩家 {fdisp}", force=True,
                  extra="聚合智谋对局历史（每人最近 100 场）")
     gkilled = gdeaths = gcount = gwins = 0
     seen_g = set()
@@ -713,7 +793,7 @@ def _mode_hours(stats: dict) -> dict:
 
 
 @_traced(lambda name: f"/生涯 {name}")
-async def career_report(name: str) -> dict:
+async def career_report(name: str, jid: str = "") -> dict:
     """生涯面板数据：分赛季等级 + 分职业 / 分模式时长 + 三模式生涯聚合。
 
     全程只打 GetProfile / GetHistoricalStats，不逐场拉 PGCR，所以是秒级出图。
@@ -721,10 +801,18 @@ async def career_report(name: str) -> dict:
     member = await resolve_member(name)
     if not member:
         raise LookupError(f"没找到玩家 {name}")
+    return await career_report_member(member, jid=jid)
+
+
+async def career_report_member(member: dict, jid: str = "") -> dict:
     mtype, mid = member["mtype"], member["mid"]
     r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/",
                            params={"components": "100,200,202"})
     resp = r.json()
+    if resp.get("ErrorCode") == 1601:
+        if resp.get("ErrorStatus") == "DestinyAccountNotFound":
+            raise PlayerLookupError("这个平台成员号下没有命运2档案（对方可能主要玩别的平台）")
+        raise ProfilePrivateError("该玩家的命运2档案设为了私密，无法查询")
     if resp.get("ErrorCode") != 1:
         raise RuntimeError(resp.get("Message", "Bungie API 错误"))
     R = resp["Response"]
@@ -744,14 +832,23 @@ async def career_report(name: str) -> dict:
     nb = max(1, (len(_career_modes()) + 14) // 15)
     total_steps = nchars * nb
     disp = f"{member['display']}#{fmt_code(member['code'])}"
+
+    def _jp(done: int, total: int) -> None:
+        if jid and jid in JOBS:  # 同步进面板后台任务进度条
+            JOBS[jid].update(done=int(done), total=int(total))
+
+    _jp(0, total_steps)
     log_progress(f"career:{mid}", 0, total_steps, label=f"/生涯 {disp}", force=True,
                  extra=f"拉取 {nchars} 个角色的分模式历史统计（每角色 {nb} 批）")
     for ci, (cid, c) in enumerate(chars_raw.items(), 1):
-        st = await _char_stats_full(
-            mtype, mid, cid,
-            on_batch=lambda bi, bn, ci=ci: log_progress(
+        def _on_batch(bi, bn, ci=ci):
+            _jp((ci - 1) * nb + bi, total_steps)
+            log_progress(
                 f"career:{mid}", (ci - 1) * nb + bi, total_steps,
-                label=f"/生涯 {disp}", extra=f"角色 {ci}/{nchars} · 第 {bi}/{bn} 批"))
+                label=f"/生涯 {disp}", extra=f"角色 {ci}/{nchars} · 第 {bi}/{bn} 批")
+
+        st = await _char_stats_full(mtype, mid, cid, on_batch=_on_batch)
+        _jp(ci * nb, total_steps)
         stat_list.append(st)
         # 每日在场秒数（首跑要分月补抓全史，之后只补最近 ~10 天）
         day_maps.append(await _char_day_secs(mtype, mid, cid))
@@ -915,11 +1012,14 @@ def season_name(n: int) -> str:
 
 def weapon_versions_by_name(name: str) -> list[dict]:
     """同名武器的全部版本，按赛季从旧到新排（同赛季按 hash 稳定排序）
-    返回 [{'hash', 'season', 'event'}]，下标 0 = 版本 1"""
+    返回 [{'hash', 'season', 'event'}]，下标 0 = 版本 1。
+    异域催化武器排最前：简中有同名异武器（"龙息"= 异域火箭筒 + 一把冲锋枪），
+    纯按赛季排会把冲锋枪当"版本1"默认打开，查询异域的人要的不是它"""
     items = [(h, w) for h, w in _weapons_full.items() if w["name"] == name]
     if not items:
         return []
-    items.sort(key=lambda x: (_weapon_versions.get(x[0], {}).get("season", 0), x[0]))
+    items.sort(key=lambda x: (not bool((x[1].get("plugs") or {}).get("catalysts")),
+                              _weapon_versions.get(x[0], {}).get("season", 0), x[0]))
     return [{"hash": h,
              "season": _weapon_versions.get(h, {}).get("season", 0),
              "event": _weapon_versions.get(h, {}).get("event", False)}
@@ -1878,6 +1978,46 @@ async def _run_raid_job(jid: str, member: dict, mode: int):
         JOBS[jid].update(status="error", error=str(exc))
 
 
+# /玩家 /生涯 /催化：十秒级查询也走后台任务（群里先回「统计中」，跑完自动出图）。
+# 不进上面的串行重任务队列——这几类不翻 PGCR 页，跟 raid/热力图并行跑不会造成限流，
+# 排在几分钟的 raid 后面反而把快查询拖成几分钟。
+_PROFILE_JOB_LABEL = {"full": "玩家卡片", "career": "生涯面板", "catalysts": "异域催化"}
+
+
+async def start_profile_job(name: str, kind: str, who: str = "") -> str | None:
+    member = await resolve_member(name)
+    if not member:
+        return None
+    key = f"{member['mtype']}:{member['mid']}:profjob:{kind}"
+    hit = _reuse_job(key)
+    if hit:
+        _mark_reused(hit, who)
+        return hit
+    jid = f"{member['mid']}_{kind}_{len(JOBS)}"
+    _register_job(key, jid, {
+        "done": 0, "total": 1, "status": "queued",
+        "name": f"{member['display']}#{fmt_code(member['code'])}", "result": None,
+        "kind": kind, "who": who or "网页",
+        "ts": time.time(), "label": _PROFILE_JOB_LABEL.get(kind, kind)})
+    asyncio.get_running_loop().create_task(_run_profile_job(jid, member, kind))
+    return jid
+
+
+async def _run_profile_job(jid: str, member: dict, kind: str):
+    try:
+        if kind == "full":
+            rep = await full_report_member(member, jid=jid)
+        elif kind == "career":
+            rep = await career_report_member(member, jid=jid)
+        elif kind == "catalysts":
+            rep = await node_report_member(member, "catalysts")
+        else:
+            raise ValueError(f"未知的查询类型 {kind}")
+        JOBS[jid].update(status="done", done=1, total=1, result=rep)
+    except Exception as exc:  # noqa: BLE001
+        JOBS[jid].update(status="error", error=str(exc))
+
+
 @_traced(lambda name, per_char=50: f"/战绩 {name}")
 async def history_report(name: str, per_char: int = 50) -> dict:
     """全模式最近对局流（合并所有角色）"""
@@ -2803,6 +2943,107 @@ def _obj_progress(st: dict) -> tuple[int, int]:
     return 0, 0
 
 
+def _cata_progress(st: dict) -> tuple[int, int]:
+    """催化记录的进度 → (已达成, 目标值)。
+
+    催化 record 常带多个目标（如 警惕羽翼 = 2/2 引入 + 0/250 击杀 + 0/5 场次），
+    第一个目标早满了催化仍没拿到，直接用 _obj_progress 会显示成误导性的 2/2。
+    这里取需求量最大的那个目标当主进度——那就是玩家还在磨的部分。
+    """
+    best = (0, 0)
+    for o in st.get("objectives") or []:
+        cv, pg = o.get("completionValue") or 0, o.get("progress") or 0
+        if cv > best[1]:
+            best = (min(pg, cv), cv)
+    return best
+
+
+async def _applied_catalyst_plugs(member: dict) -> dict[str, tuple[str, str]]:
+    """可锻造异域"已装了哪个催化"：找到这把枪的实例，看武器插槽（组件 304）里
+    plugHash 落在候选催化表里的那一个。返回 {武器itemHash: (催化名, 催化图标)}。
+
+    库存/插槽是隐私组件：不带 ReadBasicUserData scope 的授权读不到（响应里直接
+    没有 sockets），所以这里一次 Profile 级调用（102 档案仓 + 201 角色背包 + 304
+    全部插槽）搞定，读不到就返回空——卡上只显示锻造标，不显示已装。
+    注意：旧授权 token 没带 scope，需要在面板重新授权一次才会亮"已装"。
+    """
+    if not _CATA_OPTIONS:
+        return {}
+    try:
+        import bungie_auth
+        if not bungie_auth.authorized():
+            return {}
+        if str(bungie_auth.status().get("membership_id") or "") != str(member["mid"]):
+            return {}  # 授权的是别人：没有权限读这个玩家的库存
+        base = f"/Platform/Destiny2/{member['mtype']}/Profile/{member['mid']}/"
+        inv = await bungie_auth.authorized_get(base, {"components": "102,201,304"})
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    try:
+        sockets_all = ((inv.get("sockets") or {}).get("data")) or {}
+        if not sockets_all:
+            return out  # 没权限/隐私设置看不到插槽：安静降级
+        by_iids: dict[str, list[str]] = {}
+        items = list((((inv.get("profileInventory") or {}).get("data")) or {}).get("items") or [])
+        for ch in ((inv.get("characterInventory") or {}).get("data") or {}).values():
+            items += (ch or {}).get("items") or []
+        for it in items:
+            h = str(it.get("itemHash") or "")
+            iid = it.get("itemInstanceId") or ""
+            if h in _CATA_OPTIONS and iid:
+                by_iids.setdefault(h, []).append(iid)  # 同一把枪可能有塑形/掉落两份
+        for h, iids in by_iids.items():
+            for iid in iids:
+                for s in (sockets_all.get(iid, {}) or {}).get("sockets") or []:
+                    ph = str(s.get("plugHash") or "")
+                    if ph in _CATA_OPTIONS[h]:
+                        out[h] = _CATA_OPTIONS[h][ph]
+                        break
+                if h in out:
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+# 催化 record 名 ≠ 武器名（简中译名历史原因），换武器图标时按表纠正：
+# 记录名 → weapons.json 里的武器名（就这 9 把特例，其余记录名剥掉"催化"后缀即武器名）
+_CATA_WEAPON_ALIAS = {
+    "赫沃斯托夫": "赫沃斯托夫7G-0X",
+    "焚天者": "焚天者誓约",
+    "普罗米修斯": "普罗米修斯透镜",
+    "爱莲娜的誓言": "爱莲娜之誓",
+    "不动改装": "维王者之剑",
+    "阿克瑞斯": "阿克瑞斯传说",
+    "D.A.R.C.I.": "D.A.R.C.I",
+    "低语": "蠕虫低语",
+    "雷霆领主": "雷神",
+}
+
+# 武器名 → 本体图标（催化 record 的 displayProperties 图标全是同一张通用图，
+# 用武器自己的图标卡片才能一眼认出是哪把枪）。
+# 只收录带催化插槽的武器（weapons_full 里 plugs.catalysts 非空 = 异域催化武器）：
+# 简中有同名异武器（"龙息"既是异域火箭筒也是一把冲锋枪），不过滤会把冲锋枪的图标挂到催化卡上
+_CATA_ICON_BY_NAME: dict[str, str] = {}
+_CATA_HASH_BY_NAME: dict[str, str] = {}
+for _h, _w in _weapons_full.items():
+    if ((_w.get("plugs") or {}).get("catalysts") and _w.get("name") and _w.get("icon")):
+        _CATA_ICON_BY_NAME.setdefault(_w["name"], _w["icon"])
+        _CATA_HASH_BY_NAME.setdefault(_w["name"], str(_h))
+
+# 武器 itemHash → 可选催化插件 {插件hash: (名称, 图标)}。可锻造异域有多个候选催化
+# （零号修订 4 选 1），玩家实际装了哪个要从武器插槽（Item 组件 304）的 plugHash 反查
+_CATA_OPTIONS: dict[str, dict[str, tuple[str, str]]] = {}
+for _h, _w in _weapons_full.items():
+    _opts: dict[str, tuple[str, str]] = {}
+    for _c in (_w.get("plugs") or {}).get("catalysts") or []:
+        if isinstance(_c, dict) and _c.get("hash"):
+            _opts[str(_c["hash"])] = (_c.get("n", ""), _c.get("i", ""))
+    if _opts:
+        _CATA_OPTIONS[str(_h)] = _opts
+
+
 def _merged_records(prof: dict) -> dict:
     """合并 profileRecords 与 characterRecords。
 
@@ -2815,16 +3056,27 @@ def _merged_records(prof: dict) -> dict:
     return pr
 
 
-@_traced(lambda name, kind: (f"武器锻造图案 {name}" if kind == "patterns"
-                            else f"称号进度 {name}"))
+@_traced(lambda name, kind: ({"patterns": "武器锻造图案", "catalysts": "异域催化"}
+                            .get(kind, "称号进度") + f" {name}"))
 async def node_report(name: str, kind: str) -> dict:
-    """称号(kind=titles)/锻造图案(kind=patterns)：基于记录状态"""
+    """称号(kind=titles)/锻造图案(kind=patterns)/异域催化(kind=catalysts)：基于记录状态"""
     member = await resolve_member(name)
     if not member:
         raise LookupError(f"没找到玩家 {name}")
+    return await node_report_member(member, kind)
+
+
+async def node_report_member(member: dict, kind: str) -> dict:
     r = await client().get(f"/Platform/Destiny2/{member['mtype']}/Profile/{member['mid']}/",
                          params={"components": "200,900"})
-    prof = _parse(r).get("Response", {})
+    d = _parse(r)
+    if d.get("ErrorCode") == 1601:  # 档案不可用：不查会静默变成"全是0"的假结果
+        if d.get("ErrorStatus") == "DestinyAccountNotFound":
+            raise PlayerLookupError("这个平台成员号下没有命运2档案（对方可能主要玩别的平台）")
+        raise ProfilePrivateError("该玩家的命运2档案设为了私密，无法查询")
+    if d.get("ErrorCode") != 1:
+        raise RuntimeError(d.get("Message", "Bungie API 错误"))
+    prof = d.get("Response") or {}
     pr = _merged_records(prof)
 
     items = []
@@ -2862,6 +3114,51 @@ async def node_report(name: str, kind: str) -> dict:
                     "gilded": bool(gild and _rec_done(pr, str(gild))),
                     "group": group,
                     "done_n": n_done, "total_n": n_total,
+                })
+    elif kind == "catalysts":
+        # 异域催化：藏品"异域催化"节点（2744330515）下按槽位分三组（动能/能量/威能），
+        # 每条 record 就是一个催化目标——完成态是解锁标记，目标进度（击杀数之类）
+        # 在玩家 record 自带的 objectives 里（和锻造萃取进度同结构，_obj_progress 可读）。
+        # 记录名大多是"武器名+催化"，少数不带后缀（洛伦兹驱动器/千语等），
+        # 统一剥掉"催化/催化剂"后缀当武器名展示。
+        # 可锻造异域（描述含塑形/重塑）单独标出；它们"应用任意催化"就算完成，
+        # 已获得的再读武器插槽标出实际装的是哪个候选催化（_applied_catalyst_plugs）。
+        applied = await _applied_catalyst_plugs(member)
+        for mid in _pnodes["2744330515"]["children"]["presentationNodes"]:
+            nd = _pnodes[str(mid["presentationNodeHash"])]
+            slot = nd["displayProperties"].get("name") or "催化"
+            for rc in nd["children"]["records"]:
+                rh = str(rc["recordHash"])
+                d = _records.get(rh)
+                if not d:
+                    continue
+                dp = d.get("displayProperties", {})
+                nm = dp.get("name") or ""
+                if not nm or "[PLACEHOLDER" in nm:
+                    continue
+                for suf in ("催化剂", "催化"):
+                    if nm.endswith(suf):
+                        nm = nm[:-len(suf)]
+                        break
+                wn = _CATA_WEAPON_ALIAS.get(nm, nm)
+                st_rh = pr.get(rh) or {}
+                done_n, total_n = _cata_progress(st_rh)
+                desc = (dp.get("description", "") or "")[:120]
+                # started：目标里有任何进度但还没完成 → 卡上标"进行中"，和没开磨的区分开
+                started = any((o.get("progress") or 0) > 0
+                              for o in (st_rh.get("objectives") or []))
+                craftable = "塑形" in desc or "重塑" in desc
+                wh = _CATA_HASH_BY_NAME.get(wn, "")
+                ap = applied.get(wh) or ("", "")
+                items.append({
+                    "name": nm,
+                    "icon": _CATA_ICON_BY_NAME.get(wn) or (BASE + dp["icon"] if dp.get("icon") else ""),
+                    "desc": desc,
+                    "completed": _rec_done(pr, rh),
+                    "gilded": False, "group": slot,
+                    "done_n": done_n, "total_n": total_n,
+                    "started": started, "craftable": craftable,
+                    "applied_name": ap[0], "applied_icon": ap[1],
                 })
     else:
         # 分组、顺序、组名 1:1 对照小日向的锻造页（固定表 pattern_groups.json）。
@@ -2931,10 +3228,12 @@ async def node_report(name: str, kind: str) -> dict:
         rank = {g: i for i, g in enumerate(order)}
         items.sort(key=lambda x: (rank.get(x["group"], 99), x.get("type", ""),
                                   not x["completed"], x["name"]))
-    # 图案：顺序已在上面按 pattern_groups.json 排好，不再二次排序
+    # 图案/催化：顺序已在上面按固定节点顺序排好（催化=动能→能量→威能，同藏品页），不再二次排序
     done = sum(1 for i in items if i["completed"])
+    title = {"titles": "称号进度", "patterns": "武器锻造图案",
+             "catalysts": "异域催化"}.get(kind, "称号进度")
     return {"display": f"{member['display']}#{fmt_code(member['code'])}",
-            "title": "称号进度" if kind == "titles" else "武器锻造图案",
+            "title": title,
             "done": done, "total": len(items), "items": items,
             "gildable": sum(1 for i in items if i.get("can_gild")),
             "gilded": sum(1 for i in items if i.get("gilded")),
@@ -4023,6 +4322,7 @@ def _rot_cache_path() -> str:
 LS_CACHE_FILE = "lost_sector_cache.json"
 GM_CACHE_FILE = "gm_cache.json"
 _LS_CACHE_VER = 2     # v2：奖励套装名剥部位后缀（旧缓存里是单件名）
+_GM_CACHE_VER = 2     # v2：加本周挑战武器 weapon 字段（旧缓存没有）
 _ROT_ZH: dict | None = None
 _WEB_CLIENTS: dict = {}
 
@@ -4157,14 +4457,48 @@ async def lost_sectors_today(force: bool = False) -> dict:
     return data
 
 
+_WEP_EN_IDX: dict | None = None
+
+
+def _weapon_by_en(en: str) -> dict:
+    """英文武器名 → 本地索引（weapons.json：中文名/类型/图标）。
+
+    英文名→hash 倒排优先用 item_en.json（build_item_index.py 产出，会进 exe 包）；
+    缺了退 raw_items_en_lite.json（65MB，只在开发机上有）。同名多个 hash
+    （原版/专家/异域任务卷）取第一个能对上武器索引的。"""
+    global _WEP_EN_IDX
+    if _WEP_EN_IDX is None:
+        idx: dict[str, list] = {}
+        try:
+            idx = json.load(open(_idx_file("item_en.json"), encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            try:
+                lite = json.load(open(_idx_file("raw_items_en_lite.json"), encoding="utf-8"))
+                for h, v in lite.items():
+                    n = ((v or {}).get("displayProperties") or {}).get("name")
+                    if n:
+                        idx.setdefault(n.lower(), []).append(h)
+            except Exception:  # noqa: BLE001  没建过英文索引时武器列退化为英文原名
+                pass
+        _WEP_EN_IDX = idx
+    for h in _WEP_EN_IDX.get((en or "").lower()) or []:
+        rec = _weapons.get(h)
+        if rec and rec.get("name"):
+            return {"zh": rec["name"], "type": rec.get("type") or "",
+                    "icon": rec.get("icon") or ""}
+    return {}
+
+
 @_traced("当前宗师")
 async def gm_this_week(force: bool = False) -> dict:
-    """本周宗师夜袭（每周缓存）。lfcarry 固定页声明本周 GM，映射成中文+横图。"""
+    """本周宗师夜袭（每周缓存）。lfcarry 固定页声明本周 GM，映射成中文+横图。
+
+    同页还带本周挑战武器（GM 首通必掉的那把），一并解析映射成中文+图标。"""
     base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
     wk = _gm_week_key()
     if not force:
-        disk = _json_cache(base, GM_CACHE_FILE, 1, wk)
+        disk = _json_cache(base, GM_CACHE_FILE, _GM_CACHE_VER, wk)
         if disk:
             return disk
     html = await _web_get_text("https://lfcarry.com/guides/destiny-2-weekly-rotation")
@@ -4196,10 +4530,16 @@ async def gm_this_week(force: bool = False) -> dict:
     dl = dest_en.lower()
     dest_zh = (_DEST_ZH_FIX.get(dl) or (_rot_zh().get("dest") or {}).get(
         _DEST_ALIAS.get(dl, dl)) or dest_en)
+    wep = {}
+    wm = re.search(r"weekly challenge weapon is ([^,.\n]{2,60}?), an? ([a-z ]{3,30})", text)
+    if wm:
+        wep = _weapon_by_en(wm.group(1).strip())
+        wep.setdefault("en", wm.group(1).strip())
+        wep["type_en"] = wm.group(2).strip()
     data = {"ok": True, "week": wk, "en": en, "zh": rec.get("zh") or en,
             "hash": str(rec.get("hash") or ""), "pgcr": rec.get("pgcr") or "",
-            "dest_en": dest_en, "dest_zh": dest_zh}
-    _json_cache_save(base, GM_CACHE_FILE, 1, wk, data)
+            "dest_en": dest_en, "dest_zh": dest_zh, "weapon": wep}
+    _json_cache_save(base, GM_CACHE_FILE, _GM_CACHE_VER, wk, data)
     return data
 
 
