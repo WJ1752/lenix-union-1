@@ -16,6 +16,7 @@ import bot_log
 import napcat_runtime
 import bungie_auth
 import weapon_filter
+import weapon_usage
 
 app = FastAPI()
 
@@ -127,6 +128,25 @@ code{background:#1b1e22;border-radius:4px;padding:1px 6px;font-size:12px;color:#
     <b>生效群聊</b> <span class="dim">（不勾选任何群 = 所有群都响应）</span>
     <div id="groups" style="margin-top:8px">等待 bot 连接…</div>
     <div style="margin-top:8px;text-align:right"><button onclick="save()">保存群开关</button></div>
+  </div>
+  <div class="card">
+    <b>武器使用率数据（light.gg）</b> <span class="dim">（武器卡片上的选取率 / 热门组合）</span>
+    <div id="usage" style="margin-top:8px">正在加载…</div>
+    <div id="usageBar" class="pbar" style="display:none"><div class="pfill" style="width:0%"></div></div>
+    <div class="dim" id="usageMsg" style="margin-top:6px;white-space:pre-wrap"></div>
+    <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
+      <button onclick="usageRefresh('all')">全库刷新（最新数据）</button>
+      <button class="ghost" onclick="usageRefresh('missing')">只补缺失</button>
+      <button class="ghost" onclick="usageStop()">停止</button>
+    </div>
+    <div style="margin-top:8px;display:flex;gap:6px">
+      <input id="usageName" placeholder="单武器校准：输入武器名（支持模糊）或 hash"
+        style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid #2a2e33;
+               background:#1b1e22;color:#e8e6e3;font-size:12px">
+      <button class="ghost" onclick="usageCalibrate()">校准该武器</button>
+    </div>
+    <div class="dim" style="margin-top:4px">刷新借调试 Edge（<code>start_edge_debug.bat</code>，需过一次人机验证）
+      逐页重抓 light.gg；全库约十几到几十分钟，可随时停止，每 25 条落盘一次。</div>
   </div>
   <div class="card dim">指令（<b>必须带 <code>/</code> 前缀</b>）：/绑定 玩家名#编号 ｜ /生涯 ｜ /玩家 ｜ /武器查询 武器名 ｜ /perk查询 perk名 ｜ /pvp生涯武器 ｜ /pve生涯武器（绑定账号后玩家类指令可省名字）。<b>群里直接 @机器人 接武器名 / perk名</b> 也会自动出对应卡片。</div>
 </div>
@@ -396,9 +416,66 @@ async function bungieLogout(){
   await fetch('/api/bungie/logout', {method:'POST'});
   refreshBungie();
 }
+let usageRunning = false;
+async function refreshUsage(){
+  const box = document.getElementById('usage');
+  let s = {};
+  try{ s = await (await fetch('/api/usage/status')).json(); }catch(e){ return; }
+  const cdp = s.cdp
+    ? '<span class="on">● light.gg 通道在线</span>'
+    : '<span class="off">● light.gg 通道离线</span>　<span class="dim">双击 start_edge_debug.bat 并过一次验证后可刷新</span>';
+  box.innerHTML = cdp + '<span class="dim"> · </span>快照 <b>' + s.snapshot + '</b> / 目标 <b>' + s.targets
+    + '</b> <span class="dim">（缺 ' + s.missing + '）</span> <span class="dim">·</span> 缓存 <b>' + s.cache + '</b>'
+    + (s.newest ? ' <span class="dim">· 最新数据 ' + esc(s.newest) + '</span>' : '');
+  const r = s.refresh || {};
+  const bar = document.getElementById('usageBar');
+  const fill = bar.querySelector('.pfill');
+  const msg = document.getElementById('usageMsg');
+  if(r.running){
+    usageRunning = true;
+    bar.style.display = 'block';
+    fill.className = 'pfill';
+    fill.style.width = (r.pct || 3) + '%';
+    msg.innerHTML = '<span class="on">' + esc(r.message || '运行中') + '</span>';
+  }else{
+    if(usageRunning) refreshUsage();   // 刚结束：立即再拉一次拿最终 message（含结果统计）
+    usageRunning = false;
+    if(r.done){
+      bar.style.display = 'block';
+      fill.className = r.error ? 'pfill err' : 'pfill';
+      fill.style.width = '100%';
+    }else{
+      bar.style.display = 'none';
+    }
+    msg.innerHTML = (r.message && r.message !== '待机')
+      ? esc(r.message) + (r.error ? '　<span class="off">' + esc(r.error) + '</span>' : '')
+      : '';
+  }
+}
+async function usageStart(payload, confirmText){
+  if(!confirm(confirmText)) return;
+  let r = {};
+  try{ r = await (await fetch('/api/usage/refresh',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})).json(); }
+  catch(e){ alert('请求失败：' + e); return; }
+  if(!r.ok) alert(r.error || '启动失败');
+  refreshUsage();
+}
+function usageRefresh(scope){
+  usageStart({scope}, scope === 'all'
+    ? '全库重抓 light.gg 最新数据？可能需要十几到几十分钟，期间可随时停止。'
+    : '补齐快照里缺失的武器？');
+}
+function usageStop(){ fetch('/api/usage/stop',{method:'POST'}).then(refreshUsage); }
+function usageCalibrate(){
+  const name = (document.getElementById('usageName').value || '').trim();
+  if(!name){ alert('先输入武器名或 hash'); return; }
+  usageStart({name}, '重新抓取「' + name + '」的 light.gg 数据？');
+}
 refresh(); setInterval(refresh, 5000); setInterval(refreshJobs, 2000); refreshJobs();
 refreshBindings(); setInterval(refreshBindings, 10000);
 refreshBungie(); setInterval(refreshBungie, 10000);
+refreshUsage(); setInterval(refreshUsage, 3000);
 </script></body></html>"""
 
 
@@ -478,6 +555,32 @@ async def bot_bindings():
 async def bot_logs_clear():
     bot_log.clear()
     return {"ok": True}
+
+
+# ---------- 武器使用率数据（light.gg 快照：状态 / 全库刷新 / 单武器校准） ----------
+
+@app.get("/api/usage/status")
+async def usage_status():
+    st = weapon_usage.usage_status()
+    st["cdp"] = await weapon_usage._cdp_probe()   # 调试 Edge（9222）在不在，决定能否刷新
+    return st
+
+
+@app.post("/api/usage/refresh")
+async def usage_refresh(request: dict):
+    """启动 light.gg 后台重抓：{scope:'all'|'missing'} 或 {name:'武器名/hash'}（单武器校准）"""
+    name = (request.get("name") or "").strip()
+    if name:
+        hashes = weapon_usage.resolve_weapon_hashes(name)
+        if not hashes:
+            return {"ok": False, "error": f"找不到武器：{name}"}
+        return await weapon_usage.start_refresh(scope="custom", hashes=hashes)
+    return await weapon_usage.start_refresh(scope=(request.get("scope") or "all").strip())
+
+
+@app.post("/api/usage/stop")
+async def usage_stop():
+    return weapon_usage.stop_refresh()
 
 
 _ob11_recheck_at = 0.0  # 上次"未连接时补发反向 WS 配置"的时间（限频，WebUI API 有频率限制）
@@ -1182,7 +1285,7 @@ async def _bungie_callback_page(request: Request, code: str = "", state: str = "
     print(f"[auth] token 落库: {tok.get('display_name') or tok.get('membership_id')} "
           f"({ 'QQ用户' if tok.get('is_user') else '面板主账号' })")
     if tok.get("is_user"):
-        return (f"<h2 style='color:#35c66b;font-family:sans-serif'>授权成功：{d2.esc_err(tok.get('display_name') or '')}</h2>"
+        return (f"<h2 style='color:#35c66b;font-family:sans-serif'>授权成功：{esc(tok.get('display_name') or '')}</h2>"
                 "<div style='font:14px sans-serif;color:#c5cacd'>已绑定该 QQ 用户，回群发 "
                 "<code>/配装 数字</code> 或 <code>/仓库 关键词</code> 即可。</div>" + back)
     return ("<h2 style='color:#35c66b;font-family:sans-serif'>授权成功</h2>"
