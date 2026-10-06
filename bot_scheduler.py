@@ -188,7 +188,11 @@ async def _binding_sync_job() -> None:
         print(f"[sched] 绑定 meta 补种子 {r['seeded']} 条（老绑定补存 membershipId）")
     for uid, name in r["stale"]:
         print(f"[sched] 绑定 uid {uid} 的 {name} 在棒鸡侧搜不到（多半已改名），需人工核实新名字")
-    if not any((r["updated"], r["seeded"], r["stale"])):
+    # 失败条数必须报出来：以前核对的每一次请求都在抛 JSONDecodeError，这里却照样打
+    # 「现名全部一致」，把「所有核对全废」瞒了很久（见 CHANGELOG 2026-10-07 的 /Platform 修复）
+    if r["errors"]:
+        print(f"[sched] 绑定核对有 {r['errors']} 条失败（原因见上面的 [bind] 行）")
+    if not any((r["updated"], r["seeded"], r["stale"], r["errors"])):
         print("[sched] 绑定核对完成：现名全部一致")
 
 

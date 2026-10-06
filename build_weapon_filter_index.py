@@ -1,16 +1,22 @@
 """构建武器筛选索引 manifest_index/weapon_filter_index.json（离线，读现成缓存）
 
-产出 hash → 精简筛选字段，供 /武器筛选 使用：
+产出 hash → 精简筛选字段，供 /武器筛选 与图鉴 /catalog 使用：
   n  名称 / t 类型 / a 弹药 / c 分类（动能/能量/威力）
   e  元素（动能/电弧/烈日/虚空/冰影/缚丝）
   f  框架（固有特性名）/ p 可选特性名列表
   r  射速（每分钟发射数）/ cr 可锻造 / i 图标 / w 水印
+  en / cht  英文名 / 台服繁体名（build_locale_index.py 的 wname），
+            让「/武器筛选 Fatebringer」「图鉴搜 Crota」这类英文/繁体名也能命中
 """
 import json
 
 WF = json.load(open("manifest_index/weapons_full.json", encoding="utf-8"))
 RAW = json.load(open("manifest_index/raw_items.json", encoding="utf-8"))
 GROUPS = json.load(open("manifest_index/pattern_groups.json", encoding="utf-8"))["groups"]
+try:  # 英文/繁体武器名（build_locale_index.py 产出；没建过就留空，不影响中文筛选）
+    WNAME = json.load(open("manifest_index/name_i18n.json", encoding="utf-8")).get("wname") or {}
+except Exception:  # noqa: BLE001
+    WNAME = {}
 
 # 可锻造 = 出现在锻造图案分组里；同名的普通版/专家版都算
 CRAFT = {}
@@ -66,6 +72,8 @@ for h, w in WF.items():
         "x": 1 if (it.get("inventory") or {}).get("tierType") == 6 else 0,
         "i": w.get("icon", ""),
         "w": w.get("watermark", ""),
+        "en": (WNAME.get(h) or ["", ""])[0],
+        "cht": (WNAME.get(h) or ["", ""])[1],
     }
 
 json.dump(out, open("manifest_index/weapon_filter_index.json", "w", encoding="utf-8"),

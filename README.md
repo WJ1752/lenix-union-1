@@ -63,6 +63,7 @@
 ### 🔫 图鉴与查询
 - **武器图鉴** `/catalog`　全量 **2208 把**武器网格，六维度（类型 / 框架 / 元素 / 弹药 / 槽位 / 品质）**动态联动计数**筛选
 - 跨字段搜索，认社区叫法（`喷子`→霰弹枪、`绿弹`→特殊弹药、`主手`→主武器…）
+- 也认**英文名与台服繁体名**：`Fatebringer` / `Hand Cannon` / `手持加農砲` / `龍之氣息` 直接搜得到
 - 默认**合并同名版本**（2208 条 → 1318 个名字），点卡片就地弹出详情层
 - **武器详情**　Perk 分列**单选**，属性条实时联动（加成绿 / 削减红），Perk 悬停出精确数值浮层
 - **异域催化**　145 把金枪，中文说明优先、社区英文兜底
@@ -150,6 +151,7 @@ python -m venv .venv
 .venv\Scripts\python build_manifest.py
 .venv\Scripts\python build_weapon_details.py
 .venv\Scripts\python enrich_weapons_ci.py
+.venv\Scripts\python build_locale_index.py      # 英文/繁体名索引（要在 filter_index 之前跑）
 .venv\Scripts\python build_weapon_filter_index.py
 .venv\Scripts\python build_weapon_catalog.py
 .venv\Scripts\python build_modes.py
@@ -301,6 +303,12 @@ exe（或源码）同目录的 `qq_official_creds.json`（模板见 `qq_official
 
 **免指令**：`@机器人 武器名` 或 `@机器人 perk名` 直接出对应卡片（只认真 @，引用机器人消息不算）。
 
+**词条语言**：指令触发词只有中文（`/武器查询`、`/掉落` …），但**查什么名字都可以用英文或台服繁体**——
+`/武器查询 Fatebringer`、`/武器查询 龍之氣息`、`/武器查询 加拉尔号角` 出同一张卡；`/perk查询 Incandescent`、
+`/护甲查询 呆瓜雷達`、`/护甲套装 Seventh Seraph`、`/掉落 Crota's End`、`/掉落 國王的殞落`、`/仓库 Vex Mythoclast`
+同样认。名字取自 Bungie Manifest 官方 en / zh-cht 定义（不是字形转换：台服叫法常有词形差异，
+「克洛塔/克羅塔」「突袭/掠夺」这种只有官方名对得上），命中后卡片副标题会带出你输的那个名字。
+
 <details>
 <summary><b><code>/武器筛选</code> 支持的词库</b></summary>
 
@@ -312,8 +320,12 @@ exe（或源码）同目录的 `qq_official_creds.json`（模板见 `qq_official
 | 元素 | `电` `火` `冰` `虚空` `缚丝` |
 | 射速 | `140` `900` … |
 | 框架 | `速射` `波形` `适配` `精密` `轻质` `高冲` … |
-| 特性 | 任意 Perk 名，如 `爆破专家` `雪上加霜` `事不过四` |
+| 特性 | 任意 Perk 名，如 `爆破专家` `雪上加霜` `事不过四`（英文/繁体名同样认） |
 | 其他 | `锻造`（可锻造）`异域`（金枪） |
+
+**英文/繁体词**：类型、框架、元素、特性、武器名都能写英文或台服繁体，多词连读也认
+（`/武器筛选 Hand Cannon exotic`、`/武器筛选 脈衝步槍 烈日`、`/武器筛选 adaptive frame`）。
+词表见 `manifest_index/name_i18n.json` 的 `terms`（由 `build_locale_index.py` 按 hash 对齐三语名生成）。
 
 匹配分两级：词若能在「类型 / 弹药 / 槽位 / 元素 / 框架」命中就只用这几个字段，否则才去武器名 / 来源 / 特性名里找
 —— 否则「轻质」会从 222 条轻质框架涨到 627 条（轻质弹匣）。词与词矛盾时自动忽略其中一个并在卡片上注明。
@@ -333,6 +345,7 @@ lenix-union-1/
 ├── bot*.py                 # QQ 侧：nonebot 运行时 / 图片卡片 / 消息日志
 ├── card_render.py          # Playwright 卡片渲染（按事件循环各持一个浏览器）
 ├── weapon_filter.py        # /武器筛选 词库与匹配
+├── name_i18n.py            # 英文/繁体名查询索引（武器/perk/副本/套装/筛选词）
 ├── napcat_runtime.py       # 内置 NapCat 的启动与扫码登录桥接
 ├── build_*.py              # 索引构建脚本（Manifest → manifest_index/*.json）
 ├── scrape_starside_*.py    # 中文 Perk / 催化说明抓取
@@ -374,8 +387,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy_exe.ps1
 | 改了什么 | 要做什么 |
 | :--- | :--- |
 | `webui.py` / `destiny_data.py` / `D2Query.spec` | **重新打包** `build_exe.bat` + `deploy_exe.ps1` |
-| `nonebot_plugins/destiny2.py` / `card_render.py` / `bot_cards.py` / `weapon_filter.py` | 外置加载，**复制到 exe 同目录**重启即可（不用重打包） |
+| `nonebot_plugins/destiny2.py` / `card_render.py` / `bot_cards.py` / `weapon_filter.py` | 统一按**重新打包**处理：这些模块在 spec `hiddenimports` 里已被打进 exe，运行时 FrozenImporter 优先，外置副本不生效（`deploy_exe.ps1` 2026-10-03 实证）；只有 `bot_loadout.py` / `bot_tunnel.py` / `name_i18n.py` 这类不在 spec 清单里的才靠外置副本加载 |
 | 新增 `manifest_index/*.json` | spec 用 glob 自动收集，但 exe 已生成的话需重打包才会进 `_internal` |
+| `build_locale_index.py` 重跑（Bungie manifest 更新后） | 重新生成 `manifest_index/name_i18n.json` + `item_cht.json`，再重打包才会进 `_internal` |
 | 网页样式 / 卡片排版 | 重新打包（`webui.py` 内嵌） |
 
 > `_internal` 复制务必用 `cp -r`；`robocopy /MIR` 在中文路径下会卡住。

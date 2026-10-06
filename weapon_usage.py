@@ -24,8 +24,8 @@ pct，没有时退化为两列 pct 的独立乘积估算（卡片页脚会注明
 2. 自定义端点：GET {endpoint}/{item_hash}，返回体是完整契约直接用，否则当作 raw 数据解析；
 3. CDP 接入用户已验证浏览器（**无需任何配置**）：探测 http://127.0.0.1:9222/json/version
    （3s 超时，不通立即跳过），通了就 connect_over_cdp 挂进用户真实浏览器会话
-   （先双击 start_edge_debug.bat 重启 Edge：独立调试 profile + --remote-debugging-port=9222，
-   新版 Edge 对默认配置目录忽略调试端口），在其里开 light.gg 页面等 Turnstile 放行后取
+   （独立调试 profile + --remote-debugging-port=9222；新版 Edge 对默认配置目录忽略调试端口，
+   所以必须用独立 profile），在其里开 light.gg 页面等 Turnstile 放行后取
    HTML —— 用户浏览器已人工过 Cloudflare 验证，这是唯一能稳定穿过 light.gg 防线的通道；
    失败进 10 分钟冷却，避免每条指令都去连；
 4. d2foundry.gg/w/{hash}（httpx + Edge UA；503/超时跳过；防御式解析页面内嵌 JSON）；
@@ -35,8 +35,10 @@ pct，没有时退化为两列 pct 的独立乘积估算（卡片页脚会注明
 
 配置方法
 --------
-- CDP 通道（提供者③）：零配置。只要 Edge 带 --remote-debugging-port=9222 开着
-  （双击仓库根的 start_edge_debug.bat，标签页自动恢复、登录态/验证状态全保留）即可。
+- CDP 通道（提供者③）：零配置。只要 Edge 带 --remote-debugging-port=9222 开着即可
+  （标签页自动恢复、登录态/验证状态全保留）。没开也不用管：面板点「全库刷新」会调用
+  ``ensure_channel()`` 用独立调试 profile 自己起一个 Edge 实例（与用户正在用的 Edge 并存，
+  不关人家窗口），起不来才需要手动双击 start_edge_debug.bat 兜底。
 - cwd 下 ``usage_config.json``：``{"endpoint": "https://host/api/usage", "proxy": "http://127.0.0.1:7890"}``
   （endpoint 优先级高于环境变量；proxy 同理；两字段均可省略）
 - 环境变量：``D2_USAGE_ENDPOINT`` / ``D2_USAGE_PROXY``
@@ -63,11 +65,15 @@ import datetime
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from collections import deque
 
 import httpx
+
+import name_i18n
 
 __all__ = ["get_usage", "parse_lightgg_html", "harvest_pct_lists", "pw_fetch_html"]
 
@@ -99,6 +105,26 @@ def _idx_file(name: str) -> str:
     if os.path.exists(bundled):
         return bundled
     return os.path.join("manifest_index", name)
+
+
+def _snap_path() -> str:
+    """weapon_usage_snapshot.json 的读路径：cwd 副本优先（后台全库刷新的运行时产物，
+    打包版 exe 的 _MEIPASS 捆绑副本是构建时旧数据，必须能被它盖过），否则常规定位。"""
+    local = os.path.join("manifest_index", "weapon_usage_snapshot.json")
+    if os.path.exists(local):
+        return local
+    return _idx_file("weapon_usage_snapshot.json")
+
+
+def _snap_write_path() -> str:
+    """快照写路径：永远写 cwd 下的 manifest_index（源码跑 = 仓库目录；exe 跑 = exe 旁）。"""
+    d = os.path.join("manifest_index", "")
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+    return os.path.join(d, "weapon_usage_snapshot.json")
 
 
 def _cwd_file(name: str) -> str:
@@ -367,7 +393,10 @@ def harvest_pct_lists(obj, out_lists: list | None = None):
 
 _ICON_RE = re.compile(r"icons/([0-9a-f]{32})\.(?:png|jpg)", re.I)
 _ITEM_LINK_RE = re.compile(r"/db/items/(\d{4,10})")
-_PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+# 注意：light.gg 有省略前导零的写法（".88% of Rolls" = 0.88%），必须允许 ".88" 形态，
+# 再用 _pct_num 补零。此前用 (\d{1,3}...) 会把 .88% 匹配成 88%，冷门组合被放大 100 倍
+# 排到榜首（2026-10-07 散射信号「丰盈满溢+柔缓 85%」实为 0.85% 实证）。
+_NUM_PCT_RE = re.compile(r"(\d*\.?\d+)\s*%")
 
 # ---- light.gg 真实页面结构（按 _lgg_real.html 校准；别的 ul 都带 enhanced/random 等附加类）----
 _LGG_UL_COLS = re.compile(r'<ul class="list-unstyled sockets">(.*?)</ul>', re.S)
@@ -415,7 +444,7 @@ def _parse_lightgg_dom(html: str) -> dict | None:
         seg = html[tc:ca] if ca > tc else html[tc:tc + 200000]
         for m in _LGG_COMBO_BLOCK.finditer(seg):
             hashes = _LGG_DATA_ID.findall(m.group(0))
-            pm = _PCT_RE.search(m.group(1))
+            pm = _NUM_PCT_RE.search(m.group(1))
             if len(hashes) == 2 and pm:
                 p = _pct_num(pm.group(1))
                 if p > 0:
@@ -426,7 +455,7 @@ def _parse_lightgg_dom(html: str) -> dict | None:
     if ms >= 0:
         for m in _LGG_COMBO_BLOCK.finditer(html, ms, ms + 100000):
             hashes = _LGG_DATA_ID.findall(m.group(0))
-            pm = _PCT_RE.search(m.group(1))
+            pm = _NUM_PCT_RE.search(m.group(1))
             if len(hashes) == 1 and pm:
                 p = _pct_num(pm.group(1))
                 if p > 0:
@@ -471,9 +500,9 @@ def parse_lightgg_html(html: str) -> dict:
                         "mw": [], "mods": []}
     # ③ DOM 启发式：pct 往回找最近的 item hash / bungie 图标
     pairs: dict[int, float] = {}
-    for m in _PCT_RE.finditer(html):
+    for m in _NUM_PCT_RE.finditer(html):
         try:
-            pct = round(float(m.group(1)), 2)
+            pct = _pct_num(m.group(1))
         except ValueError:  # noqa: BLE001
             continue
         if not (0 < pct <= 100):
@@ -573,6 +602,115 @@ async def _cdp_probe() -> bool:
             return r.status_code == 200
     except Exception:  # noqa: BLE001
         return False
+
+
+# ------------------------------------------------- 通道自启：面板点刷新时自己把调试 Edge 拉起来
+#
+# 9222 上没通道时不再只丢一句报错给用户：用**独立调试 profile** 再起一个 Edge 实例
+# （与用户正在用的 Edge 两个进程并存，实测 2 秒端口就绪，全程不 taskkill、不关人家窗口），
+# 端口就绪后照旧走 CDP。profile 默认沿用 F:\edge_debug_profile——cf_clearance 就在里面，
+# 拉起后通常不用重新过人机验证。只有连 msedge.exe 都找不到才当场报错，让用户走
+# start_edge_debug.bat 兜底。
+CDP_PORT = 9222                      # 与 CDP_URL 同源：--remote-debugging-port 的值
+CDP_PROFILE_ENV = "D2_EDGE_DEBUG_PROFILE"        # 想换调试 profile 目录就设这个环境变量
+CDP_PROFILE_DEFAULT = r"F:\edge_debug_profile"   # 与 start_edge_debug.bat 同一个目录
+CDP_BOOT_WAIT = 45.0                 # 拉起后等 9222 就绪的最长秒数
+
+
+def _find_edge_exe() -> str | None:
+    """定位 msedge.exe：注册表 App Paths（最权威）→ 常见安装目录 → PATH。"""
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe") as k:
+                p = winreg.QueryValueEx(k, "")[0]
+            if p and os.path.exists(p):
+                return p
+        except Exception:  # noqa: BLE001
+            pass
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 os.environ.get("LOCALAPPDATA")):
+        if base:
+            p = os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")
+            if os.path.exists(p):
+                return p
+    return shutil.which("msedge")
+
+
+def _debug_profile_dir() -> str:
+    """调试 profile 目录：环境变量 > start_edge_debug.bat 里写的值 > F:\edge_debug_profile。
+
+    必须沿用同一个目录：cf_clearance 存在里面，换目录等于每次都要重新过人机验证。"""
+    env = (os.environ.get(CDP_PROFILE_ENV) or "").strip()
+    if env:
+        return env
+    for base in (os.getcwd(), os.path.dirname(os.path.abspath(__file__)),
+                 os.path.dirname(sys.executable)):
+        try:
+            with open(os.path.join(base, "start_edge_debug.bat"), encoding="utf-8",
+                      errors="replace") as f:
+                txt = f.read()
+        except OSError:
+            continue
+        m = re.search(r'set\s+"EDGE_PROFILE=([^"]*)"', txt, re.I)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    if os.path.isdir(CDP_PROFILE_DEFAULT):
+        return CDP_PROFILE_DEFAULT
+    return os.path.join(os.getcwd(), "edge_debug_profile")
+
+
+def _spawn_flags() -> int:
+    """子进程与本体脱钩：面板/本体关掉重启，调试 Edge 继续开着，下次直接复用。"""
+    if os.name != "nt":
+        return 0
+    return (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+
+async def ensure_channel(patience_s: float = CDP_BOOT_WAIT, cancel=None) -> dict:
+    """确保 127.0.0.1:9222 上有可用的调试 Edge：已在→直接回；不在→起一个再等端口。
+
+    返回 {"ok": bool, "started": bool, "detail": str, "cancelled"?: bool}；
+    **只新增一个 Edge 实例（独立 user-data-dir），绝不关用户正在用的 Edge**。"""
+    global _cdp_fail_until
+    if await _cdp_probe():
+        _cdp_fail_until = 0.0          # 通道回来了：顺手解除 CDP 冷却，指令立刻能再走 CDP
+        return {"ok": True, "started": False, "detail": "调试 Edge 已在运行"}
+    exe = _find_edge_exe()
+    if not exe:
+        return {"ok": False, "started": False,
+                "detail": "找不到 msedge.exe；请手动双击 start_edge_debug.bat 后再刷新"}
+    profile = _debug_profile_dir()
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except OSError as e:
+        return {"ok": False, "started": False,
+                "detail": f"调试 profile 目录不可用（{profile}）：{e}"}
+    args = [exe, f"--user-data-dir={profile}", f"--remote-debugging-port={CDP_PORT}",
+            "--restore-last-session", "--no-first-run", "--no-default-browser-check"]
+    try:
+        subprocess.Popen(args, cwd=profile, close_fds=True, creationflags=_spawn_flags(),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError as e:
+        return {"ok": False, "started": False, "detail": f"拉起调试 Edge 失败：{e}"}
+    deadline = time.monotonic() + patience_s
+    while time.monotonic() < deadline:
+        if cancel is not None and cancel():
+            return {"ok": False, "started": True, "cancelled": True,
+                    "detail": "已取消（端口没等到就点了停止）"}
+        await asyncio.sleep(0.8)
+        if await _cdp_probe():
+            _cdp_fail_until = 0.0
+            return {"ok": True, "started": True,
+                    "detail": f"已拉起调试 Edge（profile={profile}）"}
+    return {"ok": False, "started": True,
+            "detail": f"调试 Edge 起了但 {int(patience_s)}s 内 9222 没就绪：该 profile 可能已被"
+                      f"另一个 Edge 占着（关掉那个调试窗口再试），或 Edge 启动被安全软件拦了"}
 
 
 class _CdpSession:
@@ -936,7 +1074,7 @@ async def _impl(h: int, force: bool) -> dict | None:
     raw = None
     source = ""
     try:
-        snap = _load_json(_idx_file("weapon_usage_snapshot.json"), {}) or {}
+        snap = _load_json(_snap_path(), {}) or {}
         if isinstance(snap.get(str(h)), dict):            # ① 本地快照（无网络）
             raw, source = snap[str(h)], "snapshot"
     except Exception:  # noqa: BLE001
@@ -979,3 +1117,276 @@ async def _impl(h: int, force: bool) -> dict | None:
     cache[str(h)] = {"ts": _now_iso(), "data": data}
     await _cache_store(cache)
     return data
+
+
+# ---------------------------------------------------------------- WebUI 后台全库刷新
+#
+# 面板「武器使用率数据」卡片的后端：借 CDP 通道（start_edge_debug.bat 起的调试 Edge）
+# 在已过 Cloudflare 的会话里用页内 fetch 批量重抓 light.gg，重写本地快照并失效派生缓存。
+# 与 build_weapon_usage_fast.py 同一套路，但常驻进程内、面板可点、可看进度、可中途停止。
+
+_REFRESH_SEED = "https://www.light.gg/db/items/42435996/"
+_CF_TITLES = ("Just a moment", "请稍候", "Attention Required")
+
+_refresh_state: dict = {"running": False, "done": 0, "total": 0, "ok": 0, "fail": 0,
+                        "scope": "", "message": "待机", "started": "", "finished": "",
+                        "error": "", "stop": False, "rate": 0.0, "eta_s": 0.0}
+_refresh_task: asyncio.Task | None = None
+
+
+def _challenged(html: str) -> bool:
+    head = html[:4000]
+    return ("Just a moment" in head) or ("请稍候" in head) or ("cf-chl-" in head)
+
+
+def _refresh_targets() -> list[int]:
+    """全库目标：weapons_full 里带特性列的武器（与 build_weapon_usage_fast 同口径）"""
+    _ensure_indexes()
+    return [int(h) for h, w in _WEAPONS_FULL.items()
+            if any("特性" in (c.get("t") or "") for c in ((w.get("plugs") or {}).get("cols") or []))]
+
+
+def resolve_weapon_hashes(q: str) -> list[int]:
+    """手动校准入口：武器名（支持模糊/英文名/繁体名）/ hash → 待刷新 hash 列表（最多 10 个）"""
+    _ensure_indexes()
+    q = (q or "").strip().lower()
+    if not q:
+        return []
+    if q.isdigit():
+        return [int(q)] if q in _WEAPONS_FULL else []
+    exact = [int(h) for h, w in _WEAPONS_FULL.items() if (w.get("name") or "").lower() == q]
+    if exact:
+        return exact[:10]
+    part = [int(h) for h, w in _WEAPONS_FULL.items() if q in (w.get("name") or "").lower()]
+    if part:
+        return part[:10]
+    return [int(h) for h in name_i18n.match_weapons(q, limit=10) if h in _WEAPONS_FULL]
+
+
+def refresh_state() -> dict:
+    s = {k: v for k, v in _refresh_state.items() if k != "stop"}
+    total = s.get("total") or 0
+    # pct 永远按 done/total 算（跑完/中途停/失败都如实反映），别再"没跑完就归零"
+    s["pct"] = round(s.get("done", 0) * 100.0 / total, 1) if total else 0.0
+    return s
+
+
+def usage_status() -> dict:
+    """面板卡片一览：快照/目标/缺失/缓存条数 + 最新数据日期 + 刷新任务进度"""
+    try:
+        targets = _refresh_targets()
+    except Exception:  # noqa: BLE001
+        targets = []
+    snap = _load_json(_snap_path(), {}) or {}
+    dates = [v.get("fetched_at") for v in snap.values() if isinstance(v, dict) and v.get("fetched_at")]
+    return {"snapshot": len(snap), "targets": len(targets),
+            "missing": sum(1 for h in targets if str(h) not in snap),
+            "newest": max(dates) if dates else None,
+            "cache": len(_cache_load()),
+            "refresh": refresh_state()}
+
+
+def _drop_contract_cache(hashes: list[int] | None) -> None:
+    """清掉派生契约缓存：None=全清。让下一条指令起用新快照重建（负缓存一并失效）。"""
+    try:
+        cache = _cache_load()
+        if hashes is None:
+            cache = {}
+        else:
+            for h in hashes:
+                cache.pop(str(h), None)
+        _dump_json(_cwd_file("weapon_usage_cache.json"), cache)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wrap_raw(raw: dict) -> dict:
+    return {"source": "lightgg", "fetched_at": _now_iso()[:10],
+            "cols": [[list(p) for p in col] for col in raw.get("cols") or []],
+            "plugs": [list(p) for p in raw.get("plugs") or []],
+            "mw": [list(p) for p in raw.get("mw") or []],
+            "mods": [list(p) for p in raw.get("mods") or []],
+            "combos": [list(c) for c in raw.get("combos") or []]}
+
+
+async def start_refresh(scope: str = "all", hashes: list[int] | None = None) -> dict:
+    """启动后台刷新任务。scope: all=全库重抓 / missing=只补缺失；hashes 给定时只刷这些。"""
+    global _refresh_task
+    if _refresh_state["running"]:
+        return {"ok": False, "error": "已有刷新任务在进行中", "state": refresh_state()}
+    if not hashes:
+        targets = _refresh_targets()
+        if scope == "missing":
+            snap = _load_json(_snap_path(), {}) or {}
+            # 快照键是字符串、targets 是 int：必须 str(h) 比较，否则"只补缺失"永远等于全库
+            hashes = [h for h in targets if str(h) not in snap]
+        else:
+            hashes, scope = targets, "all"
+    hashes = [int(h) for h in (hashes or [])]
+    if not hashes:
+        return {"ok": False, "error": "没有需要抓取的武器"}
+    # 通道没开就自己拉起（面板点刷新 = 自动开调试 Edge）：这里只拦「连 Edge 都找不到」的硬失败，
+    # 拉起过程放进任务里做，状态卡能显示进度（不至于 HTTP 请求卡 45 秒）
+    need_boot = not await _cdp_probe()
+    if need_boot and not _find_edge_exe():
+        return {"ok": False, "error": "没有可用的 light.gg 通道，本机也找不到 Edge（msedge.exe）："
+                                      "请先双击仓库根的 start_edge_debug.bat 启动调试模式 Edge"
+                                      "（端口 9222），过一次验证后再点刷新"}
+    # 立刻失效这批 hash 的旧契约缓存（含负缓存），爬的过程中查询也能落到快照旧值而不是坏缓存
+    _drop_contract_cache(hashes if len(hashes) <= 64 else None)
+    _refresh_state.update(running=True, done=0, total=len(hashes), ok=0, fail=0,
+                          scope=scope or "custom", error="", stop=False, rate=0.0, eta_s=0.0,
+                          message=("正在启动调试浏览器…" if need_boot else "连接调试浏览器…"),
+                          started=_now_iso(), finished="")
+    _refresh_task = asyncio.create_task(_refresh_job(hashes, boot=need_boot))
+    return {"ok": True, "total": len(hashes)}
+
+
+def stop_refresh() -> dict:
+    if _refresh_state["running"]:
+        _refresh_state["stop"] = True
+        _refresh_state["message"] = "正在停止…（等当前页完成）"
+        return {"ok": True}
+    return {"ok": False, "error": "没有在跑的刷新任务"}
+
+
+async def _open_crawl_page(ctx, wid: int, patience_s: float = 90.0):
+    """开一页到 light.gg 并等挑战放行（标题正常 且 页面含 community-average）。"""
+    page = await ctx.new_page()
+    try:
+        await page.goto(_REFRESH_SEED, timeout=45000, wait_until="domcontentloaded")
+    except Exception:  # noqa: BLE001
+        pass
+    deadline = time.monotonic() + patience_s
+    raised = False
+    while time.monotonic() < deadline:
+        if _refresh_state["stop"]:
+            break
+        try:
+            html = await page.content()
+        except Exception:  # noqa: BLE001
+            html = ""
+        if 'id="community-average"' in html and not _challenged(html):
+            return page
+        if not raised and _challenged(html):
+            # 撞上人机验证：把调试 Edge 窗口置前 + 在面板上说清楚，让用户知道要点一下
+            raised = True
+            _refresh_state["message"] = "等 light.gg 人机验证放行：调试 Edge 窗口已置前，点一下验证就行"
+            try:
+                await page.bring_to_front()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await page.wait_for_timeout(1500)
+        except Exception:  # noqa: BLE001
+            break
+    try:
+        await page.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _refresh_job(hashes: list[int], boot: bool = False) -> None:
+    global _refresh_state
+    workers_n = 3 if len(hashes) > 30 else 1
+    t0 = time.monotonic()
+    snap = _load_json(_snap_path(), {}) or {}
+    ok = fail = done = 0
+    pw = browser = None
+    try:
+        if boot:                             # 通道离线：先自己把调试 Edge 拉起来（不关用户正在用的）
+            ch = await ensure_channel(cancel=lambda: _refresh_state["stop"])
+            if not ch.get("ok"):
+                if ch.get("cancelled"):
+                    _refresh_state.update(running=False, finished=_now_iso(), message="已停止")
+                else:
+                    _refresh_state.update(running=False, finished=_now_iso(),
+                                          message="没能打开 light.gg 通道",
+                                          error=ch.get("detail") or "")
+                return
+            _refresh_state["message"] = "连接调试浏览器…"
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.connect_over_cdp(CDP_URL, timeout=CDP_CONNECT_TIMEOUT_MS)
+        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+        q: asyncio.Queue = asyncio.Queue()
+        for h in hashes:
+            q.put_nowait(h)
+        lock = asyncio.Lock()
+
+        async def fetch_item(page, h: int) -> str:
+            html = ""
+            try:
+                html = await page.evaluate(
+                    "h => fetch('/db/items/' + h + '/').then(r => r.text())", str(h))
+            except Exception:  # noqa: BLE001
+                html = ""
+            return html if (html and not _challenged(html)) else ""
+
+        async def worker(wid: int):
+            nonlocal ok, fail, done
+            await asyncio.sleep(wid * 2.0)      # 错峰开页，避免并发冲刚过验证的域
+            page = await _open_crawl_page(ctx, wid)
+            if page is None:
+                return
+            while not _refresh_state["stop"]:
+                try:
+                    h = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                html = await fetch_item(page, h)
+                if not html:                     # 会话失效/页崩了：重开页再试一次
+                    try:
+                        await page.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    page = await _open_crawl_page(ctx, wid)
+                    if page is not None:
+                        html = await fetch_item(page, h)
+                raw = None
+                if html:
+                    try:
+                        raw = parse_lightgg_html(html)
+                    except Exception:  # noqa: BLE001
+                        raw = None
+                async with lock:
+                    if raw:
+                        snap[str(h)] = _wrap_raw(raw)
+                        ok += 1
+                    else:
+                        fail += 1
+                    done += 1
+                    rate = done / max(time.monotonic() - t0, 0.1)      # 条/秒
+                    eta = max(0.0, (total - done) / max(rate, 0.01))
+                    # 具体进度交给面板的进度条（pct/rate/eta_s 都在 state 里），消息只报阶段
+                    _refresh_state.update(done=done, ok=ok, fail=fail, rate=round(rate, 3),
+                                          eta_s=round(eta, 1), message="抓取中…")
+                    if done % 25 == 0 or done == total:
+                        _dump_json(_snap_write_path(), snap)   # 周期落盘，中途崩溃也保留进度
+
+        total = len(hashes)
+        await asyncio.gather(*(worker(i) for i in range(workers_n)))
+    except Exception as e:  # noqa: BLE001
+        _refresh_state["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        try:
+            if browser is not None:
+                await browser.close()            # CDP：只断开，不杀调试 Edge
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if pw is not None:
+                await pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    if done >= len(hashes) and not _refresh_state["stop"]:
+        _dump_json(_snap_write_path(), snap)
+        _drop_contract_cache(None)               # 全清派生缓存，下条指令全部按新快照重建
+    stopped = _refresh_state["stop"]
+    _refresh_state.update(running=False,
+                          finished=_now_iso(),
+                          message=("已停止" if stopped else
+                                   ("已中止" if _refresh_state["error"] else
+                                    f"完成：成功 {ok} · 失败 {fail} · 共 {done}/{len(hashes)}（耗时 "
+                                    f"{(time.monotonic() - t0) / 60:.1f} 分钟）")))

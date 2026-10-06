@@ -889,7 +889,8 @@ def weapon_card(w: dict, others: list[str] | None = None,
     meta = " / ".join(x for x in (_W2_TIER.get(cat_def.get("q") or 0),
                                   cat_def.get("e"), w.get("ammo")) if x)
     slot = (w.get("cat") or "") + "武器" if w.get("cat") else ""
-    sub = " · ".join(x for x in (w.get("type"), slot) if x)
+    # alt_name：用户拿英文/繁体名查出来的那把，副标题带上原文对号（见 destiny2._weapon_reply）
+    sub = " · ".join(x for x in (w.get("type"), w.get("alt_name"), slot) if x)
     head = "<div class='w2-head'>"
     if w.get("watermark"):
         head += f"<div class='w2-wm' style=\"background-image:url('{esc(w['watermark'])}')\"></div>"

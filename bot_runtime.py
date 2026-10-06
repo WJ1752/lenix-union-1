@@ -198,7 +198,11 @@ def _serve(state: dict) -> None:
 
     driver.on_startup(_sched_attach_startup)
 
-    def _sched_attach(bot) -> None:   # 参数名必须是 bot：NoneBot 会按名字校验钩子签名
+    # 重连兜底再挂一次：**必须 async**——NoneBot 对同步钩子走 run_sync 丢进工作线程执行
+    # （nonebot/dependencies/__init__.py → anyio.to_thread），工作线程里没有正在运行的事件
+    # 循环，asyncio.get_running_loop() 会直接抛 "no running event loop"，钩子等于从没生效。
+    # 参数名必须是 bot：NoneBot 会按名字校验钩子签名。
+    async def _sched_attach(bot) -> None:
         bot_scheduler.attach_loop(asyncio.get_running_loop())
 
     driver.on_bot_connect(_sched_attach)

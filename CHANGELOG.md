@@ -2,6 +2,147 @@
 
 > 本文件保留项目全部功能演进记录与实现笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-07 fix(钩子 + API 路径): 两个「静默失效」的老 bug
+
+- **① `on_bot_connect` 钩子从没生效过**（每次 NapCat 重连都刷一段 ERROR）：
+  `bot_runtime.py` 的 `_sched_attach` 是**同步函数**，NoneBot 对同步钩子走
+  `run_sync`（`nonebot/dependencies/__init__.py` → `anyio.to_thread.run_sync`）丢进工作线程执行，
+  工作线程里没有正在运行的事件循环 → `asyncio.get_running_loop()` 抛
+  `RuntimeError: no running event loop`，被 nonebot 的 catch 打成
+  `Error when running WebSocketConnection hook`。功能上一直被 `on_startup` 那条异步钩子
+  兜住（每日预取照跑），所以没暴露；代价是日志被假 ERROR 污染 + 「重连兜底」是假的
+  （哪天 on_startup 没跑到，token 保活/轮换推送会静默停摆）。改法：`async def _sched_attach(bot)`。
+  回归测试 `_rtest/test_bot_hook.py` 直接复现 nonebot 的调用链，证明「同步写法必炸且挂不上循环、
+  async 写法才生效」；重启后日志 0 条 ERROR，`[sched] Bungie token 已续期` 证明调度器真挂上了。
+- **② `GetMembershipsById` 两处漏了 `/Platform` 前缀**（`destiny_data.py:1777` / `:2513`）：
+  `client()` 的 base_url 是 `https://www.bungie.net`，路径不写 `/Platform` 就打到网站 404 页面
+  （实测返回 `\ufeff<!DOCTYPE html>…404 Page`），`r.json()` 抛
+  `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`。两处都被 `except` 吞掉，于是：
+  **/raid /地牢 的「跨存档全家桶」静默失效**（只算主平台场次，注释里 87 vs 86 那笔账再也合不上）、
+  **每日改名核对 100% 失败**（日志里累计 723 次 `[bind] 改名核对失败`）。加前缀后实测返回 200 JSON，
+  部署目录 21 个绑定逐个核验：21/21 一致、0 失败（无人处于待改名状态，所以不会写回任何东西）；
+  Wj 这个账号下确实挂着 Steam + 另一个平台的成员，跨存档合并有实际意义。
+- 全仓 26 处 `client().get/post` 路径一起扫过，只有这两处漏前缀，其余都带 `/Platform/`。
+
+## 2026-10-07 feat(查询词条): 所有按名字查的功能认英文名与台服繁体名
+
+- **背景**：`weapons_full.json` / `perks.json` / `activities.json` / `armor_sets.json` / `item_zh.json`
+  全部出自 **zh-chs** manifest，玩家拿英文名（`Fatebringer`）或台服繁体名（`龍之氣息`、`手持加農砲`）
+  来查一律空手而归；`/护甲查询` 是唯一有 `en` 字段的入口，`/掉落` 只认 `ce`/`ron` 这类缩写。
+  **指令触发词保持中文不变**，这次只让「查什么名字」这层认英文与繁体。
+- **不做繁简字形转换**：台服叫法是词形差异（克洛塔/克羅塔、突袭/掠夺、手炮/手持加農砲），字形转换对不上，
+  所以直接采 Bungie 官方 `en` / `zh-cht` 名字建索引——`build_locale_index.py` 下载
+  `DestinyInventoryItemLiteDefinition(zh-cht)` + `DestinySandboxPerkDefinition` + `DestinyActivityDefinition`
+  + `DestinyEquipableItemSetDefinition`（en/zh-cht），按 **同一个 hash** 把三语名对齐，产出两份紧凑索引：
+  ① `name_i18n.json`（`wname` 武器 hash→[英文,繁体]、`weapons`/`perks`/`activities` 三语名倒排、
+  `terms` 筛选词表 2430 条、`sets` 套装 109 条、`charts` 掉落表副本名 35 条，922KB）；
+  ② `item_cht.json` 繁体物品名→hash（17846 条，与已有 `item_en.json` 同构，843KB）。
+  下载原始定义（65MB 物品 + 活动/perk，共 ~94MB）留在 `manifest_index/raw_*` 作缓存，
+  **已在 D2Query.spec `_MI_SKIP` 里排除，不进包**。
+- **运行时**新增 `name_i18n.py`（不 import destiny_data，自带 `_idx_file` 三级定位；缺索引文件全部静默
+  降级成空结果/原词）：`match_weapons`/`match_perks`/`set_name`/`chart_key`/`translate`/`item_hashes`/
+  `name_hit`/`matched_name`。接进**全部按名字查的入口**，且都在**中文原路径没命中之后**才兜底，原有行为零改动：
+  `/武器查询`、`@机器人 直查`、`/perk查询`、`/护甲查询`（繁体名走 item_cht→hash）、`/护甲套装`、
+  `/掉落`（`Crota's End`、`國王的殞落`、`Vault of Glass`）、`/仓库`（`Vex Mythoclast`、`威寇斯破神者`）、
+  `/武器筛选`（`Hand Cannon`、`脈衝步槍`、`adaptive frame` 这类多词连读也认）、面板图鉴 `/catalog`
+  与 `/api/suggest`、面板单武器校准。`/武器筛选` 与图鉴索引 `weapon_filter_index.json` /
+  `weapon_catalog.json` 各加 `en`/`cht` 两个字段（构脚本从 `name_i18n.json` 的 `wname` 读，缺索引时留空不报错）。
+- **卡片上对号**：用英文/繁体名查出来的武器，副标题带出你输的那个名字
+  （`手炮 · Fatebringer · 能量武器`），避免"我查 Fatebringer 怎么出了个中文名"的错位感。
+- **面板**：`/catalog` 注入的别名表改成 `{**terms, **SYNONYM}`（英文/繁体词先查，再查社区叫法），
+  前端 `syncToks` 加多词连读（`hand cannon`/`adaptive frame` 拆开逐词都不成立），haystack 补 `en`/`cht`。
+- **构建顺序**：`build_locale_index.py` 刻意**不读** `weapon_filter_index.json`（锻造来源词表直接读
+  `pattern_groups.json`），免得两个索引脚本互相依赖；顺序固定为
+  `build_weapon_details` → `enrich_weapons_ci` → **`build_locale_index`** → `build_weapon_filter_index`
+  → `build_weapon_catalog`。
+- **实测**（`_rtest/test_i18n_smoke.py` 56 项 + `test_i18n_web.py` 11 项 + `test_i18n_plugin.py` 全绿）：
+  `Fatebringer`/`龍之氣息`/`宿命使者`/`加拉尔号角` 同出一张卡；`Incandescent`→辉耀炽热；
+  `Seventh Seraph`/`第七熾天使`/`Nezarec`→对应套装；18 张掉落图英文繁体名全对上；
+  `/武器筛选 Hand Cannon exotic` 12 把、`脈衝步槍 烈日` 26 把、`手炮`（中文老路径）202 把不变。
+- 顺带把 README 里「外置副本改完不用重打包」的旧说法改正：`bot_cards` / `weapon_filter` 等在 spec
+  `hiddenimports` 里，运行时 FrozenImporter 优先，**改这些必须重打包**（deploy_exe.ps1 里早有实证注释）。
+
+## 2026-10-07 feat(数据管理): 点刷新自动拉起 light.gg 通道 + 真进度条
+
+- **点「全库刷新/只补缺失/校准」不再只弹「没有可用的 light.gg 通道」**：`weapon_usage.ensure_channel()`
+  用独立调试 profile（默认 `F:\edge_debug_profile`，可用 `D2_EDGE_DEBUG_PROFILE` 覆盖；没有则读
+  start_edge_debug.bat 里的 `EDGE_PROFILE=`）自己起一个 Edge 实例带 `--remote-debugging-port=9222`，
+  端口就绪后照旧走 CDP 抓取。**全程不 taskkill、不关用户正在用的 Edge**——独立 user-data-dir 的第二个
+  Edge 跟正常 Edge 并存，实测端口 2 秒就绪；拉起成功后顺手清掉 CDP 的 10 分钟失败冷却，群指令立刻
+  能重新走 CDP。拉起过程放进刷新任务里（状态卡显示「正在启动调试浏览器…」），HTTP 请求不会卡 45 秒；
+  只有「连 msedge.exe 都找不到」才当场报错让人走 bat 兜底。
+- 面板新增「启动通道」按钮 + `POST /api/usage/channel/start`（不刷新、只想先把通道打开时用）；
+  离线提示文案改成「点『全库刷新』会自动拉起调试 Edge」。
+- **真进度条**：抓取阶段显示 `百分比 · done/total（成功 N · 失败 M）` + `剩余约 X 分钟`（后端新增
+  `rate`/`eta_s` 字段，消息里的重复计数去掉）；起通道/连浏览器/等人机验证的准备阶段走不定进度滚动条
+  +「准备中…」；撞上 Cloudflare 人机验证时把调试 Edge 窗口置前并在面板提示要手点一下。
+- 顺带修的三个老问题：①`stop` 标志跑完不重置——点过一次「停止」之后，每次刷新都会立刻"完成"
+  （0 条）；②「只补缺失」用 int 键去比字符串键的快照，永远等于全库重抓（现在真只补缺的 538 条，
+  确认弹窗会写明这批多是 light.gg 本就没有统计的武器——异域/固定词条/老随机掉落，补完多半仍是
+  「失败」，属正常）；③刷新中断/失败时进度百分比归零（现在如实显示 done/total）。
+- `start_edge_debug.bat` 改成非破坏式兜底：先探 9222（在线就直接退出什么都不动），只关占用调试
+  profile 的 Edge 进程；真起不来才提示「按任意键强制重启」（那时才会 taskkill 所有 Edge）。该脚本
+  已加进 deploy_exe.ps1 的外置清单（漏同步会让 exe 旁的兜底脚本与 EDGE_PROFILE 解析脱节）。
+
+## 2026-10-07 feat(后台UI): 后端管理重做为标签式管理台
+
+- **旧版问题**：面板把 连接状态/运行状态(iframe)/数据缓存/QQ登录/Bungie授权/消息日志/
+  生效群聊/使用率数据/指令说明 九块内容摞成一列 + 右侧两块，找什么都要滚很久，
+  运行状态用 details+iframe 嵌套很别扭。
+- **重做为六个标签页**（客户端切换，记住上次所在页）：
+  总览（QQ连接/NapCat/Bungie/数据概况 四块状态瓷砖 + 各处轮询顺带刷新 + 快捷跳转按钮）、
+  登录与授权（NapCat 扫码 + Bungie OAuth）、任务与日志（后台任务与消息日志双栏）、
+  群与绑定（生效群聊 + 账号绑定双栏）、数据管理（light.gg 使用率 + 数据与缓存）、
+  参数设置（CPU/内存/网络资源瓷砖 + 并发上限 + 生涯统计场次上限，原生页面，
+  废弃 iframe 嵌入）。轮询只在对应标签页可见时才刷新重型内容（二维码/资源采样）。
+- 旧 /runtime 路由保留（?embed=1 不带导航），收藏夹直链不受影响。
+
+## 2026-10-07 feat(界面整合): 导航收敛为 查询站/后端管理 两栏 + 后端管理中心
+
+- **导航从 8 个按钮收敛为 2 个栏目**：查询站（原玩家查询首页，内部标签本就覆盖
+  总览/PVP/PVE/智谋/战绩/Raid/地牢/生涯武器/宗师/热力图/称号/锻造）+ 后端管理
+  （原 Bot 面板）。武器图鉴 / Perk查询 / 光尘商店 / 本周轮换 / 护甲套装 不再占导航，
+  入口改挂在查询站首页的链接行；运行状态页从导航移除，改为后端管理里的折叠卡片
+  （iframe 内嵌 /runtime?embed=1，页面本体与全部路由保留，收藏夹直链不受影响）。
+  资料页顶部导航点亮「查询站」。
+- **后端管理新增「数据与缓存」卡片**：列出 15 项管线本地缓存（light.gg 使用率契约、
+  生涯武器汇总/明细、团本地牢历史/PGCR、raidreport、宗师、热力图、失落Sector、
+  光尘、轮换、赛季、兜售者、玩家查询记录、图标缓存），显示体积/更新时间/重建代价
+  （低/中/高），逐项一键清除（确认后删除，需要时自动重建）；绝不含绑定表/token/配置。
+  缓存定位 cwd 优先、exe 目录兜底，打包版同样可用。
+- 新端点：GET /api/backend/caches、POST /api/backend/cache/clear。
+
+## 2026-10-07 feat(生涯统计): PVP/PVE 场次上限可配置（运行状态页，支持无限制全生涯）
+
+- **背景**：/pvp生涯武器 逐场统计默认封顶 2000 场、/pve生涯武器 3000 场（PVP_MATCH_CAP /
+  PVE_MATCH_CAP 常量，防止十年老号把逐场 PGCR 拉取拖成几十分钟），全生涯大号会被截断。
+- **运行状态页新增「生涯统计场次上限」设置**：PvP / PvE 各一个下拉（默认 / 5000 /
+  10000 / 20000 / 无限制），存 bot_config.json 的 `pvp_match_cap` / `pve_match_cap`；
+  未设键 = 内置默认，**0 = 无限制**（统计全部可读生涯，仍受 Bungie 接口每角色
+  60 页 × 250 场的可读历史硬顶）。保存即生效，只对之后发起的任务生效；面板保存时
+  回显当前生效值。
+- `_collect_matches` 对 cap<=0 按无限处理（翻满 60 页或翻空为止），结果里的
+  `capped` 标记与卡片「已达逐场统计上限」提示带上实际 cap 值并提示去运行状态页调整；
+  QQ 卡片与网页共用 render_wpvp，一处改动两处生效。
+
+## 2026-10-07 fix(武器卡片): light.gg 组合使用率前导零 bug + 面板全库刷新/单武器校准
+
+- **热门组合使用率放大 100 倍的根因**：light.gg 的 combo 百分比有省略前导零的写法
+  （`.88% of Rolls` = 0.88%），组合/大师杰作解析用的 `(\d{1,3}...)` 正则不认 `.88`，
+  把它匹配成 88%——冷门组合（真实值 <1%）全部放大 100 倍，降序排序后反而霸榜
+  （散射信号「丰盈满溢+柔缓 85%」实为 0.85%，榜首本该是「丰盈满溢+受控连射 43.9%」）。
+  改为 `\d*\.?\d+` + `_pct_num` 补零（combo、大师杰作、DOM 兜底启发式三处同修），
+  已对 light.gg 实页 HTML 回归验证：榜首组合与单特性占比交叉吻合（49.5%×87.2%≈43.2%）。
+- **面板新增「武器使用率数据」卡片**（Bot 面板）：显示快照/目标/缺失/缓存条数、
+  最新数据日期与调试 Edge（9222 CDP 通道）在线状态；按钮「全库刷新（最新数据）」
+  「只补缺失」「停止」，进度条实时显示 抓取中 n/N · 成功/失败 · ETA（每 25 条落盘一次，
+  中途崩溃保留进度）。爬取引擎常驻 weapon_usage.py（复用 build_weapon_usage_fast 的
+  CDP + 页内 fetch 套路，3 worker 错峰），挑战页自动重开页面等放行。
+- **单武器校准**：面板输入武器名（支持模糊）/ hash → 只重抓该武器，几秒完。
+- **快照双副本读写**：刷新产物写 exe 旁 `manifest_index/weapon_usage_snapshot.json`
+  （cwd），读取时 cwd 副本优先于打包捆绑副本——打包版运行时刷新立即生效，不用重打包。
+  刷新完成/启动时自动失效派生契约缓存（weapon_usage_cache.json，含负缓存）。
+
 ## 2026-10-07 /登录 多用户授权 + /配装数字 + /仓库搜索
 
 - **公网隧道自动回跳（小日向同款单链接登录）**：仓库根放一份 cloudflared.exe（免费临时

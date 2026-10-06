@@ -24,6 +24,7 @@ import json
 
 import destiny_data as d2
 import bungie_auth
+import name_i18n
 from bot_fireteam import (_MAX_MEMBERS, _profile_ex, _retry_twice, _row_budget,
                           collect as _fireteam_collect)
 
@@ -386,8 +387,11 @@ async def vault_search(qq: str, kw: str) -> dict:
     inst = ((resp.get("itemComponents") or {}).get("instances") or {}).get("data") or {}
     chars = (resp.get("characters") or {}).get("data") or {}
     nk = d2.norm_key(kw)
+    alt = name_i18n.item_hashes(kw)  # 英文 / 繁体物品名（Vex Mythoclast、維克氏神話）命中
 
     def hit(h: int) -> bool:
+        if str(h) in alt:
+            return True
         n = _name(h)
         return bool(n) and (kw.lower() in n.lower() or (nk and nk in d2.norm_key(n)))
 

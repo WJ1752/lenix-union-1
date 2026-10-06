@@ -144,11 +144,17 @@ if b:
     results.append(("首页/PVE默认范围", "ok" if ok else "FAIL PVE 下拉未默认当前赛季"))
 # 本周轮换：exe 里主界面 / HTTPS 回跳 / QQ bot 各跑一个事件循环，共享 httpx 客户端时
 # 会报「Event object ... is bound to a different event loop」→ 整页「本周轮换获取失败」
-check("本周轮换", "/rotation", must=("本周轮换", "突袭", "d2nav", "max-width:800px"),
+check("本周轮换", "/rotation", must=("本周轮换", "突袭", "d2nav", "width:900px"),
       none_of=("Traceback", "Internal Server Error", "获取失败", "Event loop"))
-check("光尘商店", "/eververse", must=("d2nav", "max-width:800px"),
+check("光尘商店", "/eververse", must=("d2nav", "width:900px"),
       none_of=("Traceback", "Internal Server Error", "Event loop"))
-check("面板", "/panel", must=("QQ Bot 面板",))
+check("面板", "/panel", must=("Bot 后端管理",))
+# 英文/繁体词条（build_locale_index.py → manifest_index/name_i18n.json）：面板的联想与
+# 查询接口也要认，不然 QQ 侧改了这里悄悄退化没人发现
+check("词条/英文武器名", "/api/suggest?type=weapon&q=gjallar", must=("加拉尔号角",))
+check("词条/繁体武器名", "/api/suggest?type=weapon&q=龍之氣息", must=("龙息",))
+check("词条/英文perk", "/perks?q=Incandescent", must=("辉耀炽热",))
+check("词条/英文套装", "/armorsets?q=Seventh%20Seraph", must=("第七炽天使",))
 b = check("bot状态", "/api/bot/status")
 check("bot群API", "/api/bot/groups")
 

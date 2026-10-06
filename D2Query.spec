@@ -8,8 +8,14 @@ pw_datas, pw_binaries, pw_hidden = collect_all('playwright')
 
 # manifest_index 索引**自动收集**，别改回手写清单：手写版漏过一次 stats.json，
 # 打包出来的 exe 一开武器详情就报 "No such file or directory: manifest_index\stats.json"。
-# raw_* 是构建中间产物（raw_items.json 有 220MB），只给构建脚本用，不进包。
-_MI_SKIP = {'raw_items.json', 'raw_plugsets.json', 'raw_items_en_lite.json'}
+# raw_* 是构建中间产物，只给构建脚本用，不进包：raw_items 220MB、en/zh-cht 的
+# 物品与活动定义（build_locale_index.py 的下载缓存）也一并排除，只有**紧凑索引**
+# name_i18n.json / item_cht.json 进包。
+_MI_SKIP = {'raw_items.json', 'raw_plugsets.json', 'raw_items_en_lite.json',
+            'raw_items_cht_lite.json', 'raw_perks_cht.json', 'raw_perks_en.json',
+            'raw_acts_cht.json', 'raw_acts_en.json', 'raw_sets_chs.json',
+            'raw_sets_cht.json', 'raw_sets_en.json', 'raw_dmg_zh-chs.json',
+            'raw_dmg_zh-cht.json', 'raw_dmg_en.json'}
 mi_datas = [(p, 'manifest_index') for p in sorted(glob.glob('manifest_index/*.json'))
             if os.path.basename(p) not in _MI_SKIP]
 

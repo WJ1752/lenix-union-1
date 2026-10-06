@@ -72,6 +72,7 @@ import bot_loadout
 import bot_platform as bp
 import bot_tunnel
 import bungie_auth
+import name_i18n
 
 try:
     import weapon_usage
@@ -576,7 +577,13 @@ async def _weapon_reply(matcher, event: Event, q: str, ver_num: int | None = Non
             top = dict(d2.weapon_detail(vers[-1]["hash"]), hash=vers[-1]["hash"])
         ver_tags = [d2.season_tag(v["season"]) + ("·活动" if v["event"] else "") for v in vers]
         ver_names = [d2.season_name(v["season"]) for v in vers]
-    strong = len(res) == 1 or top["name"].lower().startswith(q.lower()) or top["name"].lower() == q.lower()
+    # 用英文/繁体名查的：把命中的那个名字带到卡片副标题上，方便确认是不是同一把
+    alt_name = name_i18n.matched_name(top.get("hash"), q)
+    if alt_name:
+        top = dict(top, alt_name=alt_name)
+    strong = (len(res) == 1 or top["name"].lower().startswith(q.lower())
+              or top["name"].lower() == q.lower()
+              or name_i18n.name_hit(top["hash"], q))  # 英文/繁体名精确查询同样出详情卡
     if strong:
         others = [w["name"] for w in res[1:4]]
         usage = None
@@ -711,8 +718,10 @@ def _armor_data() -> list[dict] | None:
 
 def _armor_match(items: list[dict], q: str) -> tuple[list[dict], list[dict]]:
     """按 名字/英文名/别名 匹配异域护甲：返回 (精确命中, 模糊命中)。
-    两者都为空时，再用无符号归一化键（去 ·/'/- 等符号）兜底一遍。"""
+    两者都为空时，再用无符号归一化键（去 ·/'/- 等符号）兜底一遍；
+    台服繁体名没有单独字段，靠三语物品索引（item_cht.json）先换出 hash 再认。"""
     q_low = (q or "").strip().lower()
+    alt = name_i18n.item_hashes(q)  # 英文/繁体名 → hash 集合（也含英文名的子串命中）
 
     def _pass(norm, qk: str) -> tuple[list[dict], list[dict]]:
         exact, fuzzy, seen = [], [], set()
@@ -720,7 +729,9 @@ def _armor_match(items: list[dict], q: str) -> tuple[list[dict], list[dict]]:
             names = {str(it.get("name") or ""), str(it.get("en") or "")}
             names |= {str(a) for a in (it.get("aliases") or [])}
             names = {norm(n) for n in names if n.strip()}
-            if qk in names:
+            if qk and str(it.get("hash")) in alt:  # 英文/繁体名直接命中该 hash
+                exact.append(it)
+            elif qk in names:
                 exact.append(it)
             elif any(qk in n or n in qk for n in names):
                 h = it.get("hash")

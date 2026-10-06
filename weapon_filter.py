@@ -11,6 +11,8 @@ import os
 import re
 import sys
 
+import name_i18n
+
 _IDX: dict | None = None
 _VER: dict = {}  # hash → {season, event}（weapon_versions.json，缺省为空=全部按首发）
 
@@ -108,6 +110,9 @@ def _pred(token: str):
         rpm = int(token)
         return (["射速"], lambda w, rpm=rpm: w["r"] == rpm)
 
+    # 英文 / 繁体词先归一到简体（Hand Cannon → 手炮、脈衝步槍 → 脉冲步枪），再走原来的词形表
+    token = name_i18n.translate(token)
+
     if token in SPECIAL:
         if SPECIAL[token] == "craft":
             return (["可锻造"], lambda w: bool(w["cr"]))
@@ -119,9 +124,9 @@ def _pred(token: str):
     def strong(w, low=low):
         return any(low in (w[k] or "").lower() for k in ("t", "a", "c", "e", "f"))
 
-    # 内容字段：武器名、来源、可选特性名
+    # 内容字段：武器名（含英文/繁体名）、来源、可选特性名
     def weak(w, low=low):
-        if any(low in (w[k] or "").lower() for k in ("n", "g")):
+        if any(low in (w[k] or "").lower() for k in ("n", "g", "en", "cht")):
             return True
         return any(low in p.lower() for p in w["p"])
 
@@ -132,8 +137,27 @@ def _pred(token: str):
     return (["关键字"], weak)
 
 
+def _merge_words(words: list[str]) -> list[str]:
+    """英文/繁体多词条先连读成一个词再翻译：「hand cannon」「adaptive frame」
+    「pulse rifle」拆开逐词都不成立，连读才认得出是类型/框架"""
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        for n in (3, 2):  # 最多连读三个词
+            if i + n <= len(words):
+                joined = " ".join(words[i:i + n])
+                if name_i18n.translate(joined) != joined:
+                    out.append(joined)
+                    i += n
+                    break
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
 def filter_weapons(query: str, limit: int = 120) -> dict:
-    words = [t for t in re.split(r"[\s,，、·]+", (query or "").strip()) if t]
+    words = _merge_words([t for t in re.split(r"[\s,，、·]+", (query or "").strip()) if t])
 
     preds, unknown = [], []
     for w in words:

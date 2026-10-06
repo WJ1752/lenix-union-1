@@ -3,6 +3,7 @@ import asyncio
 import json as _json
 import os
 import subprocess
+import sys
 import time
 
 from fastapi import FastAPI, Request
@@ -15,24 +16,24 @@ import bot_runtime
 import bot_log
 import napcat_runtime
 import bungie_auth
+import name_i18n
 import weapon_filter
 import weapon_usage
 
 app = FastAPI()
 
 
-# ---------- 顶部导航：玩家 / 武器 / Perk 同级切换 ----------
-# pywebview 原生窗口没有浏览器的后退键，进了 /catalog、/perks 就只能靠 history.back 回去。
-# 各页面统一挂同一排导航，任意页面都能一步直达其他页面。
-_NAV_ITEMS = (("/", "玩家查询"), ("/catalog", "武器图鉴"),
-              ("/perks", "Perk查询"), ("/eververse", "光尘商店"), ("/rotation", "本周轮换"),
-              ("/armorsets", "护甲套装"), ("/runtime", "运行状态"),
-              ("/panel", "Bot面板"))
+# ---------- 顶部导航：查询站 / 后端管理 两个栏目 ----------
+# 资料查询类功能（武器图鉴/Perk/光尘/轮换/护甲）并入「查询站」栏目，入口挂在查询站首页；
+# 运行状态并入「后端管理」（面板内的折叠卡片）。/runtime、各资料页路由保留，导航不再露出。
+_NAV_ITEMS = (("/", "查询站"), ("/panel", "后端管理"))
+_TOOL_PATHS = {"/catalog", "/perks", "/eververse", "/rotation", "/armorsets"}
 
 
 def navbar(active: str = "") -> str:
+    act = "/" if active in _TOOL_PATHS else active   # 资料页属于查询站栏目，点亮查询站
     links = "".join(
-        f"<a class='nv{' on' if href == active else ''}' href='{href}'>{txt}</a>"
+        f"<a class='nv{' on' if href == act else ''}' href='{href}'>{txt}</a>"
         for href, txt in _NAV_ITEMS)
     return (
         "<style>.d2nav{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:0 0 16px}"
@@ -66,40 +67,97 @@ async def no_cache(request, call_next):
 
 
 # ---------- QQ Bot 面板 ----------
-PANEL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Bot 面板</title>
+PANEL = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>Bot 后端管理</title>
 <style>
 body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;padding:22px}
-h1{font-size:20px;text-align:center;margin:0 0 16px}
-.wrap{display:flex;gap:18px;align-items:flex-start;justify-content:center;max-width:1180px;margin:0 auto}
-.col-main{flex:1 1 620px;max-width:680px;min-width:0}
-.col-side{flex:0 0 380px;position:sticky;top:22px}
-@media(max-width:1020px){.wrap{flex-direction:column}.col-side{position:static;flex:1 1 auto;width:100%}}
+h1{font-size:20px;text-align:center;margin:0 0 14px}
+.wrap{max-width:1180px;margin:0 auto}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-bottom:16px}
+.tabs .tb{color:#c5cacd;background:#16181b;border:1px solid #2a2e33;border-radius:8px;
+ padding:9px 16px;font-size:14px;cursor:pointer;user-select:none;white-space:nowrap}
+.tabs .tb:hover{border-color:#4b8fd4;color:#fff}
+.tabs .tb.on{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold}
+.tab{display:none}.tab.on{display:block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+.grid2>*{min-width:0}
+.grid4{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
 .card{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:14px 18px;
-      margin:0 0 14px;font-size:14px;line-height:1.8;box-sizing:border-box}
+ margin:0 0 14px;font-size:14px;line-height:1.8;box-sizing:border-box}
 .on{color:#35c66b}.off{color:#ff8d85}
 .grow{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;
-      border-radius:6px;margin:3px 0;background:#16181b}
+ border-radius:6px;margin:3px 0;background:#16181b}
 .grow:hover{background:#1b1e22}
 button{padding:6px 14px;border-radius:6px;border:1px solid #2a2e33;background:#35c66b;
-       color:#e8e6e3;cursor:pointer;font-weight:bold}
+ color:#e8e6e3;cursor:pointer;font-weight:bold}
 button.ghost{background:#2a2e33;font-weight:normal}
 button:disabled{opacity:.4;cursor:default}
 code{background:#1b1e22;border-radius:4px;padding:1px 6px;font-size:12px;color:#4b8fd4}
 .dim{color:#9aa0a6;font-size:12px}
+.tile{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:12px 16px;font-size:14px;line-height:1.7}
+.tile .k{font-size:12px;color:#9aa0a6;margin-bottom:4px}
+.tile .v{font-size:15px}
+.tile .go{margin-top:6px}
 .pbar{height:8px;background:#1b1e22;border-radius:4px;overflow:hidden;margin-top:6px}
 .pfill{height:100%;background:linear-gradient(90deg,#35c66b,#4b8fd4);transition:width .4s}
 .pfill.err{background:#b04a42}
+/* 真进度条：数据卡片里带百分比/剩余时间的粗条；准备阶段（起通道/等验证）走不定进度动画 */
+.pwrap{margin-top:8px}
+.pwrap .pbar{height:12px;margin-top:0}
+.plabel{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#9aa0a6;margin-top:5px}
+.plabel b{color:#e8e6e3;font-weight:600}
+.pfill.indet{width:35%!important;animation:pslide 1.15s linear infinite}
+@keyframes pslide{0%{margin-left:-35%}100%{margin-left:100%}}
 .jobhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-.jobbox{max-height:calc(100vh - 300px);min-height:120px;overflow:auto;padding-right:4px}
-.jobbox::-webkit-scrollbar{width:8px}
-.jobbox::-webkit-scrollbar-thumb{background:#2a2e33;border-radius:4px}
+.scroll{max-height:430px;overflow:auto;padding-right:4px}
+.scroll::-webkit-scrollbar{width:8px}
+.scroll::-webkit-scrollbar-thumb{background:#2a2e33;border-radius:4px}
 .pager{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:8px}
 .pager button{padding:4px 10px;font-size:12px}
+.sec{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:14px 16px;margin:0 0 14px}
+.sec h2{font-size:15px;margin:0 0 8px}
+.sec p{font-size:12px;color:#9aa0a6;line-height:1.7;margin:0 0 10px}
+select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3;
+ border:1px solid #2a2e33;border-radius:8px;padding:8px 12px}
+.rtiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:14px}
+.rtile{background:#16181b;border:1px solid #2a2e33;border-radius:10px;padding:12px 14px}
+.rtile .k{font-size:12px;color:#9aa0a6;margin-bottom:6px}
+.rtile .v{font-size:20px;font-weight:600;line-height:1.2}
+.rtile .s{font-size:12px;color:#9aa0a6;margin-top:4px}
+.rbar{height:5px;background:#24282d;border-radius:3px;margin-top:8px;overflow:hidden}
+.rbar i{display:block;height:100%;background:#35c66b;border-radius:3px;transition:width .4s}
+#msg,#capmsg{font-size:13px;color:#35c66b;margin-left:10px}
 </style></head><body>
-<h1>QQ Bot 面板</h1>
+<h1>Bot 后端管理</h1>
 <div class="wrap">
-<div class="col-main">
-  <div class="card" id="status">正在获取连接状态…</div>
+<div class="tabs" id="tabs">
+  <span class="tb on" data-t="overview">总览</span>
+  <span class="tb" data-t="login">登录与授权</span>
+  <span class="tb" data-t="jobs">任务与日志</span>
+  <span class="tb" data-t="groups">群与绑定</span>
+  <span class="tb" data-t="data">数据管理</span>
+  <span class="tb" data-t="settings">参数设置</span>
+</div>
+
+<!-- ============ 总览 ============ -->
+<div class="tab on" id="tab-overview">
+  <div class="grid4">
+    <div class="tile"><div class="k">QQ Bot 连接</div><div class="v" id="ovBot">…</div>
+      <div class="go"><button class="ghost" onclick="showTab('jobs')">看消息日志</button></div></div>
+    <div class="tile"><div class="k">QQ 登录（NapCat）</div><div class="v" id="ovNap">…</div>
+      <div class="go"><button class="ghost" onclick="showTab('login')">去登录管理</button></div></div>
+    <div class="tile"><div class="k">Bungie 授权</div><div class="v" id="ovBungie">…</div>
+      <div class="go"><button class="ghost" onclick="showTab('login')">去授权</button></div></div>
+    <div class="tile"><div class="k">数据概况</div><div class="v" id="ovData">…</div>
+      <div class="go"><button class="ghost" onclick="showTab('data')">数据管理</button>
+      <button class="ghost" onclick="showTab('settings')">参数设置</button></div></div>
+  </div>
+  <div style="height:14px"></div>
+  <div class="card dim">指令（<b>必须带 <code>/</code> 前缀</b>）：/绑定 玩家名#编号 ｜ /生涯 ｜ /玩家 ｜ /武器查询 武器名 ｜ /perk查询 perk名 ｜ /pvp生涯武器 ｜ /pve生涯武器（绑定账号后玩家类指令可省名字）。<b>群里直接 @机器人 接武器名 / perk名</b> 也会自动出对应卡片。</div>
+</div>
+
+<!-- ============ 登录与授权 ============ -->
+<div class="tab" id="tab-login">
   <div class="card">
     <b>QQ 登录（内置 NapCat）</b>
     <div id="napcat" style="margin-top:8px">正在检查 NapCat…</div>
@@ -107,111 +165,214 @@ code{background:#1b1e22;border-radius:4px;padding:1px 6px;font-size:12px;color:#
     <details class="dim" style="margin-top:6px"><summary>已有外部协议端？手动接入方式</summary>
       1. 启动 NapCat / LLOneBot 并登录 QQ；<br>
       2. 添加<b>反向 WebSocket</b>：<code>ws://127.0.0.1:8901/onebot/v11/ws</code><br>
-      3. 连接成功后，上方自动出现 QQ 账号，下方出现群列表。
+      3. 连接成功后，总览页出现 QQ 账号，群与绑定页出现群列表。
     </details>
   </div>
   <div class="card">
     <b>Bungie 账号授权</b> <span class="dim">（读光尘商店等需要登录的接口）</span>
     <div id="bungie" style="margin-top:8px">正在检查…</div>
   </div>
-  <div class="card">
-    <b>消息日志</b> <span class="dim">（群里的指令与私聊消息 + 机器人回复，最新在前，最多 500 条）</span>
-    <div style="margin:8px 0;display:flex;gap:8px;align-items:center">
-      <select id="logGroup" onchange="refreshLogs()" style="padding:5px 8px;border-radius:6px;
-        border:1px solid #2a2e33;background:#1b1e22;color:#e8e6e3"></select>
-      <button class="ghost" onclick="clearLogs()">清空日志</button>
-      <span class="dim" id="logCount"></span>
+</div>
+
+<!-- ============ 任务与日志 ============ -->
+<div class="tab" id="tab-jobs">
+  <div class="grid2">
+    <div class="card">
+      <div class="jobhead"><b>后台任务</b><span class="dim" id="jobCount"></span></div>
+      <div class="dim" style="margin-bottom:8px">生涯武器 / 热力图 / light.gg 刷新：谁发起的、跑到第几</div>
+      <div id="jobs" class="scroll">暂无后台任务</div>
+      <div class="pager">
+        <button class="ghost" id="jobPrev" onclick="jobGo(-1)">上一页</button>
+        <span class="dim" id="jobPageInfo"></span>
+        <button class="ghost" id="jobNext" onclick="jobGo(1)">下一页</button>
+      </div>
     </div>
-    <div id="logs" style="max-height:360px;overflow:auto">正在加载…</div>
+    <div class="card">
+      <b>消息日志</b> <span class="dim">（群里的指令与机器人回复，最新在前）</span>
+      <div style="margin:8px 0;display:flex;gap:8px;align-items:center">
+        <select id="logGroup" onchange="refreshLogs()" style="padding:5px 8px;font-size:12px;max-width:220px"></select>
+        <button class="ghost" onclick="clearLogs()">清空日志</button>
+        <span class="dim" id="logCount"></span>
+      </div>
+      <div id="logs" class="scroll" style="max-height:480px">正在加载…</div>
+    </div>
   </div>
-  <div class="card">
-    <b>生效群聊</b> <span class="dim">（不勾选任何群 = 所有群都响应）</span>
-    <div id="groups" style="margin-top:8px">等待 bot 连接…</div>
-    <div style="margin-top:8px;text-align:right"><button onclick="save()">保存群开关</button></div>
+</div>
+
+<!-- ============ 群与绑定 ============ -->
+<div class="tab" id="tab-groups">
+  <div class="grid2">
+    <div class="card">
+      <b>生效群聊</b> <span class="dim">（不勾选任何群 = 所有群都响应）</span>
+      <div id="groups" style="margin-top:8px">等待 bot 连接…</div>
+      <div style="margin-top:8px;text-align:right"><button onclick="save()">保存群开关</button></div>
+    </div>
+    <div class="card">
+      <div class="jobhead"><b>账号绑定</b><span class="dim" id="bindCount"></span></div>
+      <div class="dim" style="margin-bottom:8px">QQ → 已绑定的命运2账号（编号统一补零到 4 位）</div>
+      <div id="binds" class="scroll">加载中…</div>
+    </div>
   </div>
+</div>
+
+<!-- ============ 数据管理 ============ -->
+<div class="tab" id="tab-data">
   <div class="card">
     <b>武器使用率数据（light.gg）</b> <span class="dim">（武器卡片上的选取率 / 热门组合）</span>
     <div id="usage" style="margin-top:8px">正在加载…</div>
-    <div id="usageBar" class="pbar" style="display:none"><div class="pfill" style="width:0%"></div></div>
+    <div id="usageBar" class="pwrap" style="display:none">
+      <div class="pbar"><div class="pfill" style="width:0%"></div></div>
+      <div class="plabel"><span id="usagePct"></span><span id="usageEta"></span></div>
+    </div>
     <div class="dim" id="usageMsg" style="margin-top:6px;white-space:pre-wrap"></div>
     <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
       <button onclick="usageRefresh('all')">全库刷新（最新数据）</button>
       <button class="ghost" onclick="usageRefresh('missing')">只补缺失</button>
       <button class="ghost" onclick="usageStop()">停止</button>
+      <button class="ghost" onclick="usageChannel()">启动通道</button>
     </div>
     <div style="margin-top:8px;display:flex;gap:6px">
       <input id="usageName" placeholder="单武器校准：输入武器名（支持模糊）或 hash"
-        style="flex:1;padding:6px 8px;border-radius:6px;border:1px solid #2a2e33;
-               background:#1b1e22;color:#e8e6e3;font-size:12px">
+        style="flex:1;padding:6px 8px;font-size:12px">
       <button class="ghost" onclick="usageCalibrate()">校准该武器</button>
     </div>
-    <div class="dim" style="margin-top:4px">刷新借调试 Edge（<code>start_edge_debug.bat</code>，需过一次人机验证）
-      逐页重抓 light.gg；全库约十几到几十分钟，可随时停止，每 25 条落盘一次。</div>
+    <div class="dim" style="margin-top:4px">刷新会自动借调试 Edge 抓 light.gg：通道没开就自己用独立调试
+      profile 拉一个（不关你正在用的 Edge），首次可能要过一次人机验证；逐页重抓，
+      全库约十几到几十分钟，可随时停止，每 25 条落盘一次。「启动通道」可单独把通道拉起来。</div>
   </div>
-  <div class="card dim">指令（<b>必须带 <code>/</code> 前缀</b>）：/绑定 玩家名#编号 ｜ /生涯 ｜ /玩家 ｜ /武器查询 武器名 ｜ /perk查询 perk名 ｜ /pvp生涯武器 ｜ /pve生涯武器（绑定账号后玩家类指令可省名字）。<b>群里直接 @机器人 接武器名 / perk名</b> 也会自动出对应卡片。</div>
+  <div class="card">
+    <b>数据与缓存</b> <span class="dim">（各管线的本地缓存，删除后按需自动重建；标注了重建代价）</span>
+    <div id="caches" style="margin-top:8px">正在加载…</div>
+  </div>
 </div>
-<div class="col-side">
-  <div class="card">
-    <div class="jobhead">
-      <b>后台任务日志</b>
-      <span class="dim" id="jobCount"></span>
-    </div>
-    <div class="dim" style="margin-bottom:8px">生涯武器 / 热力图：谁发起的、查的谁、跑到第几场（按发起时间，最新在前）</div>
-    <div id="jobs" class="jobbox">暂无后台任务</div>
-    <div class="pager">
-      <button class="ghost" id="jobPrev" onclick="jobGo(-1)">上一页</button>
-      <span class="dim" id="jobPageInfo"></span>
-      <button class="ghost" id="jobNext" onclick="jobGo(1)">下一页</button>
-    </div>
+
+<!-- ============ 参数设置 ============ -->
+<div class="tab" id="tab-settings">
+  <div class="rtiles">
+   <div class="rtile"><div class="k">进程 CPU</div><div class="v" id="pcpu">–</div>
+    <div class="rbar"><i id="pcpu_b"></i></div></div>
+   <div class="rtile"><div class="k">进程内存</div><div class="v" id="pmem">–</div><div class="s" id="pmem_s"></div>
+    <div class="rbar"><i id="pmem_b"></i></div></div>
+   <div class="rtile"><div class="k">进程线程数</div><div class="v" id="pth">–</div><div class="s" id="puptime"></div></div>
+   <div class="rtile"><div class="k">系统 CPU</div><div class="v" id="scpu">–</div>
+    <div class="rbar"><i id="scpu_b"></i></div></div>
+   <div class="rtile"><div class="k">系统内存</div><div class="v" id="smem">–</div><div class="s" id="smem_s"></div></div>
+   <div class="rtile"><div class="k">网络 ↑ 发送</div><div class="v" id="nup">–</div><div class="s" id="nup_s"></div></div>
+   <div class="rtile"><div class="k">网络 ↓ 接收</div><div class="v" id="ndown">–</div><div class="s" id="ndown_s"></div></div>
   </div>
-  <div class="card">
-    <div class="jobhead">
-      <b>账号绑定</b>
-      <span class="dim" id="bindCount"></span>
-    </div>
-    <div class="dim" style="margin-bottom:8px">QQ → 已绑定的命运2账号（编号统一补零到 4 位）</div>
-    <div id="binds" style="max-height:280px;overflow:auto">加载中…</div>
+  <div class="sec">
+   <h2>并发上限</h2>
+   <p>限定查询任务同时发起的请求数（PvP/PvE 逐场对局拉取、卡片图标下载共用）。
+    调小可降低对电脑 CPU/带宽的占用，代价是大数据量统计耗时变长；保存即生效，无需重启。
+    「默认」= 程序内置值（对局 16 路 / 图标 8 路）。</p>
+   <select id="conc">
+    <option value="0">默认（对局 16 / 图标 8）</option>
+    <option value="2">2（最省资源）</option><option value="4">4</option><option value="6">6</option>
+    <option value="8">8</option><option value="12">12</option><option value="16">16</option>
+    <option value="24">24</option><option value="32">32</option>
+   </select>
+   <button onclick="saveConc()">保存</button><span id="msg"></span>
+  </div>
+  <div class="sec">
+   <h2>生涯统计场次上限</h2>
+   <p>/pvp生涯武器 逐场统计默认最多 2000 场、/pve生涯武器 默认 3000 场（防止十年老号
+    跑几十分钟）。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能要跑
+    很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
+   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label>PvP　<select id="capPvp">
+     <option value="default">默认 2000</option>
+     <option value="5000">5000</option><option value="10000">10000</option>
+     <option value="20000">20000</option><option value="0">无限制（全生涯）</option>
+    </select></label>
+    <label>PvE　<select id="capPve">
+     <option value="default">默认 3000</option>
+     <option value="5000">5000</option><option value="10000">10000</option>
+     <option value="20000">20000</option><option value="0">无限制（全生涯）</option>
+    </select></label>
+    <button onclick="saveCaps()">保存</button><span id="capmsg"></span>
+   </div>
   </div>
 </div>
 </div>
 <script>
-let groupNames = {};
-let jobPage = 0;
-const JOB_PAGE = 6;
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function fmtElapsed(sec){
   if(!sec && sec !== 0) return '';
   const m = Math.floor(sec/60), s = sec%60;
   return m ? `${m}分${s}秒` : `${s}秒`;
 }
-async function refreshLogs(){
-  const sel = document.getElementById('logGroup');
-  const cur = sel.value;
-  const r = await (await fetch('/api/bot/logs?limit=200&group_id=' + encodeURIComponent(cur))).json();
-  const opts = r.groups.map(g =>
-    `<option value="${g}" ${g===cur?'selected':''}>${esc(groupNames[g]||('群 '+g))}</option>`).join('');
-  sel.innerHTML = `<option value="" ${cur===''?'selected':''}>全部</option>${opts}` +
-    (r.has_private ? `<option value="private" ${cur==='private'?'selected':''}>私聊</option>` : '');
-  const box = document.getElementById('logs');
-  document.getElementById('logCount').textContent = `共 ${r.items.length} 条`;
-  if(!r.items.length){ box.innerHTML = '<span class="dim">暂无记录</span>'; return; }
-  box.innerHTML = r.items.map(e=>{
-    const gname = e.group_id ? (groupNames[e.group_id] || ('群 ' + e.group_id)) : '私聊';
-    const tag = e.dir === 'out'
-      ? '<span class="on">回</span>'
-      : (e.enabled === false ? '<span class="off">未启用群</span>'
-         : (e.skip ? `<span class="off">${esc(e.skip)}</span>` : '<span class="dim">收</span>'));
-    return `<div style="padding:6px 10px;border-radius:6px;margin:3px 0;background:#16181b">
-      <div class="dim">${e.time} · ${esc(gname)} · ${esc(e.dir==='out'?'机器人':(e.nickname||e.user_id))} ${tag}</div>
-      <div style="white-space:pre-wrap;word-break:break-all;margin-top:2px">${esc(e.text)}</div></div>`;
-  }).join('');
+function fmtB(n){if(!isFinite(n))return'–';if(n<1024)return n.toFixed(0)+' B';
+ const u=['KB','MB','GB','TB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<3);return n.toFixed(1)+' '+u[i]}
+function pct(a,b){return b>0?Math.min(100,a/b*100):0}
+function bar(id,p){const e=document.getElementById(id);if(!e)return;e.style.width=p+'%';
+ e.style.background=p>80?'#e05252':p>50?'#e0b452':'#35c66b'}
+function fmtSize(n){
+  if(!n) return '–';
+  const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++}
+  return n.toFixed(n>=100||i===0?0:1)+' '+u[i];
 }
-async function clearLogs(){
-  if(!confirm('清空当前日志？')) return;
-  await fetch('/api/bot/logs/clear', {method:'POST'});
-  refreshLogs();
+
+/* ---------- 标签页 ---------- */
+const TAB_REFRESH = {
+  login:   ()=>{ refreshNap(); refreshBungie(); },
+  jobs:    ()=>{ refreshJobs(); refreshLogs(); },
+  groups:  ()=>{ refreshGroups(); refreshBindings(); },
+  data:    ()=>{ refreshUsage(); refreshCaches(true); },
+  settings:()=>{ refreshStats(); loadCaps(); loadConc(); },
+};
+function showTab(id){
+  document.querySelectorAll('.tab').forEach(s=>s.classList.remove('on'));
+  document.querySelectorAll('#tabs .tb').forEach(b=>b.classList.toggle('on', b.dataset.t===id));
+  const sec = document.getElementById('tab-'+id);
+  if(sec) sec.classList.add('on');
+  try{ localStorage.setItem('panelTab', id); }catch(e){}
+  (TAB_REFRESH[id]||(()=>{}))();
 }
-let qrBusy = false;  // 刷新二维码期间暂停 5 秒轮询覆盖，避免"正在获取"被冲掉
+document.querySelectorAll('#tabs .tb').forEach(b=>b.onclick=()=>showTab(b.dataset.t));
+
+/* ---------- 总览（各处轮询顺带更新瓷砖） ---------- */
+let _ovData = {snap:null, cache:null, binds:null, jobs:0};
+function ovDataRender(){
+  const p = [];
+  if(_ovData.snap !== null) p.push(`快照 <b>${_ovData.snap}</b> 条`);
+  if(_ovData.cache !== null) p.push(`缓存 <b>${_ovData.cache}</b> 项`);
+  if(_ovData.binds !== null) p.push(`绑定 <b>${_ovData.binds}</b> 人`);
+  p.push(`后台任务 <b>${_ovData.jobs}</b> 条`);
+  document.getElementById('ovData').innerHTML = p.join(' · ');
+}
+
+/* ---------- QQ 连接 / 群 ---------- */
+let groupNames = {};
+async function refreshStatus(){
+  try{
+    const s = await (await fetch('/api/bot/status')).json();
+    document.getElementById('ovBot').innerHTML = s.connected
+      ? `<span class="on">● 已连接</span><br>${esc(s.nickname)}（${s.uin}）`
+      : '<span class="off">● 未连接</span><br><span class="dim">等待协议端接入</span>';
+  }catch(e){}
+  try{
+    const g = await (await fetch('/api/bot/groups')).json();
+    groupNames = Object.fromEntries((g.groups||[]).map(x=>[String(x.group_id), x.group_name]));
+    if(document.getElementById('tab-groups').classList.contains('on')){
+      const box = document.getElementById('groups');
+      if(!g.connected){ box.textContent = '未连接协议端，无法获取群列表'; }
+      else if(!g.groups.length){ box.textContent = '该 QQ 号还没加入任何群'; }
+      else box.innerHTML = g.groups.map(x =>
+        `<div class="grow"><label><input type="checkbox" value="${x.group_id}"
+          ${g.enabled.includes(String(x.group_id))?'checked':''}> ${x.group_name}（${x.group_id}）</label></div>`).join('');
+    }
+  }catch(e){}
+}
+async function refreshGroups(){ if(document.getElementById('tab-groups').classList.contains('on')) await refreshStatus(); }
+async function save(){
+  const en = [...document.querySelectorAll('#groups input:checked')].map(i=>i.value);
+  const r = await fetch('/api/bot/groups', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: en})});
+  alert(r.ok ? '已保存' : '保存失败');
+}
+
+/* ---------- NapCat 登录 ---------- */
+let qrBusy = false;
 function qrHtml(q){
   return q
     ? `<img src="${q}" width="200" style="border-radius:8px"><div class="dim">用手机 QQ 扫这个码登录（提示过期就点刷新）</div><button onclick="refreshQR()">刷新二维码</button>`
@@ -219,6 +380,11 @@ function qrHtml(q){
 }
 async function refreshNap(){
   const s = await (await fetch('/api/napcat/status')).json();
+  const ov = document.getElementById('ovNap');
+  ov.innerHTML = !s.running ? '<span class="off">● 未启动</span>'
+    : (s.isLogin || s.uin || s.qq) ? `<span class="on">● 已登录</span>　${s.uin || s.qq}`
+    : '<span class="off">● 运行中</span>　等待扫码';
+  if(!document.getElementById('tab-login').classList.contains('on')) return;  // 不在登录页就不刷二维码区
   const box = document.getElementById('napcat');
   const qr = document.getElementById('qr');
   if(!s.running){
@@ -258,88 +424,15 @@ async function resetNap(){
   await fetch('/api/napcat/reset', {method:'POST'});
   refreshNap();
 }
-async function refresh(){
-  refreshNap();
-  refreshLogs();
-  const s = await (await fetch('/api/bot/status')).json();
-  document.getElementById('status').innerHTML = s.connected
-    ? `<span class="on">● 已连接</span>　QQ：${s.nickname}（${s.uin}）`
-    : `<span class="off">● 未连接</span>　等待协议端接入（按上方步骤配置 NapCat）`;
-  const g = await (await fetch('/api/bot/groups')).json();
-  groupNames = Object.fromEntries((g.groups||[]).map(x=>[String(x.group_id), x.group_name]));
-  const box = document.getElementById('groups');
-  if(!g.connected){ box.textContent = '未连接协议端，无法获取群列表'; return; }
-  if(!g.groups.length){ box.textContent = '该 QQ 号还没加入任何群'; return; }
-  box.innerHTML = g.groups.map(x =>
-    `<div class="grow"><label><input type="checkbox" value="${x.group_id}"
-      ${g.enabled.includes(String(x.group_id))?'checked':''}> ${x.group_name}（${x.group_id}）</label></div>`).join('');
-}
-async function save(){
-  const en = [...document.querySelectorAll('#groups input:checked')].map(i=>i.value);
-  const r = await fetch('/api/bot/groups', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify({enabled: en})});
-  alert(r.ok ? '已保存' : '保存失败');
-}
-function jobGo(d){ jobPage += d; refreshJobs(); }
-async function refreshJobs(){
-  const box = document.getElementById('jobs');
-  let all = [];
-  try{ all = (await (await fetch('/api/bot/jobs')).json()).jobs || []; }catch(e){ return; }
-  document.getElementById('jobCount').textContent = all.length ? `共 ${all.length} 条` : '';
-  if(!all.length){
-    box.innerHTML = '<span class="dim">暂无后台任务</span>';
-    document.getElementById('jobPageInfo').textContent = '';
-    document.getElementById('jobPrev').disabled = true;
-    document.getElementById('jobNext').disabled = true;
-    return;
-  }
-  const pages = Math.max(1, Math.ceil(all.length / JOB_PAGE));
-  if(jobPage >= pages) jobPage = pages - 1;
-  if(jobPage < 0) jobPage = 0;
-  const slice = all.slice(jobPage * JOB_PAGE, jobPage * JOB_PAGE + JOB_PAGE);
-  box.innerHTML = slice.map(j=>{
-    const running = j.status === 'running';
-    const queued = j.status === 'queued';
-    const pct = running && !j.total ? 0 : j.pct;
-    const tail = running
-      ? (j.total ? `${j.done} / ${j.total} 场（${j.pct}%）` : '准备中…')
-      : queued ? `排队中 · 第 ${j.queue_pos || 1} 位`
-      : (j.status === 'done' ? '已完成' : j.status === 'error' ? '失败' : j.status);
-    const width = running ? (pct || 3) : queued ? 3 : 100;
-    const when = (j.date ? j.date + ' ' : '') + (j.time || '');
-    const el = (running || queued) && j.elapsed ? ` · 已跑 ${fmtElapsed(j.elapsed)}` : '';
-    // 复用的任务不会多出一条记录，这里标一下，免得看着像「指令没反应」
-    const reuse = j.reused
-      ? `<span class="dim"> · 已复用于 ${esc((j.reused_by || []).join('、') || '同一查询')}</span>` : '';
-    return `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:#16181b">
-      <div style="display:flex;justify-content:space-between;gap:10px">
-        <span><b>${esc(j.label)}</b> <span class="dim">${esc(j.name)}</span></span>
-        <span class="dim" style="white-space:nowrap">${esc(j.who)}${reuse}</span>
-      </div>
-      <div class="pbar"><div class="pfill ${j.status==='error'?'err':''}" style="width:${width}%"></div></div>
-      <div class="dim" style="margin-top:3px;display:flex;justify-content:space-between;gap:8px">
-        <span>${esc(tail)}</span>
-        <span style="white-space:nowrap">🕒 ${esc(when)}${esc(el)}</span>
-      </div></div>`;
-  }).join('');
-  document.getElementById('jobPageInfo').textContent = `第 ${jobPage + 1} / ${pages} 页`;
-  document.getElementById('jobPrev').disabled = jobPage <= 0;
-  document.getElementById('jobNext').disabled = jobPage >= pages - 1;
-}
-async function refreshBindings(){
-  const box = document.getElementById('binds');
-  let items = [];
-  try{ items = (await (await fetch('/api/bot/bindings')).json()).items || []; }catch(e){ return; }
-  document.getElementById('bindCount').textContent = items.length ? `${items.length} 个` : '';
-  if(!items.length){ box.innerHTML = '<span class="dim">还没有人绑定账号</span>'; return; }
-  box.innerHTML = items.map(b =>
-    `<div class="grow"><span class="dim">QQ ${esc(b.qq)}</span><b>${esc(b.name)}</b></div>`).join('');
-}
+
+/* ---------- Bungie 授权 ---------- */
 async function refreshBungie(){
   const box = document.getElementById('bungie');
+  const ov = document.getElementById('ovBungie');
   let s = {};
   try{ s = await (await fetch('/api/bungie/status')).json(); }catch(e){ return; }
   if(!s.configured){
+    ov.innerHTML = '<span class="off">● 未配置</span>';
     box.innerHTML = '<span class="off">● 未配置 Bungie 应用</span>'
       + '<div class="dim" style="margin-top:6px">在 .env 里补 <code>BUNGIE_CLIENT_ID</code> / '
       + '<code>BUNGIE_CLIENT_SECRET</code>（Bungie 应用里「开放授权客户端类型」要选<b>机密</b>），'
@@ -347,6 +440,7 @@ async function refreshBungie(){
     return;
   }
   if(s.authorized){
+    ov.innerHTML = `<span class="on">● 已授权</span><br>${esc(s.display_name||s.membership_id||'')}`;
     const exp = s.expires_at ? new Date(s.expires_at*1000).toLocaleString() : '';
     const expired = s.expires_at && (s.expires_at*1000 < Date.now());
     box.innerHTML = `<span class="on">● 已授权</span>　<b>${esc(s.display_name||s.membership_id||'')}</b>`
@@ -359,6 +453,7 @@ async function refreshBungie(){
       + '<div class="dim" id="bmsg2" style="margin-top:6px"></div>';
     return;
   }
+  ov.innerHTML = '<span class="off">● 未授权</span>';
   box.innerHTML = '<span class="off">● 未授权</span>'
     + '<div class="dim" style="margin-top:6px">① 点下面按钮去 Bungie 登录并同意；'
     + '② 跳回来若提示「不安全」，点「信任本机证书」装一次证书（弹窗点「是」）后重试，'
@@ -367,8 +462,7 @@ async function refreshBungie(){
     + '<div style="margin-top:8px"><a href="/bungie/authorize" target="_blank">'
     + '<button>打开 Bungie 授权页</button></a></div>'
     + '<div style="margin-top:8px;display:flex;gap:6px">'
-    + '<input id="bcode" placeholder="粘贴回调地址或 code" style="flex:1;padding:6px 8px;border-radius:6px;'
-    + 'border:1px solid #2a2e33;background:#1b1e22;color:#e8e6e3;font-size:12px">'
+    + '<input id="bcode" placeholder="粘贴回调地址或 code" style="flex:1;padding:6px 8px;font-size:12px">'
     + '<button onclick="bungieManual()">完成授权</button></div>'
     + '<div class="dim" id="bmsg" style="margin-top:6px"></div>'
     + '<div style="margin-top:8px"><button class="ghost" onclick="trustCert()">信任本机证书'
@@ -416,41 +510,161 @@ async function bungieLogout(){
   await fetch('/api/bungie/logout', {method:'POST'});
   refreshBungie();
 }
+
+/* ---------- 消息日志 ---------- */
+async function refreshLogs(){
+  const sel = document.getElementById('logGroup');
+  const cur = sel.value;
+  const r = await (await fetch('/api/bot/logs?limit=200&group_id=' + encodeURIComponent(cur))).json();
+  const opts = r.groups.map(g =>
+    `<option value="${g}" ${g===cur?'selected':''}>${esc(groupNames[g]||('群 '+g))}</option>`).join('');
+  sel.innerHTML = `<option value="" ${cur===''?'selected':''}>全部</option>${opts}` +
+    (r.has_private ? `<option value="private" ${cur==='private'?'selected':''}>私聊</option>` : '');
+  const box = document.getElementById('logs');
+  document.getElementById('logCount').textContent = `共 ${r.items.length} 条`;
+  if(!r.items.length){ box.innerHTML = '<span class="dim">暂无记录</span>'; return; }
+  box.innerHTML = r.items.map(e=>{
+    const gname = e.group_id ? (groupNames[e.group_id] || ('群 ' + e.group_id)) : '私聊';
+    const tag = e.dir === 'out'
+      ? '<span class="on">回</span>'
+      : (e.enabled === false ? '<span class="off">未启用群</span>'
+         : (e.skip ? `<span class="off">${esc(e.skip)}</span>` : '<span class="dim">收</span>'));
+    return `<div style="padding:6px 10px;border-radius:6px;margin:3px 0;background:#16181b">
+      <div class="dim">${e.time} · ${esc(gname)} · ${esc(e.dir==='out'?'机器人':(e.nickname||e.user_id))} ${tag}</div>
+      <div style="white-space:pre-wrap;word-break:break-all;margin-top:2px">${esc(e.text)}</div></div>`;
+  }).join('');
+}
+async function clearLogs(){
+  if(!confirm('清空当前日志？')) return;
+  await fetch('/api/bot/logs/clear', {method:'POST'});
+  refreshLogs();
+}
+
+/* ---------- 后台任务 ---------- */
+let jobPage = 0;
+const JOB_PAGE = 6;
+function jobGo(d){ jobPage += d; refreshJobs(); }
+async function refreshJobs(){
+  const box = document.getElementById('jobs');
+  let all = [];
+  try{ all = (await (await fetch('/api/bot/jobs')).json()).jobs || []; }catch(e){ return; }
+  _ovData.jobs = all.filter(j=>j.status==='running').length;
+  document.getElementById('jobCount').textContent = all.length ? `共 ${all.length} 条` : '';
+  ovDataRender();
+  if(!all.length){
+    box.innerHTML = '<span class="dim">暂无后台任务</span>';
+    document.getElementById('jobPageInfo').textContent = '';
+    document.getElementById('jobPrev').disabled = true;
+    document.getElementById('jobNext').disabled = true;
+    return;
+  }
+  const pages = Math.max(1, Math.ceil(all.length / JOB_PAGE));
+  if(jobPage >= pages) jobPage = pages - 1;
+  if(jobPage < 0) jobPage = 0;
+  const slice = all.slice(jobPage * JOB_PAGE, jobPage * JOB_PAGE + JOB_PAGE);
+  box.innerHTML = slice.map(j=>{
+    const running = j.status === 'running';
+    const queued = j.status === 'queued';
+    const pctv = running && !j.total ? 0 : j.pct;
+    const tail = running
+      ? (j.total ? `${j.done} / ${j.total} 场（${j.pct}%）` : '准备中…')
+      : queued ? `排队中 · 第 ${j.queue_pos || 1} 位`
+      : (j.status === 'done' ? '已完成' : j.status === 'error' ? '失败' : j.status);
+    const width = running ? (pctv || 3) : queued ? 3 : 100;
+    const when = (j.date ? j.date + ' ' : '') + (j.time || '');
+    const el = (running || queued) && j.elapsed ? ` · 已跑 ${fmtElapsed(j.elapsed)}` : '';
+    const reuse = j.reused
+      ? `<span class="dim"> · 已复用于 ${esc((j.reused_by || []).join('、') || '同一查询')}</span>` : '';
+    return `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:#1b1e22">
+      <div style="display:flex;justify-content:space-between;gap:10px">
+        <span><b>${esc(j.label)}</b> <span class="dim">${esc(j.name)}</span></span>
+        <span class="dim" style="white-space:nowrap">${esc(j.who)}${reuse}</span>
+      </div>
+      <div class="pbar"><div class="pfill ${j.status==='error'?'err':''}" style="width:${width}%"></div></div>
+      <div class="dim" style="margin-top:3px;display:flex;justify-content:space-between;gap:8px">
+        <span>${esc(tail)}</span>
+        <span style="white-space:nowrap">🕒 ${esc(when)}${esc(el)}</span>
+      </div></div>`;
+  }).join('');
+  document.getElementById('jobPageInfo').textContent = `第 ${jobPage + 1} / ${pages} 页`;
+  document.getElementById('jobPrev').disabled = jobPage <= 0;
+  document.getElementById('jobNext').disabled = jobPage >= pages - 1;
+}
+
+/* ---------- 账号绑定 ---------- */
+async function refreshBindings(){
+  const box = document.getElementById('binds');
+  let items = [];
+  try{ items = (await (await fetch('/api/bot/bindings')).json()).items || []; }catch(e){ return; }
+  _ovData.binds = items.length;
+  document.getElementById('bindCount').textContent = items.length ? `${items.length} 个` : '';
+  ovDataRender();
+  if(!items.length){ box.innerHTML = '<span class="dim">还没有人绑定账号</span>'; return; }
+  box.innerHTML = items.map(b =>
+    `<div class="grow"><span class="dim">QQ ${esc(b.qq)}</span><b>${esc(b.name)}</b></div>`).join('');
+}
+
+/* ---------- 武器使用率数据 ---------- */
 let usageRunning = false;
+let usageBooting = false;      // 「启动通道」等 Edge 起来那几秒：别让 3s 轮询把提示擦掉
 async function refreshUsage(){
   const box = document.getElementById('usage');
   let s = {};
   try{ s = await (await fetch('/api/usage/status')).json(); }catch(e){ return; }
+  _ovData.snap = s.snapshot; _ovData.cache = s.cache; _ovData.missing = s.missing;
+  ovDataRender();
   const cdp = s.cdp
     ? '<span class="on">● light.gg 通道在线</span>'
-    : '<span class="off">● light.gg 通道离线</span>　<span class="dim">双击 start_edge_debug.bat 并过一次验证后可刷新</span>';
+    : '<span class="off">● light.gg 通道离线</span>　<span class="dim">点「全库刷新」会自动拉起调试 Edge（独立窗口，不关你正在用的 Edge）</span>';
   box.innerHTML = cdp + '<span class="dim"> · </span>快照 <b>' + s.snapshot + '</b> / 目标 <b>' + s.targets
     + '</b> <span class="dim">（缺 ' + s.missing + '）</span> <span class="dim">·</span> 缓存 <b>' + s.cache + '</b>'
     + (s.newest ? ' <span class="dim">· 最新数据 ' + esc(s.newest) + '</span>' : '');
   const r = s.refresh || {};
-  const bar = document.getElementById('usageBar');
-  const fill = bar.querySelector('.pfill');
+  const barEl = document.getElementById('usageBar');
+  const fill = barEl.querySelector('.pfill');
+  const pctEl = document.getElementById('usagePct');
+  const etaEl = document.getElementById('usageEta');
   const msg = document.getElementById('usageMsg');
   if(r.running){
     usageRunning = true;
-    bar.style.display = 'block';
-    fill.className = 'pfill';
-    fill.style.width = (r.pct || 3) + '%';
+    barEl.style.display = 'block';
+    if(r.done){          // 真进度：抓取阶段按 done/total 走，条上给百分比/成功失败/剩余时间
+      fill.className = 'pfill';
+      fill.style.width = Math.max(0.5, r.pct || 0) + '%';
+      pctEl.innerHTML = '<b>' + (r.pct || 0).toFixed(1) + '%</b> · ' + r.done + '/' + r.total
+        + ' <span class="dim">（成功 ' + r.ok + ' · 失败 ' + r.fail + '）</span>';
+      etaEl.textContent = r.eta_s ? '剩余约 ' + fmtDur(r.eta_s) : '';
+    }else{               // 起通道 / 连浏览器 / 等人机验证：不定进度滚动条（还没总数可算）
+      fill.className = 'pfill indet';
+      fill.style.width = '';
+      pctEl.textContent = '准备中…';
+      etaEl.textContent = '';
+    }
     msg.innerHTML = '<span class="on">' + esc(r.message || '运行中') + '</span>';
   }else{
-    if(usageRunning) refreshUsage();   // 刚结束：立即再拉一次拿最终 message（含结果统计）
+    if(usageRunning) refreshUsage();
     usageRunning = false;
     if(r.done){
-      bar.style.display = 'block';
+      barEl.style.display = 'block';
       fill.className = r.error ? 'pfill err' : 'pfill';
-      fill.style.width = '100%';
+      fill.style.width = (r.error ? Math.max(0.5, r.pct || 0) : 100) + '%';
+      pctEl.innerHTML = '<b>' + (r.pct || 0).toFixed(1) + '%</b> · ' + r.done + '/' + r.total
+        + ' <span class="dim">（成功 ' + r.ok + ' · 失败 ' + r.fail + '）</span>';
+      etaEl.textContent = r.error ? '已中止' : (/^已停止/.test(r.message || '') ? '已停止' : '已完成');
     }else{
-      bar.style.display = 'none';
+      barEl.style.display = 'none';
     }
+    if(usageBooting) return;
     msg.innerHTML = (r.message && r.message !== '待机')
       ? esc(r.message) + (r.error ? '　<span class="off">' + esc(r.error) + '</span>' : '')
       : '';
   }
+}
+function fmtDur(sec){
+  sec = Math.max(0, Math.round(sec || 0));
+  if(sec < 90) return sec + ' 秒';
+  if(sec < 5400) return Math.round(sec / 60) + ' 分钟';
+  return (sec / 3600).toFixed(1) + ' 小时';
 }
 async function usageStart(payload, confirmText){
   if(!confirm(confirmText)) return;
@@ -464,26 +678,132 @@ async function usageStart(payload, confirmText){
 function usageRefresh(scope){
   usageStart({scope}, scope === 'all'
     ? '全库重抓 light.gg 最新数据？可能需要十几到几十分钟，期间可随时停止。'
-    : '补齐快照里缺失的武器？');
+    : '补齐快照里缺失的 ' + (_ovData.missing || '') + ' 把武器？\\n'
+      + '（缺的这批里大多是 light.gg 本来就没有统计的武器——异域/固定词条/老随机掉落，'
+      + '补完多半仍是「失败」，属正常。）');
 }
 function usageStop(){ fetch('/api/usage/stop',{method:'POST'}).then(refreshUsage); }
+async function usageChannel(){
+  const el = document.getElementById('usageMsg');
+  if(el) el.innerHTML = '正在拉起调试 Edge…（首次可能要几秒）';
+  usageBooting = true;
+  let r = {};
+  try{ r = await (await fetch('/api/usage/channel/start',{method:'POST'})).json(); }
+  catch(e){ r = {ok:false, detail:'请求失败：' + e}; }
+  usageBooting = false;
+  if(!r.ok) alert(r.detail || '启动通道失败');
+  refreshUsage();
+}
 function usageCalibrate(){
   const name = (document.getElementById('usageName').value || '').trim();
   if(!name){ alert('先输入武器名或 hash'); return; }
   usageStart({name}, '重新抓取「' + name + '」的 light.gg 数据？');
 }
-refresh(); setInterval(refresh, 5000); setInterval(refreshJobs, 2000); refreshJobs();
-refreshBindings(); setInterval(refreshBindings, 10000);
+
+/* ---------- 数据与缓存 ---------- */
+let _cachesLoaded = false;
+async function refreshCaches(force){
+  if(_cachesLoaded && !force) return;
+  const box = document.getElementById('caches');
+  let items = [];
+  try{ items = (await (await fetch('/api/backend/caches')).json()).items || []; }catch(e){ return; }
+  _cachesLoaded = true;
+  box.innerHTML = items.map(c =>
+    `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:#1b1e22">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+        <span><b>${esc(c.label)}</b> <span class="dim">重建代价 ${esc(c.cost)}</span></span>
+        <span style="white-space:nowrap"><span class="dim">${fmtSize(c.size)}${c.updated?' · '+esc(c.updated):''}</span>
+        <button class="ghost" style="margin-left:8px;padding:3px 10px;font-size:12px"
+          onclick="clearCache('${esc(c.name)}','${esc(c.label)}')">清除</button></span>
+      </div>
+      <div class="dim" style="margin-top:2px">${esc(c.desc)}</div></div>`).join('');
+}
+async function clearCache(name, label){
+  if(!confirm(`清除「${label}」？删除后会在需要时自动重建（重建代价见标注）。`)) return;
+  const r = await (await fetch('/api/backend/cache/clear',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})})).json();
+  if(!r.ok) alert(r.error || '清除失败');
+  refreshCaches(true);
+}
+
+/* ---------- 参数设置：运行状态 ---------- */
+let _statsSeen = false;
+async function refreshStats(){
+  if(!document.getElementById('tab-settings').classList.contains('on')) return;  // 只在设置页时采样
+  let d = {};
+  try{ d = await (await fetch('/api/runtime/stats')).json(); }catch(e){ return; }
+  if(!d.ok){
+    if(!_statsSeen) document.getElementById('pcpu').textContent = '不可用';
+    _statsSeen = true; return;
+  }
+  _statsSeen = true;
+  document.getElementById('pcpu').textContent = d.proc.cpu.toFixed(1)+'%'; bar('pcpu_b', d.proc.cpu);
+  document.getElementById('pmem').textContent = fmtB(d.proc.rss);
+  document.getElementById('pmem_s').textContent = '占系统内存 '+pct(d.proc.rss,d.sys.mem_total).toFixed(1)+'%';
+  bar('pmem_b', pct(d.proc.rss,d.sys.mem_total));
+  document.getElementById('pth').textContent = d.proc.threads;
+  const h = Math.floor(d.proc.uptime/3600), m = Math.floor(d.proc.uptime%3600/60);
+  document.getElementById('puptime').textContent = '已运行 '+(h?h+' 小时 ':'')+m+' 分钟';
+  document.getElementById('scpu').textContent = d.sys.cpu.toFixed(1)+'%'; bar('scpu_b', d.sys.cpu);
+  document.getElementById('smem').textContent = fmtB(d.sys.mem_used);
+  document.getElementById('smem_s').textContent = '共 '+fmtB(d.sys.mem_total);
+  document.getElementById('nup').textContent = fmtB(d.net.up)+'/s';
+  document.getElementById('nup_s').textContent = '累计 '+fmtB(d.net.sent_total);
+  document.getElementById('ndown').textContent = fmtB(d.net.down)+'/s';
+  document.getElementById('ndown_s').textContent = '累计 '+fmtB(d.net.recv_total);
+}
+async function loadConc(){
+  try{ document.getElementById('conc').value = String((await (await fetch('/api/settings/concurrency')).json()).value || 0); }
+  catch(e){}
+}
+async function saveConc(){
+  const v = parseInt(document.getElementById('conc').value);
+  await fetch('/api/settings/concurrency',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+  const m = document.getElementById('msg'); m.textContent = '已保存，即刻生效';
+  setTimeout(()=>m.textContent='',2500);
+}
+async function loadCaps(){
+  try{
+    const d = await (await fetch('/api/settings/matchcaps')).json();
+    const set = (id,v)=>{const s = document.getElementById(id);
+      if(![...s.options].some(o=>o.value===String(v))){
+        const o = document.createElement('option'); o.value = String(v);
+        o.textContent = v===0?'无限制（全生涯）':v+'（自定义）'; s.add(o);}
+      s.value = String(v);};
+    set('capPvp',d.pvp); set('capPve',d.pve);
+  }catch(e){}
+}
+async function saveCaps(){
+  const body = {pvp:document.getElementById('capPvp').value,
+                pve:document.getElementById('capPve').value};
+  const d = await (await fetch('/api/settings/matchcaps',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  const m = document.getElementById('capmsg');
+  const show = n=>n===0?'无限制':n+' 场';
+  m.textContent = d.ok?`已保存，生效：PvP ${show(d.pvp_eff)} / PVE ${show(d.pve_eff)}`:'保存失败';
+  setTimeout(()=>m.textContent='',4000);
+}
+
+/* ---------- 启动 ---------- */
+let _bootTab = 'overview';
+try{ _bootTab = localStorage.getItem('panelTab') || 'overview'; }catch(e){}
+showTab(['overview','login','jobs','groups','data','settings'].includes(_bootTab) ? _bootTab : 'overview');
+refreshStatus(); setInterval(refreshStatus, 5000);
+refreshNap();    setInterval(refreshNap, 5000);
 refreshBungie(); setInterval(refreshBungie, 10000);
-refreshUsage(); setInterval(refreshUsage, 3000);
+setInterval(refreshJobs, 2000);  refreshJobs();
+refreshBindings(); setInterval(refreshBindings, 10000);
+refreshUsage();  setInterval(refreshUsage, 3000);
+setInterval(refreshStats, 2000);
 </script></body></html>"""
 
 
 @app.get("/panel", response_class=HTMLResponse)
 async def panel():
     # 顶部挂同一排导航：面板本身就是程序内一个页面，可以一步回查询站（此前没有返回按钮）
-    return HTMLResponse(PANEL.replace("<h1>QQ Bot 面板</h1>",
-                                      navbar("/panel") + "<h1>QQ Bot 面板</h1>", 1))
+    return HTMLResponse(PANEL.replace("<h1>Bot 后端管理</h1>",
+                                      navbar("/panel") + "<h1>Bot 后端管理</h1>", 1))
 
 
 @app.get("/api/napcat/status")
@@ -581,6 +901,103 @@ async def usage_refresh(request: dict):
 @app.post("/api/usage/stop")
 async def usage_stop():
     return weapon_usage.stop_refresh()
+
+
+@app.post("/api/usage/channel/start")
+async def usage_channel_start():
+    """面板「启动通道」：拉起调试 Edge（独立 profile，不动用户正在用的 Edge）。
+
+    刷新本身也会自动拉起通道（weapon_usage.start_refresh → ensure_channel），
+    这个入口是给「不刷新、只想先把通道打开」用的。"""
+    return await weapon_usage.ensure_channel()
+
+
+# ---------- 后端数据与缓存管理 ----------
+
+def _cache_path(name: str) -> str:
+    """缓存文件定位：先 cwd（源码跑=仓库目录），再 exe 同目录（打包版运行时数据都在那）"""
+    p = os.path.join(os.getcwd(), name)
+    if os.path.exists(p) or not getattr(sys, "frozen", False):
+        return p
+    return os.path.join(os.path.dirname(sys.executable), name)
+
+
+# (键, 标题, 文件, 重建代价, 说明) —— 绝不含 绑定表/token/配置/凭据
+_BACKEND_CACHES = [
+    ("usage", "light.gg 使用率缓存", ["weapon_usage_cache.json"], "低",
+     "武器卡片选取率/热门组合的解析契约（7 天 TTL）；删后下条指令从快照重算，几乎无损"),
+    ("agg", "生涯武器汇总缓存", ["weapon_agg_cache.json"], "中",
+     "同范围再查只补新对局；删后该范围要全量重算一次"),
+    ("pvp_detail", "对局明细贡献缓存", ["pvp_weapon_cache.json"], "高",
+     "逐场武器击杀明细；删后重复统计要逐场重拉，最贵的一个"),
+    ("raid_hist", "团本/地牢历史缓存", ["raid_history_cache.json"], "高",
+     "已统计对局 + 翻页 gate；删后 /raid /地牢 冷启动要重新翻几十页历史"),
+    ("raid_pgcr", "团本/地牢单场缓存", ["raid_pgcr_cache.json"], "中",
+     "对局基础信息永久缓存；删后重拉"),
+    ("raidreport", "raidreport 排名缓存", ["raidreport_ranks.json", "raidreport_stats.json"], "低",
+     "世界排名缓存"),
+    ("gm", "宗师战绩缓存", ["gm_cache.json"], "低", "宗师/征服战绩查询缓存"),
+    ("heat", "热力图缓存", ["heatmap_cache.json"], "中", "按月活动统计；删后重拉"),
+    ("lost_sector", "失落Sector缓存", ["lost_sector_cache.json"], "低", "当日失落Sector"),
+    ("eververse", "光尘商店缓存", ["eververse_cache.json"], "低", "商店商品索引"),
+    ("rotation", "本周轮换缓存", ["rotation_cache.json"], "低", "轮换活动索引"),
+    ("season", "赛季时间缓存", ["season_time_cache.json"], "低", "赛季起止时间"),
+    ("xur", "兜售者缓存", ["xur_kyber_cache.json"], "低", "老九/异域数据"),
+    ("seen", "玩家查询记录", ["seen_players.json"], "低", "查过的玩家 id ↔ 名字记录"),
+    ("icons", "卡片图标缓存", ["icon_cache/"], "中", "bungie 图标落盘；删后出卡片时重新下载"),
+]
+
+
+def _path_size(p: str) -> int:
+    try:
+        if p.endswith("/"):
+            base = _cache_path(p)
+            if not os.path.isdir(base):
+                return 0
+            return sum(os.path.getsize(os.path.join(r, f))
+                       for r, _, fs in os.walk(base) for f in fs)
+        f = _cache_path(p)
+        return os.path.getsize(f) if os.path.isfile(f) else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@app.get("/api/backend/caches")
+async def backend_caches():
+    out = []
+    for name, label, files, cost, desc in _BACKEND_CACHES:
+        size = sum(_path_size(f) for f in files)
+        updated = ""
+        try:
+            mts = [os.path.getmtime(_cache_path(f)) for f in files
+                   if os.path.exists(_cache_path(f))]
+            if mts:
+                updated = time.strftime("%m-%d %H:%M", time.localtime(max(mts)))
+        except Exception:  # noqa: BLE001
+            pass
+        out.append({"name": name, "label": label, "cost": cost, "desc": desc,
+                    "size": size, "updated": updated})
+    return {"items": out}
+
+
+@app.post("/api/backend/cache/clear")
+async def backend_cache_clear(request: dict):
+    name = (request.get("name") or "").strip()
+    entry = next((e for e in _BACKEND_CACHES if e[0] == name), None)
+    if not entry:
+        return {"ok": False, "error": f"未知的缓存：{name}"}
+    try:
+        for f in entry[2]:
+            p = _cache_path(f)
+            if f.endswith("/"):
+                import shutil
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p):
+                os.remove(p)
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
 
 
 _ob11_recheck_at = 0.0  # 上次"未连接时补发反向 WS 配置"的时间（限频，WebUI API 有频率限制）
@@ -684,6 +1101,34 @@ async def set_concurrency(request: dict):
     return {"ok": True, "value": bot_runtime.load_config().get("max_concurrency") or 0}
 
 
+@app.get("/api/settings/matchcaps")
+async def get_matchcaps():
+    """生涯统计场次上限（原始值：'default'=默认，数字=上限，0=无限制）+ 当前生效值"""
+    cfg = bot_runtime.load_config()
+    return {"pvp": cfg.get("pvp_match_cap", "default"),
+            "pve": cfg.get("pve_match_cap", "default"),
+            "pvp_eff": d2.match_cap("pvp"), "pve_eff": d2.match_cap("pve")}
+
+
+@app.post("/api/settings/matchcaps")
+async def set_matchcaps(request: dict):
+    def _set(cfg):
+        for kind in ("pvp", "pve"):
+            v = request.get(kind)
+            if v is None:
+                continue
+            key = f"{kind}_match_cap"
+            if v == "default":
+                cfg.pop(key, None)          # 默认：不落键
+            else:
+                try:
+                    cfg[key] = max(0, int(v))   # 0 = 无限制
+                except Exception:  # noqa: BLE001
+                    continue
+    bot_runtime.update_config(_set)
+    return {"ok": True, "pvp_eff": d2.match_cap("pvp"), "pve_eff": d2.match_cap("pve")}
+
+
 RUNTIME_PAGE = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>运行状态</title>
 <style>
 body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;padding:22px}
@@ -730,6 +1175,25 @@ button{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold;curso
  </select>
  <button onclick="save()">保存</button><span id="msg"></span>
 </div>
+<div class="sec" style="margin-top:14px">
+ <h2>生涯统计场次上限</h2>
+ <p>/pvp生涯武器 逐场统计默认最多 2000 场、/pve生涯武器 默认 3000 场（防止十年老号
+ 跑几十分钟）。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能要跑
+ 很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
+ <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <label>PvP　<select id="capPvp">
+   <option value="default">默认 2000</option>
+   <option value="5000">5000</option><option value="10000">10000</option>
+   <option value="20000">20000</option><option value="0">无限制（全生涯）</option>
+  </select></label>
+  <label>PvE　<select id="capPve">
+   <option value="default">默认 3000</option>
+   <option value="5000">5000</option><option value="10000">10000</option>
+   <option value="20000">20000</option><option value="0">无限制（全生涯）</option>
+  </select></label>
+  <button onclick="saveCaps()">保存</button><span id="capmsg"></span>
+ </div>
+</div>
 <script>
 function fmtB(n){if(!isFinite(n))return'–';if(n<1024)return n.toFixed(0)+' B';
  const u=['KB','MB','GB','TB'];let i=-1;do{n/=1024;i++}while(n>=1024&&i<3);return n.toFixed(1)+' '+u[i]}
@@ -764,12 +1228,33 @@ async function save(){
   headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
  const m=document.getElementById('msg');m.textContent='已保存，即刻生效';
  setTimeout(()=>m.textContent='',2500)}
-refresh();setInterval(refresh,2000);
+async function loadCaps(){
+ try{
+  const d=await (await fetch('/api/settings/matchcaps')).json();
+  const set=(id,v)=>{const s=document.getElementById(id);
+   if(![...s.options].some(o=>o.value===String(v))){   // 配置里是自定义数值时动态补一项
+    const o=document.createElement('option');o.value=String(v);
+    o.textContent=v===0?'无限制（全生涯）':v+'（自定义）';s.add(o);}
+   s.value=String(v);};
+  set('capPvp',d.pvp);set('capPve',d.pve);
+ }catch(e){}}
+async function saveCaps(){
+ const body={pvp:document.getElementById('capPvp').value,
+             pve:document.getElementById('capPve').value};
+ const d=await (await fetch('/api/settings/matchcaps',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ const m=document.getElementById('capmsg');
+ const show=n=>n===0?'无限制':n+' 场';
+ m.textContent=d.ok?`已保存，生效：PvP ${show(d.pvp_eff)} / PVE ${show(d.pve_eff)}`:'保存失败';
+ setTimeout(()=>m.textContent='',4000)}
+refresh();setInterval(refresh,2000);loadCaps();
 </script></body></html>"""
 
 
 @app.get("/runtime", response_class=HTMLResponse)
-async def runtime_page():
+async def runtime_page(embed: int = 0):
+    if embed:   # 面板内嵌 iframe：不带导航栏
+        return HTMLResponse(RUNTIME_PAGE)
     return HTMLResponse(RUNTIME_PAGE.replace(
         "<h1>运行状态</h1>", navbar("/runtime") + "<h1>运行状态</h1>", 1))
 
@@ -805,6 +1290,11 @@ __NAV__
   <input id="name" placeholder="玩家名#编号，如 Wj#8984" size="44" autocomplete="off">
   <button onclick="go()">查询</button>
   <div id="sug" style="display:none;position:absolute;top:44px;left:0;width:100%;background:#16181b;border:1px solid #2a2e33;border-radius:8px;z-index:9"></div>
+</div>
+<div class="d2nav" style="margin-bottom:14px">
+  <a class="nv" href="/catalog">武器图鉴</a><a class="nv" href="/perks">Perk查询</a>
+  <a class="nv" href="/eververse">光尘商店</a><a class="nv" href="/rotation">本周轮换</a>
+  <a class="nv" href="/armorsets">护甲套装</a>
 </div>
 <div id="tabs">
   <button data-m="all" class="on">总览</button>
@@ -1065,8 +1555,9 @@ async def api_suggest(type: str = "weapon", q: str = ""):
 @app.get("/catalog", response_class=HTMLResponse)
 async def catalog_page():
     """全武器图鉴：一次拉全量索引，筛选/搜索/计数都在浏览器里算"""
+    alias = {**name_i18n.terms_map(), **weapon_filter.SYNONYM}  # 英文/繁体词先查，再查社区叫法
     return HTMLResponse(CATALOG_PAGE.replace("__NAV__", navbar("/catalog"))
-                        .replace("__ALIAS__", _json.dumps(weapon_filter.SYNONYM, ensure_ascii=False)))
+                        .replace("__ALIAS__", _json.dumps(alias, ensure_ascii=False)))
 
 
 @app.get("/api/catalog/index")
@@ -1731,7 +2222,9 @@ def render_wpvp(rep: dict) -> str:
              + chip("大招", f"{rep.get('super', 0):,}"))
     rng = rep.get("range") or ("", "")
     span = f" · {rng[0]} ~ {rng[1]}" if rng and rng[0] else ""
-    note = (f"（已达逐场统计上限 {rep['matches']:,} 场）" if rep.get("capped") else "")
+    cap_v = rep.get("cap") or rep["matches"]
+    note = (f"（已达逐场统计上限 {cap_v:,} 场，可在「运行状态」页调整或设为无限制）"
+            if rep.get("capped") else "")
     note += f" · {rep['missed']} 场详情未取到" if rep.get("missed") else ""
     if rep.get("cached"):  # 命中汇总缓存：说明这次只补拉了多少新对局
         note += f" · 缓存复用，本次只补 {rep.get('added', 0)} 场"
@@ -2128,8 +2621,20 @@ function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'
 function lab(k,v){return k==='q'?(TIER[v]||('品质'+v)):v;}
 
 function syncToks(){
-  const v=document.getElementById('q').value.trim().toLowerCase();
-  TOKS=v?v.split(/\s+/).filter(Boolean).map(x=>[x,AL[x]||'']):[];
+  const raw=document.getElementById('q').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  TOKS=[];
+  let i=0;
+  while(i<raw.length){
+    let done=false;
+    // 英文/繁体多词条连读：「hand cannon」「adaptive frame」拆开逐词都不成立
+    for(const n of [3,2]){
+      if(i+n<=raw.length){
+        const j=raw.slice(i,i+n).join('');
+        if(AL[j]){TOKS.push([j,AL[j]]);i+=n;done=true;break;}
+      }
+    }
+    if(!done){TOKS.push([raw[i],AL[raw[i]]||'']);i++;}
+  }
 }
 // 一个词命中：原文或它的社区叫法（喷子→霰弹枪）出现在名称/类型/框架/元素/来源/Perk 里
 function tokOk(it,c){return c.some(x=>x&&it.hay.indexOf(x)>=0);}
@@ -2289,7 +2794,8 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeOv();});
   }
   const order=Object.entries(j);
   ITEMS=order.map(([h,d])=>({h,d,tier:d.q||0,
-    hay:(d.n+' '+d.t+' '+d.f+' '+d.e+' '+d.g+' '+(d.p||[]).join(' ')).toLowerCase()}));
+    hay:((d.n||'')+' '+(d.t||'')+' '+(d.f||'')+' '+(d.e||'')+' '+(d.g||'')+' '
+         +((d.p||[]).join(' '))+' '+(d.en||'')+' '+(d.cht||'')).toLowerCase()}));
   buildPool();
   syncToks();
   drawFacets();draw();

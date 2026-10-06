@@ -9,6 +9,8 @@ import os
 import re
 import sys
 
+import name_i18n
+
 # key -> (显示名, 别名小写列表, 来源文章)
 CHARTS: dict[str, tuple[str, list[str], str]] = {
     "crota": ("克洛塔的末日", ["ce", "克洛塔", "末日", "crota"],
@@ -69,7 +71,9 @@ def _display_base(name: str) -> str:
 
 def resolve(text: str) -> str | None:
     """'ron掉落' / '掉落 克洛塔' / 'ce' → key；认不出返回 None。
-    副本全名（显示名去括号）也可直接触发：'深渊机灵掉落'、'克洛塔的末日掉落'"""
+    副本全名（显示名去括号）也可直接触发：'深渊机灵掉落'、'克洛塔的末日掉落'
+    英文名 / 台服繁体名同样认（Crota's End、國王的殞落、Vault of Glass），
+    走 build_locale_index.py 生成的三语索引（活动名 → 图表 key）"""
     t = _norm(text)
     for probe in (t.replace("掉落", ""), t):
         for key, (name, aliases, _) in CHARTS.items():
@@ -77,6 +81,9 @@ def resolve(text: str) -> str | None:
                 return key
         if probe in MISSING:
             return None
+        k = name_i18n.chart_key(probe)
+        if k:
+            return k
     return None
 
 

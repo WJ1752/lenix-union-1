@@ -13,6 +13,7 @@ import weakref
 import httpx
 
 import bot_runtime
+import name_i18n
 from jsonio import dump_json
 
 
@@ -986,6 +987,8 @@ def mode_tags(modes: list) -> str:
 def suggest_weapons(q: str, limit: int = 8) -> list[dict]:
     q = q.lower().strip()
     out = [w for w in _weapons_full.values() if q in w["name"].lower()]
+    if not out and q:  # 英文/繁体名的联想（面板搜索框）
+        return _weapons_by_alt_name(q, limit)
     out.sort(key=lambda w: (not w["name"].lower().startswith(q), w["name"]))
     return out[:limit]
 
@@ -1037,6 +1040,18 @@ def search_weapons_full(q: str, limit: int = 24) -> list[dict]:
             out = [dict(w, hash=h) for h, w in _weapons_full.items()
                    if nk in norm_key(w["name"])]
             out.sort(key=lambda w: (not norm_key(w["name"]).startswith(nk), w["name"]))
+    if not out and q:  # 英文名 / 台服繁体名兜底（Fatebringer、龍息）：三语索引直接给 hash
+        out = _weapons_by_alt_name(q, limit)
+    return out[:limit]
+
+
+def _weapons_by_alt_name(q: str, limit: int = 24) -> list[dict]:
+    """英文/繁体武器名 → 武器记录（索引里精确命中在前，其次前缀/子串命中）"""
+    out = []
+    for h in name_i18n.match_weapons(q, limit=limit * 2):
+        rec = _weapons_full.get(h)
+        if rec:
+            out.append(dict(rec, hash=h))
     return out[:limit]
 
 
@@ -1083,6 +1098,11 @@ def search_perks(q: str, limit: int = 20) -> list[dict]:
                     exact.append({"hash": h, **p})
                 elif nk in n:
                     part.append({"hash": h, **p})
+    if not exact and not part and q:  # 英文/繁体 perk 名（Incandescent、熾熱）走三语索引
+        for h in name_i18n.match_perks(q, limit=limit):
+            p = _perks.get(h)
+            if p:
+                part.append({"hash": h, **p})
     out = (exact + part)[:limit]
     for p in out:  # 附上社区数值/说明
         pc = _perk_ci.get(p["hash"])
@@ -1121,20 +1141,31 @@ def _edit_dist(a: str, b: str) -> int:
 
 def search_armor_sets(q: str) -> list[dict]:
     """护甲套装检索：套装名 / 别名精确命中 → 包含命中 → 模糊兜底（容 1-2 个字符的手滑，
-    如 vog 打成 vod）；全命中为空才走模糊，避免正常搜索被带偏"""
+    如 vog 打成 vod）；全命中为空才走模糊，避免正常搜索被带偏。
+    英文/繁体套装名（Seventh Seraph、第七熾天使）先经三语索引换算成简体名再走同一套匹配。"""
     q = _norm_set(q)
     if not q:
         return []
-    out = []
-    for s in _armor_sets:
-        names = {_norm_set(s["name"])} | {_norm_set(a) for a in s.get("aliases", [])}
-        src = _norm_set(s.get("source") or "")
-        if q in names or (src and q == src):   # 来源（副本名）也可精确搜
-            out.insert(0, s)
-        elif any(q in n for n in names):
-            out.append(s)
+
+    def _pass(qn: str) -> list[dict]:
+        out = []
+        for s in _armor_sets:
+            names = {_norm_set(s["name"])} | {_norm_set(a) for a in s.get("aliases", [])}
+            src = _norm_set(s.get("source") or "")
+            if qn in names or (src and qn == src):   # 来源（副本名）也可精确搜
+                out.insert(0, s)
+            elif any(qn in n for n in names):
+                out.append(s)
+        return out
+
+    out = _pass(q)
     if out:
         return out
+    alt = name_i18n.set_name(q)  # 英文/繁体套装名 → 简体套装名
+    if alt:
+        out = _pass(_norm_set(alt))
+        if out:
+            return out
     fuzzy: list[tuple[int, int, dict]] = []  # (距离, 名字长度, 套装)
     for s in _armor_sets:
         for n in {_norm_set(s["name"])} | {_norm_set(a) for a in s.get("aliases", [])}:
@@ -1743,7 +1774,9 @@ async def raid_report_member(member: dict, mode: int, jid: str | None = None) ->
     # 只拉主平台会少算跨平台前打的那些场（实测 Benson 克洛塔 页面87 vs 主平台86）
     accts = [(mtype, str(mid))]
     try:
-        r = await client().get(f"/User/GetMembershipsById/{mid}/{mtype}/")
+        # 路径必须带 /Platform：漏了会打到 bungie.net 的 404 HTML 页，r.json() 抛
+        # JSONDecodeError 被下面的 except 吞掉——跨存档合并会静默失效（少算跨平台场次）
+        r = await client().get(f"/Platform/User/GetMembershipsById/{mid}/{mtype}/")
         for mm in ((r.json().get("Response") or {}).get("destinyMemberships") or []):
             mt2, md2 = mm.get("membershipType"), str(mm.get("membershipId") or "")
             if md2 and mt2 in (1, 2, 3, 4, 5, 6, 10) and (mt2, md2) not in accts:
@@ -2340,11 +2373,29 @@ _PVP_CACHE_FILE = "pvp_weapon_cache.json"
 _pvp_cache_ready = False
 # PGCR 单发延迟约 2 秒（Bungie 服务端就慢），16 路并发 ≈ 10+ req/s，远低于 25/s 限流
 _PVP_CONCURRENCY = 16
-PVP_MATCH_CAP = 2000      # 逐场拉 PGCR 的上限，防止十年老号把任务拖成几十分钟
+PVP_MATCH_CAP = 2000      # 逐场拉 PGCR 的默认上限，防止十年老号把任务拖成几十分钟
 # PVE 场次比 PVP 多一个数量级（一个赛季通常几百场），默认只统计单赛季，全生涯才可能吃满上限
 PVE_MATCH_CAP = 3000
 # 探索/巡逻（mode 6）没有实质击杀，实测还偶发没有武器明细，统计里排除（PVE 通关率也已排除它）
 _PVE_SKIP_MODES = frozenset({6})
+
+
+def match_cap(kind: str) -> int:
+    """生涯统计场次上限：bot_config.json 的 pvp_match_cap / pve_match_cap（运行状态页可调）。
+
+    未设置 = 内置默认（PVP 2000 / PVE 3000）；0 = 无限制全生涯——受 Bungie 接口本身
+    每角色 60 页 × 250 场的可读历史硬顶约束（更早的对局接口根本不给）。
+    """
+    default = PVP_MATCH_CAP if kind == "pvp" else PVE_MATCH_CAP
+    cfg = bot_runtime.load_config()
+    key = f"{kind}_match_cap"
+    if key not in cfg:
+        return default
+    try:
+        n = int(cfg.get(key) or 0)
+    except Exception:  # noqa: BLE001
+        return default
+    return n if n > 0 else 0    # 0 = 无限制（_collect_matches 对 cap<=0 按无限处理）
 
 
 def _writable_path(name: str) -> str:
@@ -2460,8 +2511,10 @@ async def sync_bindings() -> dict:
         cur = None
         if me.get("mid"):
             try:
+                # 同 1777：路径必须带 /Platform，否则 404 HTML 让 R.json() 抛
+                # JSONDecodeError，改名核对每天都在这里全军覆没
                 r = await client().get(
-                    f"/User/GetMembershipsById/{me['mid']}/{me.get('mtype', -1)}/")
+                    f"/Platform/User/GetMembershipsById/{me['mid']}/{me.get('mtype', -1)}/")
                 mems = ((r.json().get("Response") or {}).get("destinyMemberships") or [])
                 if mems:
                     cur = (mems[0].get("bungieGlobalDisplayName") or "",
@@ -2601,7 +2654,7 @@ async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
     seen, matches = set(), []
     for ci, cid in enumerate(chars):
         page = 0
-        while page < 60 and len(matches) < cap:  # 60页×250 ≈ 1.5万场/角色的兜底
+        while page < 60 and (cap <= 0 or len(matches) < cap):  # 60页×250 ≈ 1.5万场/角色的接口硬顶
             acts = await activity_history(mtype, mid, cid, mode, count=250, page=page)
             if not acts:
                 break
@@ -2620,7 +2673,7 @@ async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
                 if m["instance"] and m["instance"] not in seen:
                     seen.add(m["instance"])
                     matches.append(m)
-                    if len(matches) >= cap:
+                    if cap > 0 and len(matches) >= cap:
                         stop = True
                         break
             if stop or len(acts) < 250:
@@ -2664,12 +2717,12 @@ async def _start_weapon_job(name: str, scope: str, kind: str, mode: int,
 
 async def start_pvp_weapons(name: str, scope: str = "all", who: str = "") -> str | None:
     """PVP 生涯武器后台任务；scope: 'all'=全生涯，'s27'/'27'/'赛季27'=只统计该赛季"""
-    return await _start_weapon_job(name, scope, "pvp", 5, PVP_MATCH_CAP, frozenset(), who)
+    return await _start_weapon_job(name, scope, "pvp", 5, match_cap("pvp"), frozenset(), who)
 
 
 async def start_pve_weapons(name: str, scope: str = "current", who: str = "") -> str | None:
     """PVE 生涯武器后台任务；scope 默认 'current'=当前赛季（全生涯 PVE 场次太多，要显式指定）"""
-    return await _start_weapon_job(name, scope, "pve", 7, PVE_MATCH_CAP, _PVE_SKIP_MODES, who)
+    return await _start_weapon_job(name, scope, "pve", 7, match_cap("pve"), _PVE_SKIP_MODES, who)
 
 
 async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
@@ -2703,7 +2756,7 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         eff_since = base_newest_full[:10] or since
     empty = {"display": JOBS[jid]["name"], "scope": scope, "scope_label": label,
              "kind": kind, "matches": base_matches, "missed": base_missed, "capped": False,
-             "range": (base_oldest, base_newest_full[:10]),
+             "cap": cap, "range": (base_oldest, base_newest_full[:10]),
              "cached": base_matches if reuse else 0, "added": 0,
              "weapons": sorted(agg.values(), key=lambda x: -x["kills"]), **tot}
     try:
@@ -2769,7 +2822,8 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         result = {
             "display": JOBS[jid]["name"], "scope": scope, "scope_label": label, "kind": kind,
             "matches": total_matches, "missed": base_missed + missed,
-            "capped": total_matches >= cap, "range": (oldest, newest),
+            "capped": cap > 0 and total_matches >= cap, "cap": cap,
+            "range": (oldest, newest),
             "added": len(matches), "cached": base_matches if reuse else 0,
             "weapons": weapons,
             # 卡片只展示前 60 把，汇总块要用全量，所以单独给两个总数
