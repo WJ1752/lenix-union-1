@@ -69,10 +69,13 @@ foreach ($f in $ext) {
   $d = Join-Path $dst  $f
   if (Test-Path $s) { Copy-Item $s $d -Force; Write-Output "sync $f" }
 }
-# cloudflared.exe（/登录 公网隧道自动回跳用）保持外置：55MB 不进包
+# cloudflared.exe（/登录 公网隧道自动回跳用）保持外置：55MB 不进包。
+# 若隧道正在跑，文件被锁——跳过即可（部署脚本还会停 D2Query.exe，其子进程随之退出）。
 if (Test-Path (Join-Path $root "cloudflared.exe")) {
-  Copy-Item (Join-Path $root "cloudflared.exe") (Join-Path $dst "cloudflared.exe") -Force
-  Write-Output "sync cloudflared.exe"
+  try {
+    Copy-Item (Join-Path $root "cloudflared.exe") (Join-Path $dst "cloudflared.exe") -Force
+    Write-Output "sync cloudflared.exe"
+  } catch { Write-Output ("  cloudflared.exe 跳过（被运行中的隧道进程锁住）: " + $_.Exception.Message) }
 }
 
 # 3.6) sync NapCat runtime files into dist's napcat_shell (that dir is created once by

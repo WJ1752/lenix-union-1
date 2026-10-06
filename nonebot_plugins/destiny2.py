@@ -1390,30 +1390,28 @@ async def _(event: Event, args: Message = CommandArg()):
     st = bungie_auth.user_status(qq)
     cur = (f"当前已登录：{st['display_name']}；重新登录会覆盖。" if st.get("authorized")
            else "登录后可用：/配装 数字（游戏内20套配装）、/仓库 关键词。")
-    # 公网隧道链接（任意网络全自动）优先；没起隧道退回 本机/局域网/粘贴
+    # 公网隧道链接（远程全自动，依赖 Bungie 尊重授权链接里的回跳参数，实验性）
     tun_origin = await asyncio.to_thread(bot_tunnel.callback_origin)
     lines = ["Bungie 账号登录（仅本人可见的数据用你自己的授权读取，token 只存在本机）："]
     if tun_origin:
         lines += [
             bungie_auth.auth_url(qq=qq, origin=tun_origin),
-            "↑ 任意网络的设备点这条：登录 Bungie 并点「允许」后**自动完成绑定**，"
-            "回群直接用 /配装 数字、/仓库 关键词。",
+            "↑ 任意网络的设备点这条：登录 Bungie 并点「允许」。若跳回后自动显示"
+            "「授权成功」即完成（此链接依赖 Bungie 认授权链接里的回跳地址，部分情况"
+            "会被送回应用登记地址而打不开，那时用下面的兜底）。",
         ]
     url = bungie_auth.auth_url(qq=qq)
     lines += [
         url,
-        "↑ 在 bot 这台电脑上点这条（同样自动完成；提示证书不安全可先在面板点"
-        "「信任本机证书」）。",
+        "↑ 在 bot 这台电脑上点这条：登录并「允许」→ 浏览器提示「不安全」→"
+        "高级→继续访问 → 显示「授权成功」即完成（面板可点「信任本机证书」免此步）。",
     ]
-    origin = bungie_auth.lan_redirect_origin()
-    if origin:
-        lines += [
-            bungie_auth.auth_url(qq=qq, origin=origin),
-            "↑ 和 bot 同一 Wi-Fi/局域网的设备点这条（自动完成，提示不安全→高级→继续访问）。",
-        ]
     lines += [
-        "上面链接都点不通（隧道/局域网都不可用）时：点完「允许」复制地址栏整条，"
-        "发「/回调 那串地址」完成。",
+        "⚠ 前提：Bungie 应用页（bungie.net/en/Application）里登记的 Redirect URL 必须"
+        "是 https://127.0.0.1:8902/bungie/callback——Bungie 授权完总是把浏览器送回"
+        "登记地址；登记成别的（如 8900）会落到打不开的页面，code 丢失。",
+        "兜底：跳回后若打不开，复制地址栏整条（含 code=…&state=…）发「/回调 那串地址」"
+        "同样能完成。",
         cur,
     ]
     await login_query.send("\n\n".join(lines))

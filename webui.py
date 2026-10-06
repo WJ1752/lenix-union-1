@@ -1162,20 +1162,25 @@ async def bungie_manual(request: dict):
 
 
 async def _bungie_callback_page(request: Request, code: str = "", state: str = "", error: str = "") -> str:
-    """Bungie 授权回跳页（面板 8900 与 TLS 8902 口共用；TLS 口只挂这一个路由）"""
+    """Bungie 授权回跳页（面板 8900 与 TLS 8902/8903 口共用；TLS 口只挂这一个路由）"""
     back = ("<div style='margin-top:14px'><a href='/panel' "
             "style='color:#4b8fd4;font:14px sans-serif'>← 返回面板</a></div>")
+    land = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
+    print(f"[auth] 回调进入: {land} state={state[:8]}… error={error or '无'}")
     if error or not code:
         return f"<h2 style='color:#ff8d85;font-family:sans-serif'>授权失败：{d2.esc_err(error or '没有拿到 code')}</h2>{back}"
     if not bungie_auth.check_state(state):
         return "<h2 style='color:#ff8d85;font-family:sans-serif'>state 校验失败，请重新授权</h2>" + back
     try:
-        # 实际落地 URL 的 scheme://host:port/path 才是发 code 那次授权真正用的 redirect_uri，
-        # 拿它去换 token（换 token 的校验只认这个），配置值作为兜底重试
-        ru = f"{request.url.scheme}://{request.url.netloc}{request.url.path}"
-        tok = await bungie_auth.exchange(code, ru, state)
+        # 实际落地 URL 的 origin 才是浏览器真正到达的地址；换 token 时优先用
+        # 发授权码那次记录在 flow 里的 redirect_uri（Bungie 实际把浏览器送回的是
+        # 开发者页登记的地址，可能与授权链接里传的不一致）
+        tok = await bungie_auth.exchange(code, land, state)
     except Exception as exc:  # noqa: BLE001
+        print(f"[auth] 换 token 失败: {exc}")
         return f"<h2 style='color:#ff8d85;font-family:sans-serif'>换取 token 失败：{d2.esc_err(exc)}</h2>{back}"
+    print(f"[auth] token 落库: {tok.get('display_name') or tok.get('membership_id')} "
+          f"({ 'QQ用户' if tok.get('is_user') else '面板主账号' })")
     if tok.get("is_user"):
         return (f"<h2 style='color:#35c66b;font-family:sans-serif'>授权成功：{d2.esc_err(tok.get('display_name') or '')}</h2>"
                 "<div style='font:14px sans-serif;color:#c5cacd'>已绑定该 QQ 用户，回群发 "
