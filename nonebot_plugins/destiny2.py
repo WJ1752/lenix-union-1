@@ -1390,7 +1390,15 @@ async def _(event: Event, args: Message = CommandArg()):
     st = bungie_auth.user_status(qq)
     cur = (f"当前已登录：{st['display_name']}；重新登录会覆盖。" if st.get("authorized")
            else "登录后可用：/配装 数字（游戏内20套配装）、/仓库 关键词。")
-    # 公网隧道链接（远程全自动，依赖 Bungie 尊重授权链接里的回跳参数，实验性）
+    # 固定公网域名（.env BUNGIE_PUBLIC_ORIGIN + 常驻隧道）> 临时隧道 > 本机/局域网/粘贴
+    fixed_origin = bot_tunnel.public_origin()
+    if fixed_origin:
+        lines = ["Bungie 账号登录（token 只存本机）：",
+                 bungie_auth.auth_url(qq=qq, origin=fixed_origin),
+                 "↑ 点开登录 Bungie 并点「允许」即自动完成绑定，任何网络任何设备都一样。",
+                 cur]
+        await login_query.send("\n\n".join(lines))
+        return
     tun_origin = await asyncio.to_thread(bot_tunnel.callback_origin)
     lines = ["Bungie 账号登录（仅本人可见的数据用你自己的授权读取，token 只存在本机）："]
     if tun_origin:

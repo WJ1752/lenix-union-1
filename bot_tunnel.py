@@ -86,3 +86,58 @@ def callback_origin(wait: float = 12.0) -> str:
 if __name__ == "__main__":
     print("cloudflared:", _exe_path() or "未找到")
     print("公网回跳源:", callback_origin() or "起不来")
+
+
+# ---------- 常驻命名隧道（自己的域名，外网全自动登录的正式方案） ----------
+# .env 配两项即可：
+#   BUNGIE_TUNNEL_TOKEN=Cloudflare Zero Trust 建隧道时给的 token
+#   BUNGIE_PUBLIC_ORIGIN=https://d2.你的域名     （dashboard 里把该主机名指向
+#                                                 service http://localhost:8903）
+# Bungie 应用页 Redirect URL 也改成同一个 origin + /bungie/callback。
+
+_named: dict = {"proc": None, "tried": False}
+
+
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v:
+        return v
+    for base in (os.path.dirname(os.path.abspath(__file__)),
+                 os.getcwd(), os.path.dirname(sys.executable)):
+        p = os.path.join(base, ".env")
+        if os.path.exists(p):
+            for line in open(p, encoding="utf-8"):
+                if "=" in line and not line.startswith("#"):
+                    k, _, val = line.strip().partition("=")
+                    if k == name and val:
+                        return val
+    return default
+
+
+def _named_ensure() -> None:
+    """BUNGIE_TUNNEL_TOKEN 配了就把命名隧道常驻拉起（每进程只试一次）。"""
+    if _named["tried"]:
+        return
+    _named["tried"] = True
+    exe = _exe_path()
+    tok = _env("BUNGIE_TUNNEL_TOKEN").strip()
+    if not (exe and tok):
+        return
+    try:
+        _named["proc"] = subprocess.Popen(
+            [exe, "tunnel", "--no-autoupdate", "run", "--token", tok],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tunnel] 常驻隧道启动失败: {type(exc).__name__}: {exc}")
+
+
+def public_origin() -> str:
+    """固定公网回跳源（.env BUNGIE_PUBLIC_ORIGIN）；未配置返回空串。
+
+    配了就优先于临时隧道/局域网链接——这是给外网玩家全自动登录的正式方案。"""
+    origin = _env("BUNGIE_PUBLIC_ORIGIN").strip().rstrip("/")
+    if origin:
+        _named_ensure()
+        return origin
+    return ""
