@@ -110,3 +110,17 @@ user_bindings_meta.json
 
 # ===== 第三方大文件（deploy 脚本另行复制）=====
 cloudflared.exe
+
+# ===== 发送失败的图片（面板可预览/重发，运行态不入库）=====
+unsent_images/
+# 维护窗口记录（判定缓存是否被维护污染用，本机运行态）
+maintenance_log.json
+
+# ===== _rtest 探针的转储与一次性产物（探针脚本本身留档，产物不留）=====
+# 原始响应 / 抓取的第三方 bundle / 临时起的 Edge 配置档（含 cookie，重量级且可重跑生成）
+_rtest/*.json
+!_rtest/_kyber_xur.json
+_rtest/edge_cf_profile/
+_rtest/drep_bundles/
+_rtest/weapon_src_preview/
+_rtest/_emb_*

@@ -15,6 +15,10 @@ bot_config.json
 user_bindings.json
 *_cache.json
 *cache.json
+/weapon_usage_cache.json
+/raidreport_ranks.json
+# light.gg 解析失败的 HTML 调试转储（weapon_usage.py 生成）
+/logs/usage_debug/
 
 # ===== 虚拟环境 / 打包产物 =====
 .venv/
@@ -30,6 +34,7 @@ dist_build/
 
 # ===== 大数据索引 / 第三方程序（由构建脚本生成或另行下载）=====
 manifest_index/
+icon_cache/
 napcat_shell/
 node_modules/
 
@@ -75,6 +80,50 @@ build_tmp/
 dist_new/
 dist_build/
 build/
+
+# ZCode 编辑预览临时目录（工具自动生成）
+_preview/
+
+# v2 皮肤改造的预览产物与工具
+_rtest/v2/
+
+# 官方 QQ 机器人凭证（AppSecret，绝不入库）
+qq_official_creds.json
+
+# 指令面板/菜单改动前的线上配置备份（可能含 group_openid）
+qq_official_menu_backup.json
+
+# 模糊搜索的玩家索引（运行期生成，含玩家名）
+/seen_players.json
+
+# ===== _rtest 一次性产物（探针日志 / HTML/PNG 转储 / 构建日志）=====
+_rtest/*.log
+_rtest/*.html
+_rtest/*.png
+_rtest/_build_log*.txt
+_rtest/tmp_manifest/
+raidreport_stats.json
+
+# ===== 登录/运行态（含 token，绝不提交）=====
+bungie_tokens.json
+user_bindings_meta.json
+
+# ===== 第三方大文件（deploy 脚本另行复制）=====
+cloudflared.exe
+
+# ===== 发送失败的图片（面板可预览/重发，运行态不入库）=====
+unsent_images/
+# 维护窗口记录（判定缓存是否被维护污染用，本机运行态）
+maintenance_log.json
+
+# ===== _rtest 探针的转储与一次性产物（探针脚本本身留档，产物不留）=====
+# 原始响应 / 抓取的第三方 bundle / 临时起的 Edge 配置档（含 cookie，重量级且可重跑生成）
+_rtest/*.json
+!_rtest/_kyber_xur.json
+_rtest/edge_cf_profile/
+_rtest/drep_bundles/
+_rtest/weapon_src_preview/
+_rtest/_emb_*
 
 # ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
 .git/
