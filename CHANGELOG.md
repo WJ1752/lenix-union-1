@@ -2,6 +2,194 @@
 
 > 本文件保留项目全部功能演进记录与实现笔记（原 README 正文），最新功能说明见 [README.md](README.md)。
 
+## 2026-10-09 轮换卡「整周错一周」：宗师与武器改成「数据源自称是本周才收」+ 全量日/周刷新项复核
+
+**用户报**：「轮换有明显问题，每周宗师刷新错误，武器错误」，并附游戏内截图
+（本周末宗师 = **军火交易商**（The Arms Dealer，欧洲无人区），首通掉落 **驱逐引擎**（Ouster Engine，榴弹发射器））。
+卡片上写的却是「移民号的坠毁（Exodus Crash）· 涅索斯 · 急锋（The Slammer）」。
+
+**查证：不是抓取失败，是「抓早了 + 缓存整周」（线上文件对得上，不是推断）**
+
+| 证据 | 实测 |
+|---|---|
+| 线上 `gm_cache.json` | `key=2026-W41`（本周）、`at=2026-10-07 01:02` —— Bungie 复位是 01:00，**复位后两分钟**就抓了；内容却是上一周的 Exodus Crash / The Slammer |
+| 同一时刻的源页面 | 2026-10-09 03:2x 复抓 lfcarry：`Grandmaster: The Arms Dealer … It stays up through Tuesday, October 13, at 17:00 UTC. The featured weapon is Ouster Engine, a grenade launcher.` → 与游戏内逐项吻合 |
+| 首刷那一刻 | 当时页面还挂着上一周（`through Tuesday, October 6`），我们照样按新周键落盘 → **整周都在说上周的宗师**（lfcarry 换页比 Bungie 复位晚，不是偶发） |
+| 武器为什么也错 | 页面措辞换过：老正则只认 `weekly challenge weapon is The Slammer, a sword`，新版是 `The featured weapon is Ouster Engine, a grenade launcher` → 这版直接漏解析 |
+| 另外丢的一行 | 旧页有「It is the Nessus strike」补目的地，这版没了 → 目的地会空 |
+
+**同时把其余日/周刷新项逐条核了一遍（都对）**：突袭/地牢（官方里程碑 `challengeObjectiveHashes` = 救赎的边缘 / 玻璃拱顶，
+与 lfcarry 的 featured 段一致；地牢 ① ② 按配对表 k-1 / k+3 推出的战争领主的废墟 / 异端深渊也对）、
+扭曲星球（`slots[4][3]` = 幽梦之城，与截图 03:00 时段一致）、遗失区域（d2lostsector 首页 9 区与卡片逐格一致）、
+光尘商店（已有「过刷新点重取 + 官方晚切标 stale」），老九（到场窗口内 2 小时 / 未到场 10 分钟）。
+**官方接口确实没有宗师和遗失区域**（`GetPublicMilestones` 只有突袭/公会/赛季活动，本次实测复核），所以第三方页仍需守住。
+
+**改法**
+
+- **数据层 `_FreshGuard`（新增）**：识别出「拿到的还是上一轮」时——不落盘、不返回（抛
+  `DataSuspiciousError`，宁可缺也不出上一周的宗师），并记 5 分钟熔断（面板/群里连点几次不会把第三方站打穿，
+  也别白等 20 秒）；每轮最多熔断 2 次，之后**带 `stale` + 警告照收**，判据万一日后过于保守也不会把板块锁死。
+  `force=True` 只绕熔断、不放行陈旧数据。
+- **宗师（`gm_this_week`）**：① 页面自称的周界必须对得上本周——`_gm_week_span()` 算出本周界
+  （周三 01:00 北京 = 周二 17:00 UTC，实测与官方里程碑 `endDate` 逐秒一致），`_page_week_marks()` 抽页面里
+  「stays up through Tuesday, October 13, at 17:00 UTC」「The week of October 6 to October 13, 2026…」两种句式的
+  (月, 日)，对不上就拦；② 页面没写周界时用「宗师+武器与上一轮一字不差」兜底；③ 武器正则泛化成
+  `weapon is (X), a/the (类型)`（featured / weekly challenge 两种措辞都认）；④ 名称查映射时冠词容错并优先真横图
+  （映射里 `arms dealer` 是占位图、`the arms dealer` 才有真图）；⑤ 目的地页面不写时按活动 hash 反查官方
+  单定义接口（`lc=zh-chs`，免 OAuth）——manifest 里 Nessus 目的地是内部区域名「阿卡狄亚谷」，按游戏内显示映射回「涅索斯」。
+- **遗失区域（`lost_sectors_today`）**：同一套思路但不解释时区——页面那个日历日期（`#calendar3` 后的「Oct 8, 2026」）
+  只当指纹，与上一轮的「日期 + 9 个区域」都比不变才算「页面还没换天」，拦下不落盘；指纹抓不到时判据自动失效。
+- **缓存版本**：`_GM_CACHE_VER` 2 → 3（旧那份错的整周缓存当场作废，重启后即重取；`_LS_CACHE_VER` 不动，
+  今天的遗失区域本来就是对的，没必要重抓）。
+- **调度器**：轮换推送遇到 `DataSuspiciousError` 时**整轮推迟**（推送一周只有一次，缺一块比错一块更难补），
+  上限 4 次（≈2 小时），到上限照推缺省卡。
+- **卡片 / 面板**：`stale` 时在板块抬头写明「⚠ 数据源还没换轮，可能仍是上一轮」；「没抓到」缺省行补上原因
+  （复位后那十几分钟会写「数据源还没换轮」）；`/rotation` 面板页补上宗师 + 遗失区域两块，与 QQ 卡同口径
+  （此前面板只有突袭/地牢/扭曲星球）。
+
+**回归**：新增 `_rtest/rotation_refresh_test.py`（50 项：周界口径、页面周界抽取、新旧武器措辞、陈旧页
+拦下不落盘/熔断不重复打接口/超上限带警告照收/force 语义、冠词容错、遗失区域换天判定、卡片警告与缺省原因、
+推送推迟上限）；既有回归（ev_time / heat_cache / job_* / resend / maint_guard / panel_log / launcher_log /
+no_console_flash / help_list / i18n / plugin_import / detail_repair）全部照旧通过。
+实拍 `_rtest/rot_card_shot.py` → `_rot_card.png`（+ `--stale` 的警告版）逐格核对过。
+
+## 2026-10-08 生涯统计「缺明细」不再判死：自动补读 + 维护期等恢复 + 连续日志 + 关掉窗口也能续跑
+
+**用户报**：「缓存是可以复用，但是这个差的是不是有点多啊」——Seren1ty 的 PVE 全生涯卡上写着
+`9,136 场对局 · 8762 场详情未取到 · 缓存复用，本次只补 0 场`，而击杀数看着像正常值。
+
+**查证：不是「差一点」，是那张卡的数基本废了**（逐条实测，不是推断）：
+
+| 证据 | 实测 |
+|---|---|
+| 汇总缓存 | `weapon_agg_cache.json` 的 `4611686018494243351\|pve\|all`：`matches=9136 / missed=8762`，只有 **374 场**（4%）进了统计 |
+| 内部对账 | 武器「出场」列求和 = 910 ≈ 374 场 × 2.4 把/场；场均击杀 22,942÷374 = 61（PvE 正常），而卡片头部写的是 9,136 场 → 看着只有 2.5 杀/场 |
+| 当时的运行 | `exe_stdout.log`：10-07 23:48:54 起翻历史收到 9,125 场，逐场明细跑到 10-08 00:11:36（22 分 41 秒，≈2.2 秒/请求、16 路并发）：请求都发出去了，但 96% 没换回可用明细 |
+| 现在还能不能取 | 新探针 `_rtest/pve_missed_detail_probe.py` 直连 Bungie 跨 2020~2026 抽 40 场：**40/40 都是 HTTP 200 / ErrorCode 1、含本人条目**（其中 20 场本就是 0 击杀空场）→ **官方没删老数据**，当时是环境性失败（限流/抖动） |
+| 交叉印证 | 同一个人 PVP 全生涯 4,624 场只 missed 1 场；另一位玩家 10-07 23:58 的 PVE 2,060 场 missed 1,863，10-08 12:20 重跑 2,061 场 **0 missed** → 整轮大面积 missed 是偶发，重跑就好 |
+
+**三个真缺陷（都在数据层）**：
+
+1. **失败的场次被当成「已统计」永久冻结**：`missed` 只记了个数字，`matches`/`newest_full` 照样把
+   它们算进去 → 下次同范围查询只补「比 newest_full 更新」的对局，那 8,762 场**永远不再复查**；
+   面板上的「重跑」也是同一条路（同 scope → `same_scope` → 直接复用），修不了。
+2. **明细缓存会被整份清空**：`_save_pvp_cache()` 不先 `_load_pvp_cache()` 就写盘，而每个任务收尾
+   都会调它。于是「某次任务走『没有新对局』的复用收尾」（重启后第一个任务尤其容易）时，进程里
+   那份还没加载过的空 dict 就把磁盘上 2MB 的明细整份盖掉。日志能对上：11:35:38 重启 → 12:02:26
+   Kostus 那次「没有新对局」收尾 → 文件被清空 → 12:14/12:18 两轮重新拉出 3,780 条（现在文件里
+   只剩那两位玩家、Seren1ty 一条都没有）。后果是每次整段重算都要重新拉满几千场 PGCR。
+3. **维护/限流期把对局判死**：`one()` 里任何异常或非 1 错误码都记 `missed`，维护闸门拦下的
+   `BungieMaintenanceError` 也照记——维护期跑长任务 = 整批对局被算成「没有明细」。
+
+**改法（对应四条需求）**：
+
+- **明细取数改三态**：新增 `pgcr_detail(instance, mid) -> (status, detail)`：`ok`＝拿到、
+  `gone`＝官方确实没有（1653/1601/1620，或名单里没有本人条目，重试无意义）、`retry`＝这次没拿到
+  （限流/超时/维护闸门/未知错误码）。`pvp_match_contribution` 保留老口径（非 ok 一律 None）。
+- **未取到过多自动重读**：明细阶段改为 `_pull_details()`——一轮内按 `_PGCR_ROUNDS`(3) 退避补读
+  （8s→16s；失败面 ≥50% 且 ≥20 场时按限流风暴多歇 45s），仍没到手的写进汇总缓存的 `missing`
+  名单（`"instance@period"`，≤2 万条）；**同范围下一次查询、以及任务结束后 `_MISS_RETRY_DELAY`
+  (180s) 到点的自动补读**都会先把这批旧账要回来（`miss_tries` 上限 3 轮，跑满不再自动试、名单
+  留着等下回），补齐了才把 `missed` 归零；跨范围折叠时，被折进来的已缓存分段自己带的缺口名单
+  也会接手补读（不接的话那几场在本范围里会被当成「有明细」）。
+- **维护期不再判死**：明细阶段绕过维护闸门（`_job_checkpoint(gate=False)`），维护中走
+  `_wait_maint_clear()` 原地等恢复（面板显示「Bungie 维护中，等恢复后接着跑（已等 X）」；每 60 秒
+  放一个真实请求探路、成功即自动熄灯；上限 `_MAINT_WAIT_MAX` 30 分钟；期间暂停/中止照常响应），
+  超时才收工落盘、把没拉到的进补读名单。
+- **老缓存自动迁移**：同范围复用前多一道校验——`missed > 0` 却没有 `missing` 名单的老汇总
+  （2026-10-08 之前只记数字、补不回来）直接丢掉整段重算，所以这次 Seren1ty 那张卡**下次查询
+  就会自己重算成正确值**，不用手动删缓存。结果里新增 `covered`/`gone`/`incomplete` 字段。
+- **卡片如实说**：`render_wpvp` 副标题改成「缺 N 场详情未取到（已排队自动补读）」「N 场官方
+  已无明细（重试无效）」；`incomplete`（缺口 > max(50, 5%)）时在统计数字**前面**插一条金色警示
+  「本卡只统计了 X / Y 场有明细的对局…下面的数字会偏小；补完后重发一次本指令就是准的」。
+- **日志跨重启连续**：`d2query_launcher.py` 抽出 `_open_log_stream()`——启动时先把**上一次会话的
+  最后 15 行回放**进新日志（这就是「诊断断点」要的几行）、再写会话分隔行（时间+pid）；上次没写
+  正常退出标记时明确提示「上次会话未正常结束（多半是被强杀/崩溃）」；退出时 atexit 写「会话正常
+  结束」；日志超 8MB 轮转成 `exe_stdout.1.log`（留 2 份）。面板「任务与日志」新增「运行日志」卡
+  （`/api/bot/engine_log?tail=N`，只读文件末尾 128KB）+ 刷新/自动跟随/打开文件夹。
+- **关掉窗口也能续跑**：任务描述（谁、查谁、什么范围，含去重键）落盘 `jobs_state.json`
+  （`_note_resume`/`_clear_resume`/`_clear_resume_key`），面板启动钩子调 `resume_saved_jobs()`
+  把上次没跑完的重排进队列——明细/汇总缓存都在，续跑等于接着跑；维护中止的与「还缺明细」的留
+  名单，正常跑完/管理员中止就销账。四类重任务（生涯武器/突袭/宗师/热力图）都登记了描述。
+- **缓存落盘加护栏**：`_save_pvp_cache()`/`_save_agg_cache()` 在**没读过盘**时直接返回不写
+  （要覆盖得显式 `force=True`），从根上堵住第 2 条那个「空 dict 盖掉 2MB」的坑。
+
+**回归与验证**：`_rtest/launcher_log_test.py`（32 项，含真子进程的 windowed 启动/强杀端到端）、
+`_rtest/panel_log_api_test.py`（Starlette TestClient 走真实 ASGI，验新端点与卡片告警）、
+`_rtest/detail_repair_test.py`（三态、补读轮、缺口落盘与再补读、老缓存迁移、缓存护栏、续跑重放）、
+`_rtest/pve_missed_detail_probe.py`（直连 Bungie 的抽样体检）；`_rtest/job_engine_test.py` 的明细桩
+同步改成三态口径（`stub_details()`），全套依旧通过。
+
+**注意**：改了 `destiny_data.py` / `webui.py` / `d2query_launcher.py`，三者都在 exe 里
+（hiddenimports / 入口），**必须 `build_exe.bat` 重打包 + `deploy_exe.ps1`** 才生效；没有新增本地
+模块，`D2Query.spec` 与外置模块同步清单都不用改。
+
+## 2026-10-08 修「正常使用会闪一下 cmd 黑窗」——看门狗每分钟一次 netstat 没藏窗口
+
+**用户报**：「我现在正常使用会弹 cmd 窗口闪现出来，虽然只有一瞬间但是已经影响到我正常使用了，
+是自动刷新数据导致的吗」。**不是数据刷新**——是 **NapCat 看门狗的探测，稳定每分钟一次**
+（数据刷新是整点/每日轮换那种节奏，对不上；用户感觉上的「刷新」指的是这个周期性）。
+
+**根因**：`D2Query.spec` 里 `console=False`，exe 是 **windowed（GUI 子系统）**程序，进程
+**完全没有控制台对象**。Windows 的规矩：没有控制台的父进程起一个**控制台子系统子进程**时，
+若不带 `CREATE_NO_WINDOW`，系统会给这个子进程**新分配一个控制台窗口**——子进程干完活退出、
+窗口随之消失 = 黑窗一闪。`napcat_runtime.py` 里 **6 处** netstat / tasklist / taskkill / wmic
+调用全漏了这个标志，其中 `onebot_connected()` 被看门狗 `watch_loop` 每 60 秒（`WATCH_SEC`）
+调一次跑 `netstat -ano -p TCP`（判断 8901 上有没有已建立的 OneBot 反连）→ 机器人一开着就
+每分钟闪一下。
+
+**真机复现（不是「按理说会闪」）**：从同样没有控制台的父进程（`pythonw.exe`，实测
+`GetConsoleWindow() == 0`）一边跑真实代码路径、一边枚举桌面上新出现的 `ConsoleWindowClass` 窗口：
+
+| 用例 | 实测结果 |
+|---|---|
+| `onebot_connected()`（修复后，带 `_NO_WIN`） | 全程**没有任何控制台窗口**（基线时段也没有） |
+| 同一调用、把 `creationflags` 摘掉（= 修复前行为） | 冒出标题 `C:\Windows\SYSTEM32\netstat.exe` 的控制台窗口，**曾可见** ← 用户看到的闪 |
+| 正对照：无标志起 `cmd /k title D2FLASH_PROBE` | 窗口出现且可见（证明监视器抓得到，不是没抓到） |
+| 同正对照 + `CREATE_NO_WINDOW` | 不出现 |
+
+**改法**：`napcat_runtime.py` 顶部统一一个 `_NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)`，
+下面 6 处调用全带 `creationflags=_NO_WIN`；`webui.py` 的「信任证书」`certutil`
+（`asyncio.create_subprocess_exec` 同样吃这个参数）一并带上。
+
+| 改动位置 | 干什么 | 不修的话什么时候闪 |
+|---|---|---|
+| `onebot_connected()` | 看门狗探 8901 反连 | **每 60 秒**（用户报的那个） |
+| `_kill_webui_holder()` | 起/重置前清 6099 端口占用（netstat + tasklist） | 每次启动/重置机器人 |
+| `_kill_orphan_boot()` | 清残留 NapCatWinBootMain（tasklist → taskkill） | 重置/退出时 |
+| `_find_qq()` | 注册表与常见路径都没有时 wmic 查 QQ.exe | 启动时（本机走注册表，平时不走） |
+| `webui.trust_cert` | 装自签证书（certutil） | 点「信任证书」时（一次） |
+
+**本来就对、别去动**：`bot_tunnel.py`（cloudflared）和 `weapon_usage.py`（调试 Edge，
+`_spawn_flags()` = DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP \| CREATE_NO_WINDOW）本来就带标志。
+**顺带查清、省下一轮排查**：卡片渲染的 Playwright 也起 node 子进程，但它自己就藏窗口
+（`playwright/_impl/_transport.py` 用 `STARTUPINFO` + `STARTF_USESHOWWINDOW` + `SW_HIDE` 起 driver），
+**不是**闪烁源。
+
+**防回潮**：新增 `_rtest/no_console_flash_test.py`（静态扫描，不联网、不起进程）：用 AST 找出全仓
+`subprocess.run/Popen/call/check_output/check_call` 与 `asyncio.create_subprocess_exec/shell`，
+每个调用必须能从 `creationflags`（或 `startupinfo`）的表达式里解析出 `CREATE_NO_WINDOW` /
+`DETACHED_PROCESS` / `SW_HIDE` / `STARTF_USESHOWWINDOW`——`creationflags=_NO_WIN`、
+`creationflags=_spawn_flags()` 这类会顺一层同文件的常量/函数体再解析，所以两种写法都认
+（函数内 `startupinfo = subprocess.STARTUPINFO()` 那种也认）。当前 57 个源码文件全过；自检过
+「裸 `subprocess.run`」「`creationflags=0`」「常量解析不到标志」确实会被抓出来，不是空跑。
+
+**验证**：源码树里直接调 `onebot_connected()`，实测子进程 `creationflags = 0x8000000`（= CREATE_NO_WINDOW）；
+离线测试全绿（no_console_flash 5、ev_time 80、maint_guard 42、resend 16、help_list 6、i18n 56+7、
+bot_hook 4、job_engine / job_dedup / heat_cache）；重打包后从解出来的 PYZ 里核对过：老 exe 的
+`napcat_runtime` / `webui` 里 `CREATE_NO_WINDOW` 引用数是 **0**，新包是 **1**（两模块各一处定义，
+引用走 `_NO_WIN` 名字）。
+
+> `napcat_runtime` / `webui` 都**冻结在 exe 包内**（PYZ 里查过；外置副本不生效），所以这条修复
+> 必须重打包才吃到。已重建 + `deploy_exe.ps1` 部署到 `dist_new\D2Query` + 重启（NapCat 未被波及、
+> 自动重连、反向 WS 已建立）。
+>
+> **运行态盯屏复核**（跑的就是部署后那个 exe）：另起一个进程枚举桌面 `ConsoleWindowClass` 窗口，
+> 连续盯 190 秒（跨看门狗 3 次巡检），`netstat`/`tasklist`/`taskkill`/`wmic`/`certutil`
+> 窗口 **0 个**（修复前同一探测会冒 netstat 窗口）。同期出现的 5 个控制台窗口都归不到这几条探测上：
+> Playwright 的 `driver\node.exe`（自己 `SW_HIDE`，始终不可见）、本机自带 `bash.exe` / `ps_server.exe`、
+> 以及一个从没被观测到可见的 `cmd.exe`（bot 这条线是 0）。
+
 ## 2026-10-08（收尾）完整性复核 + 修的 5 处 + 上一批改动清理入库
 
 **这次做的是「把 10-07/10-08 攒下的改动盘一遍再入库」**，不是新功能。复核口径：全部模块能编译、

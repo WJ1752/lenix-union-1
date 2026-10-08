@@ -23,6 +23,31 @@ import weapon_usage
 app = FastAPI()
 
 
+async def _resume_jobs_on_startup() -> None:
+    """启动时把上次没跑完的后台任务重新排起来
+
+    长任务（全生涯逐场 PGCR 二三十分钟）被关窗口/强杀时，内存里的队列与进度全没了，
+    用户只能重发指令。这里按落盘的描述续跑，明细/汇总缓存都在，基本等于接着跑。
+    直接挂 router.on_startup 而不用 @app.on_event：后者在 FastAPI 0.141 已废弃，
+    装饰器一用就打 DeprecationWarning（日志里平白多一行噪音）。
+    """
+    try:
+        done = await d2.resume_saved_jobs()
+    except Exception as exc:  # noqa: BLE001 续跑失败绝不能挡住面板启动
+        print(f"[面板] 续跑上次没跑完的任务失败：{type(exc).__name__}: {exc}", flush=True)
+        return
+    for label in done:
+        print(f"[面板] 已续跑上次没跑完的任务：{label}", flush=True)
+        try:
+            bot_log.add("out", nickname="后台任务",
+                        text=f"[系统] ↻ 续跑上次没跑完的任务：{label}")
+        except Exception:  # noqa: BLE001 面板日志写不进去不影响续跑
+            pass
+
+
+app.router.on_startup.append(_resume_jobs_on_startup)
+
+
 # ---------- 顶部导航：查询站 / 后端管理 两个栏目 ----------
 # 资料查询类功能（武器图鉴/Perk/光尘/轮换/护甲）并入「查询站」栏目，入口挂在查询站首页；
 # 运行状态并入「后端管理」（面板内的折叠卡片）。/runtime、各资料页路由保留，导航不再露出。
@@ -213,6 +238,20 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
       </div>
       <div id="logs" class="scroll" style="max-height:480px">正在加载…</div>
     </div>
+    <div class="card">
+      <div class="jobhead"><b>运行日志</b><span class="dim" id="engLogMeta"></span></div>
+      <div class="dim" style="margin-bottom:8px">引擎日志 exe_stdout.log：翻页/逐场明细/任务进度都在这，重启也不会断</div>
+      <div style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="ghost" onclick="refreshEngineLog()">刷新</button>
+        <label class="dim" style="display:flex;gap:5px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="engLogFollow" style="padding:0"
+            onchange="if(this.checked) refreshEngineLog(true)">自动跟随</label>
+        <button class="ghost" onclick="openLogDir()">打开文件夹</button>
+      </div>
+      <pre id="engineLog" style="margin:0;max-height:420px;overflow:auto;white-space:pre-wrap;
+        word-break:break-all;font-size:12px;line-height:1.6;background:#0f1113;border:1px solid #2a2e33;
+        border-radius:8px;padding:8px 10px;color:#c5cacd">加载中…</pre>
+    </div>
   </div>
 </div>
 
@@ -393,7 +432,7 @@ function fmtSize(n){
 let curTab = 'overview';
 const TAB_REFRESH = {
   login:   ()=>{ refreshNap(); refreshBungie(); },
-  jobs:    ()=>{ refreshJobs(); refreshLogs(true); },
+  jobs:    ()=>{ refreshJobs(); refreshLogs(true); refreshEngineLog(true); },
   groups:  ()=>{ refreshGroups(); refreshBindings(); },
   data:    ()=>{ refreshUsage(); refreshCaches(true); },
   settings:()=>{ refreshStats(); loadCaps(); loadRecent(); loadGrid(); loadConc(); loadPar(); },
@@ -692,6 +731,34 @@ async function clearLogs(){
   if(!confirm('清空当前日志？')) return;
   await fetch('/api/bot/logs/clear', {method:'POST'});
   refreshLogs();
+}
+
+/* ---------- 运行日志（引擎日志 exe_stdout.log，跨重启连续） ---------- */
+async function refreshEngineLog(follow){
+  const box = document.getElementById('engineLog');
+  if(!box) return;
+  let r = null;
+  try{
+    r = await (await fetch('/api/bot/engine_log?tail=200')).json();
+  }catch(e){
+    box.textContent = '读不到日志：' + e;   // 面板里就地说明，别弹 alert（轮询会反复弹）
+    return;
+  }
+  if(!r.exists){
+    box.textContent = '读不到日志：' + (r.path || '') + '（文件不存在或没有读取权限）';
+    return;
+  }
+  const meta = document.getElementById('engLogMeta');
+  if(meta) meta.textContent = fmtSize(r.size) + ' · 最后写入 ' +
+    new Date((r.mtime || 0) * 1000).toLocaleString();
+  box.textContent = (r.lines || []).join('\\n');   // 双反斜杠：PANEL 是普通字符串，单写会变成 JS 源码里的真换行
+  if(follow) box.scrollTop = box.scrollHeight;   // 自动跟随：滚到最新的一行
+}
+async function openLogDir(){
+  let r = {};
+  try{ r = await (await fetch('/api/bot/open_log_dir', {method:'POST'})).json(); }
+  catch(e){ r = {ok:false, msg:String(e)}; }
+  if(!r.ok) alert('打不开文件夹：' + (r.msg || '未知原因'));
 }
 
 /* ---------- 后台任务 ---------- */
@@ -1038,6 +1105,9 @@ refreshBungie(); setInterval(refreshBungie, 10000);
 setInterval(refreshJobs, 2000);  refreshJobs();
 // 消息日志也走轮询（只在「任务与日志」页可见时拉）：不用再切标签页才看到新消息
 setInterval(()=>{ if(curTab==='jobs' && !document.hidden) refreshLogs(); }, 2500);
+// 引擎日志：同页且勾了「自动跟随」才拉（5s）；切到该页时 TAB_REFRESH 里总会先拉一次
+setInterval(()=>{ const f = document.getElementById('engLogFollow');
+  if(curTab==='jobs' && !document.hidden && f && f.checked) refreshEngineLog(true); }, 5000);
 refreshBindings(); setInterval(refreshBindings, 10000);
 refreshUsage();  setInterval(refreshUsage, 3000);
 setInterval(refreshStats, 2000);
@@ -1138,6 +1208,43 @@ async def bot_bindings():
 async def bot_logs_clear():
     bot_log.clear()
     return {"ok": True}
+
+
+@app.get("/api/bot/engine_log")
+async def bot_engine_log(tail: int = 200):
+    """引擎日志尾部（exe_stdout.log）：面板上直接看，跨重启连续"""
+    # 必须用 d2._writable_path：写日志的 launcher 按「打包后 exe 同目录 / 源码运行项目目录」
+    # 定位文件，这里换个口径就会指向另一个文件、永远读不到内容
+    path = d2._writable_path("exe_stdout.log")
+    tail = max(1, min(2000, tail))       # 前端传多少都别让它拉超过 2000 行
+    out = {"path": path, "exists": False, "size": 0, "lines": [], "mtime": 0.0}
+    try:
+        size = os.path.getsize(path)
+        mtime = os.path.getmtime(path)
+        # 日志会涨到 MB 级，别整份读：只回读末尾 128KB，再从里面切最后 tail 行
+        with open(path, encoding="utf-8", errors="replace") as f:
+            if size > 128 * 1024:
+                f.seek(size - 128 * 1024)
+            lines = f.read().splitlines()
+        out.update(exists=True, size=int(size), mtime=float(mtime), lines=lines[-tail:])
+    except FileNotFoundError:
+        pass   # 还没写过日志（首次运行）：exists=False 就够了，别打日志刷屏
+    except Exception as exc:  # noqa: BLE001 被占用/没权限都只回 exists=False，不抛 500
+        print(f"[面板] 读引擎日志失败：{type(exc).__name__}: {exc}", flush=True)
+    return out
+
+
+@app.post("/api/bot/open_log_dir")
+def open_log_dir():
+    """打开引擎日志所在文件夹（Windows 资源管理器），排查任务失败时用"""
+    d = os.path.dirname(d2._writable_path("exe_stdout.log"))
+    if not os.path.isdir(d):
+        return {"ok": False, "msg": "日志所在文件夹不存在"}
+    try:
+        os.startfile(d)                        # noqa: S606 本机面板功能，路径写死
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "msg": f"{type(exc).__name__}: {exc}", "dir": d}
+    return {"ok": True, "msg": d, "dir": d}
 
 
 # ---------- 发送失败的图片：预览 / 重发 / 打开文件夹 ----------
@@ -2197,7 +2304,19 @@ async def rotation_page(force: int = 0):
         return err_page("本周轮换获取失败",
                         "读取 Bungie 里程碑接口失败，稍后刷新重试。<br>"
                         f"<span style='color:#9aa0a6'>{d2.esc_err(exc)}</span>")
-    return card_page(bot_cards.rotation_card(rot), "/rotation")
+    # 宗师 / 遗失区域与 QQ 卡片同一口径：第三方页各自独立容错，缺哪块就少哪块
+    # （复位后对方换页比 Bungie 晚时 destiny_data 抛 DataSuspiciousError，
+    #  这里照实显示「没抓到 + 原因」，别把上一轮的宗师当本周摆在面板上）
+    gm = ls = None
+    try:
+        gm = await d2.gm_this_week()
+    except Exception as exc:  # noqa: BLE001
+        gm = {"ok": False, "why": str(exc)}
+    try:
+        ls = await d2.lost_sectors_today()
+    except Exception as exc:  # noqa: BLE001
+        ls = {"ok": False, "why": str(exc)}
+    return card_page(bot_cards.rotation_card(rot, d2.distortion_now(), ls, gm), "/rotation")
 
 
 _ARMOR_CATS = ("目的地", "先锋行动", "熔炉竞技场行动", "智谋行动", "突袭", "地牢", "活动")
@@ -2285,7 +2404,10 @@ async def bungie_trust_cert():
     try:
         proc = await asyncio.create_subprocess_exec(
             "certutil", "-user", "-addstore", "Root", cert,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            # 本 exe 是 windowed 子系统（D2Query.spec console=False），没这个标志
+            # certutil 会自己新开一个控制台——闪一下黑窗
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out, _ = await proc.communicate()
         text = out.decode("gbk", "replace")
         if proc.returncode == 0:
@@ -2811,12 +2933,24 @@ def render_wpvp(rep: dict) -> str:
     cap_v = rep.get("cap") or rep["matches"]
     note = (f"（已达逐场统计上限 {cap_v:,} 场，可在「运行状态」页调整或设为无限制）"
             if rep.get("capped") else "")
-    note += f" · {rep['missed']} 场详情未取到" if rep.get("missed") else ""
+    # 明细缺口分两种：missed 已进自动补读队列（等一会就有），gone 是官方档案里真没了（重试无效）
+    note += f" · {rep['missed']} 场详情未取到（已排队自动补读）" if rep.get("missed") else ""
+    if rep.get("gone"):
+        note += f" · {rep['gone']} 场官方已无明细（重试无效）"
     if rep.get("cached"):  # 命中汇总缓存：说明这次只补拉了多少新对局
         note += f" · 缓存复用，本次只补 {rep.get('added', 0)} 场"
+    # 缺口占比过大时（数据层判的 incomplete）在数字前面先说明，别让用户以为这就是真实生涯数据。
+    # covered 老缓存里没有：缺失时宁可不说，也不能拿 0 冒充覆盖数（matches 同理）
+    warn = ""
+    if rep.get("incomplete") and rep.get("covered") is not None:
+        warn = (f"<div class='wpwarn'>⚠ 本卡只统计了 {rep.get('covered') or 0:,} / "
+                f"{rep.get('matches') or 0:,} 场有明细的对局"
+                f"（{rep.get('missed') or 0:,} 场明细未取到，正在自动补读），"
+                f"下面的数字会偏小；补完后重发一次本指令就是准的</div>")
     body = (f"<h1>{rep['display']}</h1>"
             f"<div class='sub'>{mode_label} 生涯武器 · <b class='sl'>{esc(rep.get('scope_label') or '全生涯')}</b> "
             f"{rep['matches']:,} 场对局{span} · {len(rep['weapons'])} 种武器{note}</div>"
+            f"{warn}"
             f"<div class='chips'>{chips}</div>"
             f"<div class='whead'><span></span><span></span><span>武器</span>"
             f"<span style='text-align:left'>击杀</span>"
@@ -2838,6 +2972,8 @@ def render_wpvp(rep: dict) -> str:
             f".chip .csub{{color:#9aa0a6;font-size:11px}}"
             f".chip.acc{{border-color:rgba(212,178,106,.45)}}"
             f".chip.acc b{{color:#d4b26a}}"
+            f".wpwarn{{border:1px solid #d4b26a;background:#16181b;color:#d4b26a;"
+            f"border-radius:8px;padding:7px 10px;margin-bottom:12px;font-size:12px;line-height:1.6}}"
             f".whead{{display:grid;grid-template-columns:34px 40px minmax(0,1fr) 130px 38px 38px 44px 42px 44px;"
             f"gap:5px;align-items:center;color:#9aa0a6;font-size:11px;padding:0 8px 6px;"
             f"border-bottom:1px solid #2a2e33}}"

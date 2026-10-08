@@ -1462,9 +1462,14 @@ def _gm_block(gm: dict) -> str:
     """当前宗师板块：横图大卡（pgcr 图 + 中文名 + 目的地），取不到时出一行缺省提示。"""
     if not gm:
         return ""
+    # stale=True 表示「重取几次数据源仍自称没换轮」——照出卡但警告写在脸上
+    # （destiny_data._FreshGuard 的口径），别让上一周的宗师冒充本周
+    note = " · <em class='warn'>⚠ 数据源还没换轮，可能仍是上一轮</em>" if gm.get("stale") else ""
     if not gm.get("ok"):
-        return "<div class='evhead'>当前宗师<span>每周三凌晨 1 点换</span></div>" \
-               "<div class='ls-empty'>本次没抓到宗师数据，稍后再试。</div>"
+        why = gm.get("why") or ""
+        return (f"<div class='evhead'>当前宗师<span>每周三凌晨 1 点换{note}</span></div>"
+                "<div class='ls-empty'>本次没抓到宗师数据，稍后再试。"
+                + (f"<br>{esc(why)}" if why else "") + "</div>")
     shot = gm.get("pgcr") or ""
     if not shot and gm.get("hash"):
         rec = d2.activity_name(gm["hash"])
@@ -1481,7 +1486,7 @@ def _gm_block(gm: dict) -> str:
         wline = ("<div class='gmw'>" + ico +
                  f"<span>首通掉落 · <b>{nm}</b>" + (f"（{ty}）" if ty else "") +
                  "</span></div>")
-    return ("<div class='evhead'>当前宗师<span>宗师征服 · 每周三凌晨 1 点换</span></div>"
+    return (f"<div class='evhead'>当前宗师<span>宗师征服 · 每周三凌晨 1 点换{note}</span></div>"
             "<div class='evhero one'>"
             "<div class='evbig'" + style + ">"
             "<div class='scrim'></div>"
@@ -1495,9 +1500,12 @@ def _ls_block(ls: dict) -> str:
     """今日遗失区域板块：9 个目的地各 1 个，3×3 网格（rotdist 同款风格）。"""
     if not ls:
         return ""
+    note = " · <em class='warn'>⚠ 数据源还没换天，可能仍是昨天</em>" if ls.get("stale") else ""
     if not ls.get("ok") or not (ls.get("sectors") or []):
-        return "<div class='evhead'>今日遗失区域<span>每天凌晨 1 点换</span></div>" \
-               "<div class='ls-empty'>本次没抓到遗失区域数据，稍后再试。</div>"
+        why = ls.get("why") or ""
+        return (f"<div class='evhead'>今日遗失区域<span>每天凌晨 1 点换{note}</span></div>"
+                "<div class='ls-empty'>本次没抓到遗失区域数据，稍后再试。"
+                + (f"<br>{esc(why)}" if why else "") + "</div>")
     cells = ""
     for s in ls["sectors"]:
         mod = ""
@@ -1515,7 +1523,7 @@ def _ls_block(ls: dict) -> str:
                      if reward else "")
                   + "</div>")
     return ("<div class='evhead'>今日遗失区域"
-            "<span>9 个目的地各 1 个 · 每天凌晨 1 点换</span></div>"
+            f"<span>9 个目的地各 1 个 · 每天凌晨 1 点换{note}</span></div>"
             f"<div class='ls-grid'>{cells}</div>")
 
 

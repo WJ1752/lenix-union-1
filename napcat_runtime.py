@@ -29,6 +29,12 @@ NAPCAT_DIR = next((c for c in _CANDIDATES
 LOG_FILE = os.path.join(NAPCAT_DIR, "napcat.log")
 WEBUI_PORT = 6099
 
+# 本程序打包成 windowed exe（D2Query.spec console=False）后自身没有控制台，
+# 任何未带 CREATE_NO_WINDOW 的控制台子进程（netstat/tasklist/taskkill/wmic）都会让
+# Windows 给**子进程**新分配一个黑窗——看门狗每 60 秒跑一次 netstat，就成了每分钟
+# 闪一下 cmd 窗口。这里所有控制台 child 一律带上该标志，一个都不许漏。
+_NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _proc: subprocess.Popen | None = None
 _lock = threading.Lock()
 _qq = ""  # 扫码登录成功后记录的 QQ 号
@@ -60,7 +66,7 @@ def _find_qq() -> str:
     try:
         out = subprocess.check_output(
             ["wmic", "process", "where", "name='QQ.exe'", "get", "ExecutablePath"],
-            text=True, errors="replace", timeout=10)
+            text=True, errors="replace", timeout=10, creationflags=_NO_WIN)
         for line in out.splitlines():
             line = line.strip()
             if line.lower().endswith("qq.exe"):
@@ -79,7 +85,7 @@ def _tree_kill(pid: int) -> bool:
     只 kill 主进程会留下僵尸 QQ 继续占着 WebUI 端口"""
     try:
         r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15, creationflags=_NO_WIN)
         return r.returncode == 0
     except Exception:  # noqa: BLE001
         return False
@@ -91,7 +97,7 @@ def _kill_webui_holder() -> bool:
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
                              capture_output=True, text=True, errors="replace",
-                             timeout=15).stdout
+                             timeout=15, creationflags=_NO_WIN).stdout
     except Exception:  # noqa: BLE001
         return False
     pids = set()
@@ -104,7 +110,7 @@ def _kill_webui_holder() -> bool:
         try:
             q = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                                capture_output=True, text=True, errors="replace",
-                               timeout=15).stdout
+                               timeout=15, creationflags=_NO_WIN).stdout
         except Exception:  # noqa: BLE001
             continue
         name = q.split(",")[0].strip('"').strip() if q else ""
@@ -206,7 +212,7 @@ def _kill_orphan_boot() -> bool:
         out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq NapCatWinBootMain.exe",
                               "/FO", "CSV", "/NH"],
                              capture_output=True, text=True, errors="replace",
-                             timeout=15).stdout
+                             timeout=15, creationflags=_NO_WIN).stdout
     except Exception:  # noqa: BLE001
         return False
     killed = False
@@ -653,7 +659,8 @@ def onebot_connected() -> bool:
     """8901 端口上有没有已建立的 OneBot 反向 WS（有 = 协议端正连本程序报事件）"""
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
-                             text=True, errors="replace", timeout=15).stdout
+                             text=True, errors="replace", timeout=15,
+                             creationflags=_NO_WIN).stdout
     except Exception:  # noqa: BLE001  查不出来就当正常，别乱动手
         return True
     return any(p[3] == "ESTABLISHED" and p[1].endswith(f":{ONEBOT_PORT}")

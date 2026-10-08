@@ -124,6 +124,23 @@ async def _xur_safe():
         pass
 
 
+# 「数据源还没换轮」时的推迟上限：一个 tick 30 分钟，4 次≈2 小时。到上限就照推
+# （宁可缺一块，也不能让本周的推送被无限推迟——第三方页真挂了也得把其余板块送到）
+_PUSH_DEFER: dict = {"key": "", "n": 0}
+PUSH_DEFER_MAX = 4
+
+
+def _push_defer() -> bool:
+    """本周期还能不能再推迟一轮推送：True=推迟，False=到上限了，照推。"""
+    key = rotation_week_key()
+    if _PUSH_DEFER["key"] != key:
+        _PUSH_DEFER["key"], _PUSH_DEFER["n"] = key, 0
+    if _PUSH_DEFER["n"] >= PUSH_DEFER_MAX:
+        return False
+    _PUSH_DEFER["n"] += 1
+    return True
+
+
 async def _push_rotation() -> bool:
     """渲染本周轮换卡并推给 enabled_groups；成功推送（或确定无事可做）返回 True。"""
     import bot_cards
@@ -140,12 +157,26 @@ async def _push_rotation() -> bool:
         dist = await d2.distortion_now()
     except Exception as exc:  # noqa: BLE001  附属板块缺了不挡主卡
         print(f"[sched] 轮换推送：扭曲星球板块缺省 {type(exc).__name__}")
+    # 宗师 / 遗失区域是第三方页：复位后对方常晚十几分钟才换页。这时 destiny_data
+    # 会抛 DataSuspiciousError（不落盘、熔断 5 分钟）。**整轮推迟**而不是缺省推送：
+    # 推送一周只有一次，缺了宗师这一块，群里整周都看不到（2026-10-07 就是拿上一周的
+    # 宗师推出去了，用户当场看出来）。推迟有上限——见 _push_defer。
     try:
         ls = await d2.lost_sectors_today()
+    except d2.DataSuspiciousError as exc:
+        if _push_defer():
+            print(f"[sched] 轮换推送推迟（遗失区域数据源还没换天）：{exc}")
+            return False
+        print(f"[sched] 遗失区域数据源仍没换天（已推迟到上限），本轮按缺省推送：{exc}")
     except Exception as exc:  # noqa: BLE001
         print(f"[sched] 轮换推送：遗失区域板块缺省 {type(exc).__name__}")
     try:
         gm = await d2.gm_this_week()
+    except d2.DataSuspiciousError as exc:
+        if _push_defer():
+            print(f"[sched] 轮换推送推迟（宗师数据源还没换轮）：{exc}")
+            return False
+        print(f"[sched] 宗师数据源仍没换轮（已推迟到上限），本轮按缺省推送：{exc}")
     except Exception as exc:  # noqa: BLE001
         print(f"[sched] 轮换推送：宗师板块缺省 {type(exc).__name__}")
     html = bot_cards.rotation_card(rot, dist, ls, gm)

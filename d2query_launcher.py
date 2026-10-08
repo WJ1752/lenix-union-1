@@ -2,21 +2,117 @@
 - 窗口内直接使用查询站（不再弹 cmd/浏览器）
 - QQ bot 后台线程随程序启动，NapCat 反向WS接入后在"Bot面板"里管理群聊
 """
+import atexit
+import os
 import socket
 import sys
 import threading
 import time
 
+_LOG_LIMIT = 8 * 1024 * 1024            # 单个日志文件的上限，超过就轮转
+_SESSION_BEGIN = "===== 会话开始"
+_SESSION_END = "===== 会话正常结束"
+
+
+def _read_tail(path, lines=15, max_bytes=65536):
+    """取日志末尾若干行，用来回答「上次跑到哪断的」。
+    从尾部 seek 读而不是整份读：日志随运行时长一直涨，整份读进内存是白吃。"""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - max_bytes)
+            fh.seek(start)
+            rows = fh.read().splitlines()
+        if start > 0 and rows:
+            rows = rows[1:]              # 开头那行多半是被字节窗口截断的半行，留着只会误导诊断
+        return [r.decode("utf-8", "replace") for r in rows[-lines:]]
+    except OSError:
+        return []                        # 文件不存在/读不到：当没有历史
+
+
+def _rotate(path, limit=_LOG_LIMIT, keep=2):
+    """日志超过 limit 才轮转：exe_stdout.log → exe_stdout.1.log（旧的 .1 → .2 …），
+    只留 keep 份。轮转而不是清空，是为了重启后还能从备份里翻更早的输出。"""
+    try:
+        if os.path.getsize(path) <= limit:
+            return
+
+        base, ext = os.path.splitext(path)
+
+        def numbered(n):
+            return f"{base}.{n}{ext}"
+
+        oldest = numbered(keep)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(keep - 1, 0, -1):
+            if os.path.exists(numbered(i)):
+                os.replace(numbered(i), numbered(i + 1))
+        os.replace(path, numbered(1))
+    except OSError:
+        pass                             # 轮转失败只是损失旧日志，不能拦住启动
+
+
+def _ended_normally(tail):
+    """判断上一次会话是不是带着结束标记正常收的尾：标记必须是尾部最后一行非空内容。
+    不能在尾部里简单「找标记有没有出现过」——崩溃的那次会把更早会话的尾部连同它的
+    结束标记原样回放进日志，出现过≠这次写的，那样会把崩溃误报成正常退出。"""
+    for line in reversed(tail):
+        if line.strip():
+            return line.startswith(_SESSION_END)
+    return False
+
+
+def _write_exit_mark(stream):
+    """atexit 收尾：写下正常退出标记，下次启动才能分辨上次是收工还是被强杀。
+    写失败要静默——退出阶段再抛异常只会刷一屏没人会看的 traceback。"""
+    try:
+        stream.write(f"{_SESSION_END} {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+        stream.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _open_log_stream(path):
+    """以追加模式打开运行日志，并写清会话边界（分隔行 + 回放上次尾部 + 强杀提示）。
+    顺序要紧：先读旧文件尾部再轮转——轮转之后 path 已经是新文件，读不到上次的断点了。
+    任何异常都退到 devnull：日志功能再出岔子也不能拦住启动。"""
+    stream = None
+    try:
+        previous = _read_tail(path)
+        _rotate(path)
+        stream = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        stream.write(f"{_SESSION_BEGIN} {stamp}（pid {os.getpid()}）=====\n\n")
+        if previous:
+            stream.write(f"----- 上次会话最后 {len(previous)} 行（诊断断点用）-----\n")
+            for line in previous:
+                stream.write(line + "\n")
+            if not _ended_normally(previous):
+                stream.write("[日志] 上次会话未正常结束（没写正常退出标记，"
+                             "多半是被强杀/崩溃），上面就是它的最后输出\n")
+            # 回放块的收尾线不能省：旧尾部很可能以更早会话的结束标记结尾，
+            # 有这一行挡着，_ended_normally 才不会把它当成这次会话的标记
+            stream.write("----- 上次会话回放结束 -----\n\n")
+        atexit.register(_write_exit_mark, stream)
+        return stream
+    except Exception:  # noqa: BLE001  连日志都开不了就静默跑
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        return open(os.devnull, "w", encoding="utf-8")
+
+
 # windowed exe（console=False）没有控制台，stdout/stderr 是 None，
 # loguru/uvicorn 往 None 写日志会直接崩——重定向到 exe 同目录的日志文件
 if sys.stdout is None or sys.stderr is None:
     try:
-        import os
-        _log = open(os.path.join(os.path.dirname(sys.executable), "exe_stdout.log"),
-                    "a", buffering=1, encoding="utf-8", errors="replace")
-        sys.stdout = sys.stderr = _log
+        _log = _open_log_stream(os.path.join(os.path.dirname(sys.executable), "exe_stdout.log"))
     except Exception:  # noqa: BLE001  连日志都开不了就静默跑
-        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        _log = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stderr = _log
 
 import uvicorn
 import webview

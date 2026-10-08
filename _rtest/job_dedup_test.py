@@ -48,7 +48,9 @@ def reset():
     d2._JOB_TASK.clear()
     # 这些用例只看「建了几条任务」，工厂函数一律不真跑：真跑会去打 Bungie 接口，
     # 结果回来时用例早翻页了，反而把后面几条的状态搅乱
-    d2._enqueue_job = lambda jid, factory: d2.JOBS.setdefault(jid, {}).update(_factory=factory)
+    # 第三个参数是「续跑描述」（2026-10-08 起有），桩要跟着收；测试不关心它
+    d2._enqueue_job = (lambda jid, factory, desc=None:
+                       d2.JOBS.setdefault(jid, {}).update(_factory=factory))
 
 
 def finish(jid, status="done"):

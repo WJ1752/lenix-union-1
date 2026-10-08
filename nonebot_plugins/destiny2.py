@@ -1058,16 +1058,17 @@ async def _(event: Event):
                       [f"Bungie 里程碑接口暂时不可用：{_exc_msg(exc)}"],
                       kind="err", fallback=f"本周轮换获取失败：{_exc_msg(exc)}")
     # 宗师 / 遗失区域是第三方页抓取，各自独立容错：单边失败不拖垮整卡
-    # （失败在 destiny_data 的 ✘ 日志里可见，卡片里会显示「没抓到」缺省行）
+    # （失败在 destiny_data 的 ✘ 日志里可见，卡片里会显示「没抓到」缺省行；
+    #  乘上 why 让缺省行写明原因——复位后那十几分钟多半是「数据源还没换轮」）
     gm = ls = None
     try:
         gm = await d2.gm_this_week()
-    except Exception:  # noqa: BLE001
-        gm = {"ok": False}
+    except Exception as exc:  # noqa: BLE001
+        gm = {"ok": False, "why": _exc_msg(exc)}
     try:
         ls = await d2.lost_sectors_today()
-    except Exception:  # noqa: BLE001
-        ls = {"ok": False}
+    except Exception as exc:  # noqa: BLE001
+        ls = {"ok": False, "why": _exc_msg(exc)}
     await _send_card(rot_query, event, bot_cards.rotation_card(rot, d2.distortion_now(), ls, gm),
                      "本周轮换", "本周轮换数据获取失败")
 

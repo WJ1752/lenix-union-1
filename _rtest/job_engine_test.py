@@ -73,6 +73,21 @@ async def fake_contrib(instance, mid):
                          "kills": 1, "precision": 0}]}
 
 
+def stub_details(fake=None):
+    """把逐场明细的取数换成桩
+
+    明细阶段现在走 pgcr_detail 的三态口径（ok/gone/retry，见 destiny_data 里那段注释），
+    所以桩也按三态给：拿到明细 = ok，拿不到 = retry（会进补读名单，正是要测的行为）。
+    """
+    call = fake or fake_contrib
+
+    async def fake_detail(instance, mid):
+        c = await call(instance, mid)
+        return ("ok", c) if c else ("retry", None)
+
+    d2.pgcr_detail = fake_detail
+
+
 def match(day: str, instance: str) -> dict:
     return {"period": f"{day} 12:00", "mode": 5, "instance": instance}
 
@@ -354,6 +369,7 @@ async def case_agg_fold():
     d2._writable_path = lambda name: os.path.join(TMP, name)
     d2.activity_history = fake_history
     d2.pvp_match_contribution = fake_contrib
+    stub_details()
     d2.save_seen_players = lambda: None
     d2._save_pvp_cache = lambda: None
 
@@ -454,6 +470,7 @@ async def case_stale_head():
     d2._writable_path = lambda name: os.path.join(TMP, name)
     d2.activity_history = fake_history
     d2.pvp_match_contribution = fake_contrib
+    stub_details()
     d2.save_seen_players = lambda: None
     d2._save_pvp_cache = lambda: None
 

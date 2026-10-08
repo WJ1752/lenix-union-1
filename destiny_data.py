@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 import weakref
@@ -2228,7 +2229,9 @@ async def start_raid_report(name: str, mode: int, who: str = "") -> str | None:
         "name": f"{member['display']}#{fmt_code(member['code'])}", "result": None,
         "kind": "dungeon" if mode == 82 else "raid", "who": who or "网页",
         "ts": time.time(), "label": "地牢战绩" if mode == 82 else "突袭战绩"})
-    _enqueue_job(jid, lambda: _run_raid_job(jid, member, mode))
+    # 描述里存用户输入的原名：重启后续跑要用它重新解析会员（改名了也还能认）
+    _enqueue_job(jid, lambda: _run_raid_job(jid, member, mode),
+                 {"type": "raid", "name": name, "mode": mode, "key": key})
     return jid
 
 
@@ -2662,15 +2665,146 @@ async def _run_queued(jid: str, factory):
     finally:
         j["ended"] = time.time()  # 复用窗口与面板用时都从这个时刻算起
         j["paused"] = False
+        # 续跑名单：正常跑完 / 管理员中止就销账；维护中止和「明细还有缺口」留着，
+        # 下次启动或到点自动补读（_schedule_miss_retry）接着跑
+        keep = bool(j.get("_miss_pending") or j.get("_maint_abort")
+                    or (j.get("status") == "aborted" and bst.is_down()))
+        if not keep:
+            _clear_resume(jid)
         _JOB_RUNNING.discard(jid)
         _JOB_TASK.pop(jid, None)
         _pump_jobs()
 
 
-def _enqueue_job(jid: str, factory):
+def _enqueue_job(jid: str, factory, desc: dict | None = None):
     JOBS.setdefault(jid, {})["_factory"] = factory
+    _note_resume(jid, desc)
     _JOB_QUEUE.append((jid, factory))
     _pump_jobs()
+
+
+# ---------- 任务续跑：还没跑完的任务落盘，重开程序接着跑 ----------
+# 长任务（全生涯逐场 PGCR 动辄二三十分钟）最怕关窗口/被杀：内存里的队列与进度全没了，
+# 用户只能重发一次指令，前面拉到的几千场虽然进了明细缓存、任务本身却要从头走一遍。
+# 这里只存「怎么把这条任务重新发起来」的描述（谁、查谁、什么范围），启动时逐条重排；
+# 明细/汇总缓存都还在，所以续跑基本等于接着跑。
+_RESUME_FILE = "jobs_state.json"
+_RESUME_LOCK = threading.Lock()
+_JOB_RESUME: dict[str, dict] = {}      # jid → {"desc": {...}, "label": …, "who": …}
+_resumed_once = False
+
+
+def _resume_path() -> str:
+    return _writable_path(_RESUME_FILE)
+
+
+def _save_job_state() -> None:
+    """把待续跑的任务写盘（空表也写：正常跑完就自动清干净，启动时不必猜）"""
+    with _RESUME_LOCK:
+        data = [{"jid": jid, **dict(it)} for jid, it in _JOB_RESUME.items()]
+    try:
+        dump_json(_resume_path(), data, indent=1)
+    except Exception:  # noqa: BLE001 写不进去只是这次关掉后不能续跑
+        pass
+
+
+def _load_job_state() -> list:
+    try:
+        with open(_resume_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return [x for x in d if isinstance(x, dict) and isinstance(x.get("desc"), dict)]
+    except FileNotFoundError:
+        # 「从来没跑过」与「上次全都跑完了」都是这个情况，语义一样
+        return []
+    except Exception as exc:  # noqa: BLE001 文件损坏就当没有，别挡住启动
+        print(f"[任务] {_RESUME_FILE} 读取失败（按无待续任务处理）：{type(exc).__name__}: {exc}")
+        return []
+
+
+def _note_resume(jid: str, desc: dict | None) -> None:
+    """登记「这条任务要能续跑」；desc=None 表示不登记（快查询类不值得落盘）"""
+    if not desc:
+        return
+    j = JOBS.get(jid) or {}
+    _JOB_RESUME[jid] = {"desc": dict(desc), "label": j.get("label") or "任务",
+                        "who": j.get("who") or "网页", "ts": time.time()}
+    _save_job_state()
+
+
+def _clear_resume(jid: str) -> None:
+    if _JOB_RESUME.pop(jid, None) is not None:
+        _save_job_state()
+
+
+def _clear_resume_key(key: str) -> None:
+    """按去重键清（同一条任务可能换过 jid，或已被自动补读又跑了一遍）"""
+    hit = [j for j, it in _JOB_RESUME.items() if (it.get("desc") or {}).get("key") == key]
+    for j in hit:
+        _JOB_RESUME.pop(j, None)
+    if hit:
+        _save_job_state()
+
+
+def _weapon_args(kind: str) -> tuple:
+    """kind → (活动模式, 场次上限, 要跳过的玩法)，与各入口函数的口径保持一致"""
+    if kind == "pve":
+        return 7, match_cap("pve"), _PVE_SKIP_MODES
+    return 5, match_cap("pvp"), frozenset()
+
+
+async def _relaunch_desc(desc: dict, who: str = "", retry: bool = False) -> str | None:
+    """按描述重新发起一个同样的任务（启动续跑 / 明细自动补读都用它）
+
+    一律走各任务本来的入口函数：会员解析、去重键、缓存复用全都照旧，
+    所以续跑不会造出第二条同范围任务，也不会重拉已经有的明细。
+    """
+    t = str(desc.get("type") or "")
+    name = str(desc.get("name") or "")
+    if not name:
+        return None
+    if t == "weapon":
+        kind = str(desc.get("kind") or "pvp")
+        mode, cap, skip = _weapon_args(kind)
+        return await _start_weapon_job(name, str(desc.get("scope") or "all"), kind,
+                                       mode, cap, skip, who, retry=retry)
+    if t == "raid":
+        return await start_raid_report(name, int(desc.get("mode") or 0), who)
+    if t == "gm":
+        return await start_gm_report(name, str(desc.get("scope") or "current"), who)
+    if t == "heatmap":
+        return await start_heatmap(name, who)
+    return None
+
+
+async def resume_saved_jobs() -> list:
+    """启动时把上次没跑完的任务重新排进队列；返回续起来的任务标签
+
+    进程内只做一次（面板启动钩子调用）。续不起来的（改名/解绑后查不到）会把名单
+    清掉，免得每次启动都白试一遍。
+    """
+    global _resumed_once
+    if _resumed_once:
+        return []
+    _resumed_once = True
+    saved = _load_job_state()
+    if not saved:
+        return []
+    out: list = []
+    for it in saved:
+        desc = it.get("desc") or {}
+        label = it.get("label") or desc.get("type") or "任务"
+        try:
+            jid = await _relaunch_desc(desc, who=it.get("who") or "上次没跑完", retry=True)
+        except Exception as exc:  # noqa: BLE001 单条续不起来不影响其它
+            print(f"[任务] 续跑失败（{label}）：{type(exc).__name__}: {exc}", flush=True)
+            continue
+        if jid:
+            out.append(label)
+            print(f"[任务] {time.strftime('%H:%M:%S')} ↻ 续跑上次没跑完的任务：{label}", flush=True)
+    if not out:
+        _JOB_RESUME.clear()
+        _save_job_state()
+    return out
 
 
 def _flush_job_caches() -> None:
@@ -2730,7 +2864,7 @@ def abort_all_jobs(note: str) -> int:
     return n
 
 
-async def _job_checkpoint(jid: str) -> None:
+async def _job_checkpoint(jid: str, gate: bool = True) -> None:
     """任务循环里的检查点：被暂停就在这里停下，等管理员「继续」
 
     刻意用轮询而不是 asyncio.Event：任务可能跑在 webui 的事件循环上，而暂停来自
@@ -2738,14 +2872,70 @@ async def _job_checkpoint(jid: str) -> None:
 
     维护检查也放这里：长任务（翻几万场对局）每翻一页就有一次机会就地停下，
     不必等下一次请求才发现官方在维护、更不会拿维护期的空数据把卡片出完。
+
+    gate=False：跳过维护闸门（明细补读阶段专用）。那一批明细还没到手就不能算统计过，
+    所以维护时该做的是「等恢复」而不是退出——等待循环自己会检查暂停/中止。
     """
-    bst.guard_sync()
+    if gate:
+        bst.guard_sync()
     if not (JOBS.get(jid) or {}).get("paused"):
         return
     print(f"[任务] {time.strftime('%H:%M:%S')} ⏸ 暂停：{_job_label(jid)}", flush=True)
     while (JOBS.get(jid) or {}).get("paused"):
         await asyncio.sleep(0.5)  # 被中止时这里会抛 CancelledError，正好就地退出
     print(f"[任务] {time.strftime('%H:%M:%S')} ▶ 继续：{_job_label(jid)}", flush=True)
+
+
+async def _sleep_watch(jid: str, seconds: float) -> None:
+    """可被暂停/中止打断的小步等待（补读退避用）"""
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        await _job_checkpoint(jid, gate=False)
+        await asyncio.sleep(min(1.0, seconds - (time.time() - t0)))
+
+
+async def _wait_maint_clear(jid: str, probe=None, limit: "float | None" = None) -> bool:
+    """维护中就地等官方恢复；返回是否等到了（超过 limit 还没恢复就返回 False）
+
+    明细阶段不能用「中止了事」：那批对局一旦按失败收尾，要么被迫算进统计（数字偏小
+    却看不出来），要么进补读名单等下一轮——都不如在这儿等恢复、然后把这一批拉完。
+    等待期间面板照常显示状态与已等时长，管理员的中止/暂停也仍然有效。
+
+    probe：可选的「放行一个真实请求」回调（传一个待拉对局的取明细协程）。维护态下
+    每 60 秒放一个请求出去探路，它成功（ErrorCode==1）会触发 bst.note_ok 自动熄灯；
+    不放行的话，只有别的查询在打接口时才会恢复，长任务可能白等。
+    """
+    t0 = time.time()
+    last_probe = time.time()
+    limit = _MAINT_WAIT_MAX if limit is None else limit
+    keep_note = (JOBS.get(jid) or {}).get("note") or ""
+    first = True
+    while bst.is_down():
+        el = time.time() - t0
+        if el >= limit:
+            log_stage(f"{jid}#maint",
+                      f"{_job_label(jid)}：维护超过 {_hm(limit)} 仍未恢复，先收工落盘，"
+                      f"没拉到的场次进补读名单，下次自动续")
+            JOBS[jid]["note"] = keep_note
+            return False
+        if first:
+            log_stage(f"{jid}#maint",
+                      f"{_job_label(jid)}：Bungie 维护中，等官方恢复后接着拉明细"
+                      f"（已拉到的明细都在缓存里，不用重拉）")
+            first = False
+        JOBS[jid]["note"] = f"Bungie 维护中，等恢复后接着跑（已等 {_hm(el)}）"
+        await _job_checkpoint(jid, gate=False)   # 暂停/中止在这里响应
+        if probe and time.time() - last_probe >= 60:
+            last_probe = time.time()
+            try:
+                await probe()   # 成功即恢复（note_ok 会熄掉维护态），失败继续等
+            except Exception:  # noqa: BLE001 闸门拦下/网络错误都是「还没恢复」
+                pass
+        await asyncio.sleep(5)
+    if not first:
+        JOBS[jid]["note"] = keep_note
+        log_stage(f"{jid}#maint", f"{_job_label(jid)}：维护结束，继续拉明细")
+    return True
 
 
 def job_control(jid: str, action: str) -> dict:
@@ -2836,8 +3026,12 @@ _JOB_DEDUP: dict[str, str] = {}   # 去重键 → jid
 _JOB_REUSE_SEC = 120              # 已结束的任务在这个秒数内仍复用（刚出完图再来一次不重跑）
 
 
-def _reuse_job(key: str) -> str | None:
-    """同一键的任务在跑 / 刚结束 → 返回它的 jid；过期或已被清理则返回 None"""
+def _reuse_job(key: str, allow_done_within: float = _JOB_REUSE_SEC) -> str | None:
+    """同一键的任务在跑 / 刚结束（allow_done_within 秒内）→ 返回它的 jid；否则 None
+
+    allow_done_within=0 给「明细自动补读」用：刚结束的那份不能复用（它正是缺明细的
+    那一份），但**还在跑/排队的仍然复用**，免得同一个查询同时跑两份。
+    """
     jid = _JOB_DEDUP.get(key)
     if not jid:
         return None
@@ -2853,7 +3047,8 @@ def _reuse_job(key: str) -> str | None:
         # 「工厂函数已把 status 置成 done、收尾还没跑到」那一瞬（也正好是「刚跑完」那一下）。
         # 长任务取 ts 会算出更久的耗时 → 不复用 → 重跑，偏保守，不会把旧结果当新数据发出去。
         ended = j.get("ended") or j.get("ts") or 0
-        return jid if time.time() - ended <= _JOB_REUSE_SEC else None
+        if allow_done_within > 0 and time.time() - ended <= allow_done_within:
+            return jid
     return None
 
 
@@ -2892,6 +3087,18 @@ def job_reuse_window() -> int:
 # PVE 用的是同一份 PGCR 解析，所以 PVP/PVE 共用这个缓存和这个文件（内容完全一样）。
 _PVP_MATCH_CACHE: dict[str, dict] = {}
 _PVP_CACHE_MAX = 20000
+# PGCR/档案/角色「不存在」：官方口径就是查不到这场，重试没有意义（与 _NA_CODES 同源）
+_PGCR_GONE_CODES = frozenset({1653, 1601, 1620})
+# 逐场明细的补读策略：单遍失败不算判死。一轮里退避重试，仍未到手的写进补读名单，
+# 下次同范围查询（或自动补读）接着要，直到拿到、或官方确认没有、或超过次数上限。
+_PGCR_ROUNDS = 3            # 一轮内最多拉几遍（1 遍正常 + 2 遍补读）
+_PGCR_RETRY_WAIT = 8        # 第一遍补读前等几秒（之后翻倍）
+_PGCR_STORM_RATIO = 0.5     # 单遍失败率 ≥ 它 = 撞上限流风暴，多歇一会再补
+_PGCR_STORM_WAIT = 45
+_AGG_MISSING_MAX = 20000    # 补读名单上限（与场次上限同量级，多了也拉不动）
+_MISS_RETRY_MAX = 3         # 同一范围自动补读最多几轮（跑满还没齐就不再自动重试）
+_MISS_RETRY_DELAY = 180     # 自动补读的延迟秒数（避开任务级复用窗口）
+_MAINT_WAIT_MAX = 1800      # 明细阶段维护中最多等 30 分钟，超了就落盘收工等下次
 _PVP_CACHE_FILE = "pvp_weapon_cache.json"
 _pvp_cache_ready = False
 # PGCR 单发延迟约 2 秒（Bungie 服务端就慢），16 路并发 ≈ 10+ req/s，远低于 25/s 限流
@@ -3000,7 +3207,19 @@ def _load_pvp_cache():
         pass
 
 
-def _save_pvp_cache():
+def _save_pvp_cache(force: bool = False):
+    """逐场明细缓存落盘；**没读过盘就不写**
+
+    进程里那份 _PVP_MATCH_CACHE 在没加载时是空的，直接写下去等于把盘上几万场明细
+    整份抹掉。2026-10-08 真踩过：重启后第一个任务恰好走「没有新对局」的复用收尾
+    （它一次明细都不拉、也就从没读过盘），照样落盘，把 pvp_weapon_cache.json 从
+    2MB 清成只剩当次那两位玩家——此后每次重算都得重新拉满几千场 PGCR，也更容易
+    再撞上限流。要强制覆盖（迁移/清缓存）才传 force=True。
+    """
+    if not _pvp_cache_ready and not force:
+        print("[缓存] 逐场明细缓存本次没读过盘也没拉过明细，跳过落盘（避免清空磁盘上那份）",
+              flush=True)
+        return
     try:
         dump_json(_writable_path(_PVP_CACHE_FILE), _PVP_MATCH_CACHE, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重拉
@@ -3040,6 +3259,10 @@ def _load_agg_cache():
 
 
 def _save_agg_cache():
+    """汇总缓存落盘；同样「没读过盘就不写」（理由见 _save_pvp_cache）"""
+    if not _agg_cache_ready:
+        print("[缓存] 生涯汇总缓存本次没读过盘，跳过落盘（避免清空磁盘上那份）", flush=True)
+        return
     try:
         dump_json(_writable_path(_AGG_CACHE_FILE), _AGG_CACHE, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重算
@@ -3186,22 +3409,40 @@ def _basic(values: dict, key: str) -> int:
     return int((values.get(key) or {}).get("basic", {}).get("value", 0) or 0)
 
 
-async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
-    """单场对局里某玩家的武器/技能击杀明细（带缓存，供生涯武器任务复用）
+async def pgcr_detail(instance: str, mid: str) -> tuple[str, "dict | None"]:
+    """单场 PGCR 明细 + 「这次到底怎么了」的三态结局
 
-    取的是 PGCR 原始 extended 数据：武器区给精准击杀，entry 区给近战/手雷/大招/技能击杀
-    （get_pgcr 的裁剪版没有这些字段，所以这里单独拉一次并只留需要的部分）
+    "ok"    → 拿到明细（第二项是 dict）
+    "gone"  → 官方确实没有这场（PGCR 已不可查/档案角色不存在），重试无意义
+    "retry" → 这次没拿到（维护闸门拦下 / 限流 / 网络抖动 / 未知错误码），值得重试
+
+    为什么要分三态：几千场的生涯任务里，一次环境抖动（限流、维护、断流）会让整批
+    请求同时失败。以前它们和「官方没有数据」一起算作 missed、还照记「已统计」，
+    于是 2026-10-07 那轮 PVE 全生涯 9136 场里 8762 场被判死后永远不再重试，卡片
+    上的总数看着像真的、实际只统计了 374 场。分开记账之后：retry 的进补读名单、
+    gone 只计数（并在卡片上说明重试无效）。
     """
     hit = _PVP_MATCH_CACHE.get(instance, {}).get(mid)
     if hit is None:
         _load_pvp_cache()  # 首次调用时才读盘，避免 import 阶段做 IO
         hit = _PVP_MATCH_CACHE.get(instance, {}).get(mid)
     if hit is not None:
-        return hit
-    r = await client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance}/")
-    resp = json.loads(r.content.decode("utf-8-sig"))
-    if resp.get("ErrorCode") != 1:
-        return None  # 包括限流/已删除对局，交给调用方重试或跳过
+        return "ok", hit
+    try:
+        r = await client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance}/")
+    except bst.BungieMaintenanceError:
+        return "retry", None      # 维护闸门拦下的：这场没毛病，等官方恢复
+    except Exception:  # noqa: BLE001 超时/断流/连接被掐：值得重试
+        return "retry", None
+    try:
+        resp = json.loads(r.content.decode("utf-8-sig"))
+    except Exception:  # noqa: BLE001 非 JSON（维护页之类）：值得重试
+        return "retry", None
+    if not isinstance(resp, dict) or resp.get("ErrorCode") != 1:
+        code = int((resp or {}).get("ErrorCode") or 0) if isinstance(resp, dict) else 0
+        # 1653 = PGCR 不存在（Bungie 的口径就是「这场查不到」）：重试也白搭；
+        # 其余（限流 31/36/37、未知错误码）都算「这次没拿到」
+        return ("gone" if code in _PGCR_GONE_CODES else "retry"), None
     me = None
     for e in resp["Response"].get("entries", []):
         info = e.get("player", {}).get("destinyUserInfo", {})
@@ -3209,7 +3450,9 @@ async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
             me = e
             break
     if not me:
-        return None
+        # 玩家不在这一场的名单里（自定义对局/中途被移出等）：业务上就是取不到，
+        # 归 gone 而不是 retry——否则每轮补读都会再白跑一遍
+        return "gone", None
     ev = (me.get("extended") or {}).get("values") or {}
     weapons = []
     for w in (me.get("extended") or {}).get("weapons") or []:
@@ -3233,7 +3476,20 @@ async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
         for k in list(_PVP_MATCH_CACHE)[: _PVP_CACHE_MAX // 4]:
             _PVP_MATCH_CACHE.pop(k, None)
     _PVP_MATCH_CACHE.setdefault(instance, {})[mid] = out
-    return out
+    return "ok", out
+
+
+async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
+    """单场对局里某玩家的武器/技能击杀明细（带缓存，供生涯武器任务复用）
+
+    取的是 PGCR 原始 extended 数据：武器区给精准击杀，entry 区给近战/手雷/大招/技能击杀
+    （get_pgcr 的裁剪版没有这些字段，所以这里单独拉一次并只留需要的部分）
+
+    拿不到一律返回 None（老口径，给「失败就当没有」的调用点用）；要知道是「官方没有」
+    还是「这次没拿到」，用 pgcr_detail。
+    """
+    status, detail = await pgcr_detail(instance, mid)
+    return detail if status == "ok" else None
 
 
 async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
@@ -3284,8 +3540,12 @@ async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
 
 async def _start_weapon_job(name: str, scope: str, kind: str, mode: int,
                             cap: int, skip_modes: frozenset,
-                            who: str = "") -> str | None:
-    """生涯武器后台任务通用入口；kind: 'pvp' / 'pve'（只影响卡片标题与标签）"""
+                            who: str = "", retry: bool = False) -> str | None:
+    """生涯武器后台任务通用入口；kind: 'pvp' / 'pve'（只影响卡片标题与标签）
+
+    retry=True 给「明细自动补读」用：不复用刚结束的那一份（它正是缺明细的那份），
+    但仍在跑/排队的照旧复用（同一个查询不会同时跑两份）。
+    """
     member = await resolve_member(name)
     if not member:
         return None
@@ -3294,7 +3554,7 @@ async def _start_weapon_job(name: str, scope: str, kind: str, mode: int,
     # 去重键用解析后的时间窗而不是 scope 原文：'27' / 's27' / '赛季27' 是同一个窗口，
     # 不该因为写法不同就跑两遍
     key = f"{mtype}:{mid}:wp:{kind}:{since}:{until}"
-    hit = _reuse_job(key)
+    hit = _reuse_job(key, 0 if retry else _JOB_REUSE_SEC)
     if hit:  # 命中就不必再拉 profile 了，直接把人带去等已有任务
         _mark_reused(hit, who)
         return hit
@@ -3308,7 +3568,10 @@ async def _start_weapon_job(name: str, scope: str, kind: str, mode: int,
         "label": ("PVE 生涯武器" if kind == "pve" else "PVP 生涯武器") + f"（{label}）"})
     _enqueue_job(jid, lambda: _run_weapon_job(
         jid, mtype, mid, chars, since, until, scope or "all", label,
-        kind, mode, cap, skip_modes))
+        kind, mode, cap, skip_modes),
+        # 续跑用的描述（重启后按它把同一条任务重新发起来）：存的是用户输入的原名，
+        # 免得依赖解析结果（改名/绑定变动时原名仍能解析）
+        {"type": "weapon", "name": name, "scope": scope or "all", "kind": kind, "key": key})
     return jid
 
 
@@ -3414,6 +3677,115 @@ def _dedup_matches(matches: list[dict]) -> list[dict]:
     return out
 
 
+def _miss_pack(matches: list[dict]) -> list:
+    """补读名单的落盘格式：["instance@period", ...]（比嵌套 dict 省一半体积）"""
+    out = []
+    for m in matches:
+        if m.get("instance"):
+            out.append(f"{m['instance']}@{m.get('period') or ''}")
+    return out[:_AGG_MISSING_MAX]
+
+
+def _miss_unpack(items) -> list[dict]:
+    """补读名单 → 对局 dict（补读只需要 instance 与 period：跳过玩法的过滤早就过完了）"""
+    out = []
+    for s in items or []:
+        inst, _, period = str(s).partition("@")
+        if inst:
+            out.append({"instance": inst, "period": period, "mode": 0})
+    return out
+
+
+async def _pull_details(jid: str, mid: str, todo: list[dict], apply,
+                        new_ids: set, count_total: int) -> tuple:
+    """逐场拉取对局明细；返回 (仍没拿到明细的对局, 官方确认没有明细的场次数)
+
+    一轮之内退避补读：维护中先等官方恢复（明细没到手不能糊弄过去），限流/抖动按
+    8s→16s 退避，失败面很大（说明撞上限流风暴）就多歇 45s 再补。几轮下来还没到手的
+    交给调用方写进补读名单——下次同范围查询或自动补读接着要，不再一次判死。
+
+    apply(detail)：调用方给的累加函数（进汇总），所以补读轮不会重复计数。
+    进度条只按本轮新枚举的对局走（补读的是旧账，不该让进度虚高）。
+    """
+    total = len(todo)
+    pending = list(todo)
+    gone = 0
+    sem = _pgcr_sem()
+    lock = asyncio.Lock()
+    # 进度/补读状态借用 note 显示，但别把任务自己写的那条（"复用已缓存范围"/"本次整段重算"
+    # 之类，收尾时要出在卡片上）冲掉：进来先记下，走的时候还回去
+    keep_note = (JOBS.get(jid) or {}).get("note") or ""
+
+    async def fetch(m: dict) -> tuple:
+        nonlocal gone
+        await _job_checkpoint(jid, gate=False)   # 暂停/中止在这里响应；维护由外层等
+        async with sem:
+            status, detail = await pgcr_detail(m["instance"], mid)
+        if status == "ok":
+            async with lock:
+                apply(detail)
+        elif status == "gone":
+            async with lock:
+                gone += 1
+        if m["instance"] in new_ids:   # 只有本轮新对局推进度（补读旧账不动进度条）
+            async with lock:
+                JOBS[jid]["done"] = min(count_total, (JOBS[jid].get("done") or 0) + 1)
+            _job_log(jid)
+        return status, m
+
+    for attempt in range(1, _PGCR_ROUNDS + 1):
+        if not pending:
+            break
+        if attempt > 1:
+            wait = _PGCR_RETRY_WAIT * (2 ** (attempt - 2))
+            if len(pending) >= max(20, total * _PGCR_STORM_RATIO):
+                wait = max(wait, _PGCR_STORM_WAIT)
+            log_stage(f"{jid}#pgcr",
+                      f"{_job_label(jid)}：还有 {len(pending)}/{total} 场明细没到手，"
+                      f"{_sec_text(wait)} 后补读（第 {attempt}/{_PGCR_ROUNDS} 遍）")
+            JOBS[jid]["note"] = f"{len(pending)} 场明细补读中（第 {attempt}/{_PGCR_ROUNDS} 遍）"
+            await _sleep_watch(jid, wait)
+        if bst.is_down() and not await _wait_maint_clear(
+                jid, probe=lambda: pgcr_detail(pending[0]["instance"], mid)):
+            break   # 维护太久（超上限）：这一批进补读名单，落盘收工等下次
+        res = await asyncio.gather(*(fetch(m) for m in pending))
+        pending = [m for st, m in res if st != "ok" and st != "gone"]
+    JOBS[jid]["note"] = keep_note
+    return pending, gone
+
+
+_MISS_TIMERS: dict = {}   # jid → loop.call_later 句柄（同一个任务只排一次自动补读）
+
+
+def _schedule_miss_retry(jid: str, tries: int, missing_n: int,
+                         delay: float = _MISS_RETRY_DELAY) -> None:
+    """明细还有缺口 → 到点自动补读一次，不用等用户重发指令
+
+    走「重新排一个同参数任务」：明细缓存与汇总缓存全部复用，所以只补缺的那些场次。
+    到点若正好在维护，任务自己会等恢复（_wait_maint_clear）。
+    """
+    info = _JOB_RESUME.get(jid) or {}
+    desc = dict(info.get("desc") or {})
+    if not desc or jid in _MISS_TIMERS:
+        return
+    loop = _loop_or_none()
+    if loop is None:
+        return
+    JOBS[jid]["_miss_pending"] = True   # 收尾时别把续跑名单销掉（进程被关掉就靠它续）
+
+    def _fire():
+        _MISS_TIMERS.pop(jid, None)
+        try:
+            loop.create_task(_relaunch_desc(desc, who="自动补读", retry=True))
+        except Exception as exc:  # noqa: BLE001 排不上就等下次查询/启动时续
+            print(f"[任务] 明细自动补读起不来（{info.get('label') or ''}）：{exc}", flush=True)
+
+    _MISS_TIMERS[jid] = loop.call_later(delay, _fire)
+    print(f"[任务] {time.strftime('%H:%M:%S')} ⟳ {info.get('label') or '任务'}："
+          f"{missing_n} 场明细还没到手，{_sec_text(delay)} 后自动补读"
+          f"（第 {tries}/{_MISS_RETRY_MAX} 轮）", flush=True)
+
+
 async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                           since: str, until: str, scope: str, label: str,
                           kind: str, mode: int, cap: int, skip_modes: frozenset):
@@ -3449,9 +3821,21 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                                  "本次整段重算")
             base = None
             same_scope = False
+        # 缺明细但没记补读名单的老汇总同样不可信：2026-10-08 之前只记了个「缺多少场」
+        # 的数字，没记是哪几场，谁也没法把那些对局补回来（当日 Seren1ty 的 PVE 全生涯
+        # 9136 场里 8762 场就是这么被永久判死、卡片却照常出的）。整段重算一次即可拉齐，
+        # 逐场明细有 _PVP_MATCH_CACHE 兜底，重算的成本主要在重新翻一遍活动历史。
+        elif int(base.get("missed") or 0) and not base.get("missing"):
+            log_stage(f"{jid}#collect",
+                      f"{_job_label(jid)}：老汇总缺 {int(base.get('missed') or 0)} 场明细"
+                      f"（只记了数字、没记是哪几场，补不回来），本次整段重算")
+            JOBS[jid]["note"] = "老汇总有缺明细的场次且无法补读，本次重新统计"
+            base = None
+            same_scope = False
     agg: dict[str, dict] = {}
     tot = {"kills": 0, "precision": 0, "melee": 0, "grenade": 0, "super": 0, "ability": 0}
-    base_matches = base_missed = 0
+    base_matches = base_missed = base_gone = 0
+    base_missing: list = []
     base_oldest = base_newest_full = ""
     segs: list[dict] = []
     if same_scope:
@@ -3460,6 +3844,8 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
             tot[k] = int((base.get("tot") or {}).get(k, 0) or 0)
         base_matches = int(base.get("matches", 0) or 0)
         base_missed = int(base.get("missed", 0) or 0)
+        base_gone = int(base.get("gone", 0) or 0)
+        base_missing = list(base.get("missing") or [])   # 上次没拿到明细的：这次一并补读
         base_oldest = base.get("oldest", "") or ""
         base_newest_full = base.get("newest_full", "") or ""
         gaps = [(base_newest_full[:10] or since, until)]
@@ -3467,6 +3853,10 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         segs = _sub_agg_segments(mid, kind, since, until, skip=key)
         base_matches = _fold_segments(agg, tot, segs)
         base_missed = sum(int(s.get("missed") or 0) for s in segs)
+        # 折进来的段自己也可能有没拿到明细的场次（带 missing 名单），一并接手补读：
+        # 不接的话这些场次在本范围里会被当成「有明细」，缺口就永远补不上了
+        base_missing = [x for s in segs for x in (s.get("missing") or [])]
+        base_gone = sum(int(s.get("gone") or 0) for s in segs)
         olds = [s.get("oldest") or "" for s in segs if s.get("oldest")]
         news = [s.get("newest_full") or "" for s in segs if s.get("newest_full")]
         base_oldest = min(olds) if olds else ""
@@ -3508,46 +3898,37 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         matches = _dedup_matches(matches)
         if not matches:  # 没有新对局：有缓存就直接返回上次排名，否则返回空态
             log_stage(f"{jid}#collect", f"{_job_label(jid)}：没有新对局，直接出图")
+        carry = _miss_unpack(base_missing)          # 上次没拿到明细的：这次一并补读
+        todo = _dedup_matches(matches + carry)
+        new_ids = {m["instance"] for m in matches}
         JOBS[jid].update(total=max(1, len(matches)), done=0 if matches else 1)
         if matches:
             log_progress(jid, 0, len(matches), label=_job_label(jid), force=True,
                          extra="开始逐场拉取对局明细")
-        missed = 0
-        sem = _pgcr_sem()
-        lock = asyncio.Lock()
+        if carry:
+            log_stage(f"{jid}#pgcr",
+                      f"{_job_label(jid)}：另有 {len(carry)} 场是上次没拿到明细的，一并补读")
 
-        async def one(m: dict):
-            nonlocal missed
-            await _job_checkpoint(jid)   # 暂停就在新对局之前停下，已发出去的收完为止
-            async with sem:
-                try:
-                    c = await pvp_match_contribution(m["instance"], mid)
-                except Exception:  # noqa: BLE001 单场失败不打断整体统计
-                    c = None
-            if not c:
-                missed += 1
-                JOBS[jid]["done"] += 1
-                _job_log(jid)
-                return
-            async with lock:
-                for k in tot:
-                    tot[k] += c[k]
-                for w in c["weapons"]:
-                    if w["kills"] <= 0:
-                        continue
-                    a = agg.setdefault(w["hash"] or w["name"], {
-                        "name": w["name"], "icon": w["icon"], "type": w["type"],
-                        "kills": 0, "precision": 0, "matches": 0})
-                    a["kills"] += w["kills"]
-                    a["precision"] += w["precision"]
-                    a["matches"] += 1
-                JOBS[jid]["done"] += 1
-                _job_log(jid)
+        def _apply(c: dict) -> None:
+            """把一场明细累加进汇总（补读轮也走它，所以重试不会重复计数）"""
+            for k in tot:
+                tot[k] += c[k]
+            for w in c["weapons"]:
+                if w["kills"] <= 0:
+                    continue
+                a = agg.setdefault(w["hash"] or w["name"], {
+                    "name": w["name"], "icon": w["icon"], "type": w["type"],
+                    "kills": 0, "precision": 0, "matches": 0})
+                a["kills"] += w["kills"]
+                a["precision"] += w["precision"]
+                a["matches"] += 1
 
-        if matches:
-            await asyncio.gather(*(one(m) for m in matches))
+        # 逐场明细：一轮里退避补读，仍没到手的进补读名单（见 _pull_details）。
+        # 明细阶段绕过维护闸门（gate=False）：维护中该等恢复，而不是把这几千场判死。
+        still, gone_now = await _pull_details(
+            jid, mid, todo, _apply, new_ids, len(matches)) if todo else ([], 0)
         save_seen_players()
-        _save_pvp_cache()
+        _flush_job_caches()   # 只写读过的缓存（没读过盘的写了等于抹掉，见 _save_pvp_cache）
         weapons = sorted((v for v in agg.values() if v["kills"] > 0), key=lambda x: -x["kills"])
         total_matches = base_matches + len(matches)
         dates = [m["period"][:10] for m in matches]
@@ -3556,9 +3937,19 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         oldest = min(pool) if pool else ""
         newest_full = max([m["period"] for m in matches]
                           + ([base_newest_full] if base_newest_full else []), default="")
+        # 缺口三件套：仍然缺明细的（自动补读名单）、官方确认没有明细的（重试无效）、
+        # 真正进了统计的。卡片「对局总数」是枚举量，跟这三者不是一个口径，要分开说。
+        missing_n = len(still)
+        gone_all = base_gone + gone_now
+        covered = max(0, total_matches - missing_n - gone_all)
+        miss_tries = (int(base.get("miss_tries") or 0) + 1 if same_scope else 1) if missing_n else 0
         result = {
             "display": JOBS[jid]["name"], "scope": scope, "scope_label": label, "kind": kind,
-            "matches": total_matches, "missed": base_missed + missed,
+            "matches": total_matches, "missed": missing_n, "gone": gone_all,
+            "covered": covered, "carried": len(carry),
+            # 缺口占比大 → 卡片数字明显偏小，出图时要醒目提示（别让人以为是真值）
+            "incomplete": missing_n > max(50, total_matches * 0.05),
+            "auto_retry": bool(missing_n and miss_tries <= _MISS_RETRY_MAX),
             "capped": cap > 0 and total_matches >= cap, "cap": cap,
             "range": (oldest, newest),
             "added": len(matches), "cached": base_matches,
@@ -3573,12 +3964,24 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         _AGG_CACHE[key] = {
             "scope_since": since, "scope_until": until, "mid": mid, "kind": kind,
             "weapons": agg, "tot": tot, "matches": total_matches,
-            "missed": base_missed + missed, "oldest": oldest,
+            "missed": missing_n, "missing": _miss_pack(still), "gone": gone_all,
+            "miss_tries": miss_tries, "oldest": oldest,
             "newest": newest, "newest_full": newest_full,
             "cap": cap,   # 记下当时的场次上限：调大之后这份汇总的头就是假边界，要往前补
             "capped": cap > 0 and total_matches >= cap,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
         _save_agg_cache()
+        # 缺口自动补读：到点重排一次同参数任务（只补缺的场次）。跑满 _MISS_RETRY_MAX 轮
+        # 就不再自动试，但名单一直留在汇总缓存里——用户下次查询/点重跑会自动带上。
+        if missing_n:
+            if miss_tries <= _MISS_RETRY_MAX:
+                _schedule_miss_retry(jid, miss_tries, missing_n)
+            else:
+                log_stage(f"{jid}#pgcr",
+                          f"{_job_label(jid)}：{missing_n} 场明细自动补读 {_MISS_RETRY_MAX} 轮"
+                          f"仍未到手，暂停自动重试（名单留着，下次查询会再带上）")
+        else:
+            _clear_resume_key(key)   # 补齐了：销掉可能残留的续跑名单
     except Exception as exc:  # noqa: BLE001
         JOBS[jid].update(status="error", error=str(exc))
 
@@ -3670,7 +4073,8 @@ async def start_gm_report(name: str, scope: str = "current", who: str = "") -> s
         f"{member['display']}#{fmt_code(member['code'])}", "result": None,
         "kind": "gm", "who": who or "网页", "ts": time.time(),
         "label": f"宗师战绩（{label}）"})
-    _enqueue_job(jid, lambda: _run_gm_job(jid, mtype, mid, chars, since, until, label, profile))
+    _enqueue_job(jid, lambda: _run_gm_job(jid, mtype, mid, chars, since, until, label, profile),
+                 {"type": "gm", "name": name, "scope": scope or "current", "key": key})
     return jid
 
 
@@ -4146,7 +4550,8 @@ async def start_heatmap(name: str, who: str = "") -> str | None:
                                              newest_full=snap.get("newest_full") or ""))
         return jid
     _enqueue_job(jid, lambda: _run_heatmap(
-        jid, mtype, mid, chars, ckey, last_played, gate))
+        jid, mtype, mid, chars, ckey, last_played, gate),
+        {"type": "heatmap", "name": name, "key": dkey})
     return jid
 
 
@@ -5638,12 +6043,69 @@ def _rot_cache_path() -> str:
 #     （build_rotation_zh.py 生成：hash→zh / 目的地→zh / 奖励套装→zh）。
 #   · 宗师：lfcarry 周轮换页（固定 URL）声明本周 Grandmaster，英文副本名过同一份映射。
 # 各自按 天/周 缓存落盘（刷新点同商店：北京时间凌晨 1 点）；抓取失败回退当日缓存。
+#
+# 2026-10-09 用户报「宗师刷新错误、武器错误」——两个源都会**比 Bungie 复位晚一点**才换页：
+# 线上缓存实证：2026-10-07 01:02（复位后两分钟）抓到的还是上一周的
+# Exodus Crash / The Slammer，却按新周键（2026-W41）落了盘，于是整周都在说上周的宗师。
+# 对策见 _FreshGuard：页面必须**自称是本周**才收，收不了就报错让调度器下个 tick 重取。
 LS_CACHE_FILE = "lost_sector_cache.json"
 GM_CACHE_FILE = "gm_cache.json"
 _LS_CACHE_VER = 2     # v2：奖励套装名剥部位后缀（旧缓存里是单件名）
-_GM_CACHE_VER = 2     # v2：加本周挑战武器 weapon 字段（旧缓存没有）
+_GM_CACHE_VER = 3     # v3：加陈旧页识别（页面还是上一轮时不落盘）；v2 加过 weapon 字段
 _ROT_ZH: dict | None = None
 _WEB_CLIENTS: dict = {}
+
+
+class _FreshGuard:
+    """「数据源还没换轮」的短时熔断 + 每轮重试上限。
+
+    识别出抓到的还是上一轮时：不落盘、不返回（宁缺勿错），并记 5 分钟熔断——
+    面板/群里连点几次不至于把第三方站打穿（light.gg 连抓被封的前车之鉴），
+    调度器下个 tick（30 分钟）自然会重取。
+    每轮最多熔断 tries 次：万一哪天判据过于保守（对方改了措辞），顶多晚一小时，
+    不会把板块永久锁死——超过上限照收，但数据上带 stale/warn 让卡片写在脸上。
+    """
+
+    def __init__(self, wait: float = 300.0, tries: int = 2):
+        self.wait, self.tries = wait, tries
+        self.until, self.msg, self.key, self.n = 0.0, "", "", 0
+
+    def blocked(self) -> str:
+        """熔断中 → 返回上次的说明（调用方直接抛出），否则空串"""
+        return self.msg if time.time() < self.until else ""
+
+    def bump(self, key: str) -> int:
+        """记一次「疑似没换轮」；同一轮内累计，换轮重置。返回本轮第几次"""
+        if key != self.key:
+            self.key, self.n = key, 1
+        else:
+            self.n += 1
+        return self.n
+
+    def trip(self, msg: str) -> "DataSuspiciousError":
+        self.until, self.msg = time.time() + self.wait, msg
+        return DataSuspiciousError(msg)
+
+    def clear(self) -> None:
+        self.until, self.msg, self.key, self.n = 0.0, "", "", 0
+
+
+_GM_GUARD = _FreshGuard()
+_LS_GUARD = _FreshGuard()
+
+
+def _data_dir() -> str:
+    """落盘缓存所在目录：exe 跑时是 exe 同目录，源码跑时是仓库根"""
+    return (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+
+
+def _gm_cache_path() -> str:
+    return os.path.join(_data_dir(), GM_CACHE_FILE)
+
+
+def _ls_cache_path() -> str:
+    return os.path.join(_data_dir(), LS_CACHE_FILE)
 
 # d2lostsector.report 的目的地短名 → rotation_zh.json dest 表的键（manifest 用全称）
 _DEST_ALIAS = {"edz": "european dead zone", "moon": "the moon",
@@ -5673,6 +6135,46 @@ def _gm_week_key(ts: float | None = None) -> str:
     t -= datetime.timedelta(hours=1)
     mon = (t.weekday() - 2) % 7          # 周三=2，往回退到本周三
     return (t - datetime.timedelta(days=mon)).strftime("%G-W%V")
+
+
+def _gm_week_span(now: float | None = None) -> tuple[datetime.datetime, datetime.datetime]:
+    """本周宗师周界的 UTC 时刻 (起, 止)：起 = 周三 01:00 北京 = 周二 17:00 UTC。
+
+    用来核对 lfcarry 页自称的周界（页面写「stays up through Tuesday, October 13,
+    at 17:00 UTC」）——实测与官方里程碑的 endDate 逐秒一致，所以能当硬判据。
+    """
+    t = _ev_dt(now if now is not None else time.time())
+    days = (t.weekday() - 2) % 7
+    b = t.replace(hour=1, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days)
+    if t < b:
+        b -= datetime.timedelta(days=7)
+    a = b.astimezone(datetime.timezone.utc)
+    return a, a + datetime.timedelta(days=7)
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"), 1)}
+_MONTHS.update({m[:3]: i for m, i in list(_MONTHS.items())})   # 也认 Oct / Sept 这类缩写
+
+
+def _page_week_marks(text: str) -> set[tuple[int, int]]:
+    """页面里声明的「(月, 日)」界点——用来判断它写的还是不是本周。
+
+    实测两种句式都有：
+      「It stays up through Tuesday, October 13, at 17:00 UTC.」（宗师段）
+      「The week of October 6 to October 13, 2026, ends at Tuesday reset…」（总览段）
+    只比月日、不比时刻：同一个点在美国本地写成 10:00 PDT、在页面里写成 17:00 UTC，
+    月日是一样的；真跨月也只需月日就能分辨相邻两周。
+    """
+    out: set[tuple[int, int]] = set()
+    for m in re.finditer(r"(?:through|until|to)\s+(?:[A-Z][a-z]+day,\s*)?"
+                         r"([A-Z][a-z]{2,8})\.?\s+(\d{1,2})(?:,?\s*\d{4})?"
+                         r"(?:,?\s*(?:at\s+)?\d{1,2}:\d{2})?", text):
+        mo = _MONTHS.get(m.group(1).lower())
+        if mo:
+            out.add((mo, int(m.group(2))))
+    return out
 
 
 async def _web_get_text(url: str) -> str:
@@ -5705,6 +6207,16 @@ def _json_cache_save(base: str, name: str, ver: int, key: str, data):
                   {"ver": ver, "key": key, "at": time.time(), "data": data})
     except Exception:  # noqa: BLE001
         pass
+
+
+def _cache_record(path: str) -> dict:
+    """读回缓存文件整条记录（**不校验键**）：用来跟「上一轮抓到的值」比内容。
+    换天后新值会覆盖旧值，所以要在落盘之前读。"""
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _parse_ls_html(html: str) -> list[dict]:
@@ -5759,11 +6271,17 @@ def _parse_ls_html(html: str) -> list[dict]:
 
 @_traced("今日遗失区域")
 async def lost_sectors_today(force: bool = False) -> dict:
-    """当日各目的地遗失区域（每日缓存，北京时间凌晨 1 点换天）。"""
-    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-            else os.path.dirname(os.path.abspath(__file__)))
+    """当日各目的地遗失区域（每日缓存，北京时间凌晨 1 点换天）。
+
+    页面自己带一个日历日期（h1 上方「Oct 8, 2026」），但那个日期按谁的时区翻页说不准，
+    所以不解释它，只拿它跟**上一轮抓到的值**比：日期与 9 个区域都没变 = 页面还没换天，
+    这时不落盘（见 _FreshGuard），免得把昨天的区域当今天的缓存一整天。"""
+    base = _data_dir()
     day = _ev_day()
     if not force:
+        blocked = _LS_GUARD.blocked()
+        if blocked:
+            raise DataSuspiciousError(blocked)
         disk = _json_cache(base, LS_CACHE_FILE, _LS_CACHE_VER, day)
         if disk:
             return disk
@@ -5771,9 +6289,39 @@ async def lost_sectors_today(force: bool = False) -> dict:
     sectors = _parse_ls_html(html)
     if not sectors:
         raise RuntimeError("页面里解析不到遗失区域卡片")
-    data = {"ok": True, "day": day, "sectors": sectors}
+    label = _ls_page_label(html)
+    stale = ""
+    if not force:
+        pd = (_cache_record(_ls_cache_path()).get("data") or {})
+        same_lab = bool(label) and pd.get("label") == label
+        same_sec = [s.get("slug") for s in sectors] == \
+                   [s.get("slug") for s in (pd.get("sectors") or [])]
+        if pd and same_lab and same_sec:
+            stale = f"d2lostsector.report 的日期（{label}）与 9 个区域跟上一轮一模一样，页面还没换天"
+    if stale:
+        n = _LS_GUARD.bump(day)
+        if n <= _LS_GUARD.tries:
+            raise _LS_GUARD.trip(f"{stale}（第 {n}/{_LS_GUARD.tries} 次，稍后自动重取）")
+        print(f"[遗失区域] {stale}；已重取 {n} 次仍如此，本轮照收并标警告")
+    data = {"ok": True, "day": day, "label": label, "sectors": sectors,
+            "stale": bool(stale), "warn": stale}
     _json_cache_save(base, LS_CACHE_FILE, _LS_CACHE_VER, day, data)
     return data
+
+
+_LS_LABEL_RE = re.compile(r"([A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+\d{4})")
+
+
+def _ls_page_label(html: str) -> str:
+    """首页的日历日期（h1 上方、日历图标后面那个「Oct 8, 2026」）。
+
+    只当「跟上一轮比有没有变」的指纹，不解释时区；抓不到就返回空串（判据自动失效，
+    不会因为页面改版把板块锁死）。"""
+    i = html.find("#calendar3")
+    if i < 0:
+        return ""
+    m = _LS_LABEL_RE.search(html[i:i + 400])
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
 
 
 _WEP_EN_IDX: dict | None = None
@@ -5784,7 +6332,8 @@ def _weapon_by_en(en: str) -> dict:
 
     英文名→hash 倒排优先用 item_en.json（build_item_index.py 产出，会进 exe 包）；
     缺了退 raw_items_en_lite.json（65MB，只在开发机上有）。同名多个 hash
-    （原版/专家/异域任务卷）取第一个能对上武器索引的。"""
+    （原版/专家/异域任务卷）取第一个能对上武器索引的。带不带冠词都认：
+    页面写过「The Slammer」，也可能写「Outbreak Perfected」这种原生不带「The」的。"""
     global _WEP_EN_IDX
     if _WEP_EN_IDX is None:
         idx: dict[str, list] = {}
@@ -5800,23 +6349,77 @@ def _weapon_by_en(en: str) -> dict:
             except Exception:  # noqa: BLE001  没建过英文索引时武器列退化为英文原名
                 pass
         _WEP_EN_IDX = idx
-    for h in _WEP_EN_IDX.get((en or "").lower()) or []:
-        rec = _weapons.get(h)
-        if rec and rec.get("name"):
-            return {"zh": rec["name"], "type": rec.get("type") or "",
-                    "icon": rec.get("icon") or ""}
+    name = re.sub(r"\s+", " ", (en or "").strip())
+    keys = [name.lower()]
+    if name.lower().startswith("the "):
+        keys.append(name[4:].lower())
+    else:
+        keys.append("the " + name.lower())
+    for k in keys:
+        for h in _WEP_EN_IDX.get(k) or []:
+            rec = _weapons.get(h)
+            if rec and rec.get("name"):
+                return {"zh": rec["name"], "type": rec.get("type") or "",
+                        "icon": rec.get("icon") or ""}
     return {}
+
+
+def _gm_rec(name: str) -> dict:
+    """英文副本名 → rotation_zh.json 的 gm 记录：大小写与冠词都容错。
+
+    映射里「arms dealer」是占位图、「the arms dealer」才有真横图（build_rotation_zh.py
+    按页面原样收的键），所以两种都查一遍，优先给带真图的。"""
+    gm_map = _rot_zh().get("gm") or {}
+    low = re.sub(r"\s+", " ", (name or "").strip()).lower()
+    cands = [low, "the " + low, re.sub(r"^the\s+", "", low)]
+    recs = [gm_map.get(k) for k in cands]
+    recs = [r for r in recs if r]
+    for r in recs:                            # 优先真横图，别让 placeholder 顶掉真图
+        if r.get("pgcr") and "placeholder" not in r["pgcr"]:
+            return r
+    return recs[0] if recs else {}
+
+
+# manifest 里 Nessus 的「目的地」用的是内部区域名（阿卡狄亚谷），游戏内那条位置行写的是涅索斯
+_DEST_ZH_ALIAS = {"阿卡狄亚谷": "涅索斯"}
+
+
+async def _activity_dest_zh(h: str) -> str:
+    """活动 hash → 目的地中文名（官方单定义接口，免费不耗 OAuth，一周只打两次）。
+
+    页面现在不写目的地了（早先那句「It is the Nessus strike」在这版没了，2026-10-09 实测），
+    只能按 hash 反查：activity → destinationHash → 目的地名；lc=zh-chs 直接要中文，
+    免得再走一遍本地英文映射（Nessus 这类内部区域名映射表里是查不到的）。
+    """
+    if not h:
+        return ""
+    r = await client().get(f"/Platform/Destiny2/Manifest/DestinyActivityDefinition/{h}/")
+    dh = (r.json().get("Response") or {}).get("destinationHash")
+    if not dh:
+        return ""
+    r2 = await client().get(f"/Platform/Destiny2/Manifest/DestinyDestinationDefinition/{dh}/",
+                            params={"lc": "zh-chs"})
+    nm = (((r2.json().get("Response") or {}).get("displayProperties") or {}).get("name") or "").strip()
+    return _DEST_ZH_ALIAS.get(nm, nm)
 
 
 @_traced("当前宗师")
 async def gm_this_week(force: bool = False) -> dict:
     """本周宗师夜袭（每周缓存）。lfcarry 固定页声明本周 GM，映射成中文+横图。
 
-    同页还带本周挑战武器（GM 首通必掉的那把），一并解析映射成中文+图标。"""
-    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-            else os.path.dirname(os.path.abspath(__file__)))
+    同页还带本周挑战武器（GM 首通必掉的那把），一并解析映射成中文+图标。
+
+    **页面必须自称是本周才收**：页面会写「stays up through Tuesday, October 13, at
+    17:00 UTC」（或「The week of October 6 to October 13, 2026…」），跟我们的周界对不上
+    就说明数据源还没换轮——复位那一刻它常还是上一周的，收下就是整周都错（2026-10-07 实踩）。
+    对不上时报 DataSuspiciousError（不落盘、5 分钟熔断，调度器下个 tick 重取）。"""
+    base = _data_dir()
     wk = _gm_week_key()
+    _, wk_end = _gm_week_span()
     if not force:
+        blocked = _GM_GUARD.blocked()
+        if blocked:
+            raise DataSuspiciousError(blocked)
         disk = _json_cache(base, GM_CACHE_FILE, _GM_CACHE_VER, wk)
         if disk:
             return disk
@@ -5825,13 +6428,12 @@ async def gm_this_week(force: bool = False) -> dict:
     text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.S)
     text = _html.unescape(re.sub(r"<[^>]+>", " ", text))
     text = re.sub(r"\s+", " ", text)
-    gm_map = _rot_zh().get("gm") or {}
     en, dest_en, fallback = "", "", ""
     for m in re.finditer(r"Grandmaster\s*[:\-]?\s*([A-Z][^,.\n{]{2,48})", text):
         raw = m.group(1).strip()
         cand, _, rest = raw.partition("(")
         cand = cand.strip()
-        if cand.lower() in gm_map:            # 只认映射里认识的活动名，防抓到导航标题
+        if _gm_rec(cand):                     # 只认映射里认识的活动名，防抓到导航标题
             en = cand
             dest_en = rest.replace(")", "").strip()
             break
@@ -5845,19 +6447,49 @@ async def gm_this_week(force: bool = False) -> dict:
         dm = re.search(r"the ([A-Z][a-zA-Z' ]{2,24}?) strike", text)
         if dm:
             dest_en = dm.group(1).strip()
-    rec = gm_map.get(en.lower()) or {}
+    rec = _gm_rec(en)
     dl = dest_en.lower()
     dest_zh = (_DEST_ZH_FIX.get(dl) or (_rot_zh().get("dest") or {}).get(
         _DEST_ALIAS.get(dl, dl)) or dest_en)
+    if not dest_zh:                           # 页面不写目的地 → 按活动 hash 反查官方定义
+        try:
+            dest_zh = await _activity_dest_zh(str(rec.get("hash") or ""))
+        except Exception as exc:  # noqa: BLE001  反查失败只少一行目的地文字，不影响出卡
+            print(f"[宗师] 目的地反查失败（页面也没写）：{type(exc).__name__}: {exc}")
     wep = {}
-    wm = re.search(r"weekly challenge weapon is ([^,.\n]{2,60}?), an? ([a-z ]{3,30})", text)
+    # 措辞实测换过：早先是「The weekly challenge weapon is The Slammer, a sword.」，
+    # 2026-10 这版是「The featured weapon is Ouster Engine, a grenade launcher.」——
+    # 只认一种就会漏掉武器（本次「武器错误」的另一半原因）
+    wm = re.search(r"weapon\s+is\s+([^,.\n]{2,60}?)[,\s]+(?:an?|the)\s+([a-z][a-z ]{2,30})",
+                   text, re.I)
     if wm:
-        wep = _weapon_by_en(wm.group(1).strip())
-        wep.setdefault("en", wm.group(1).strip())
+        wname = wm.group(1).strip()
+        wep = _weapon_by_en(wname)
+        wep.setdefault("en", wname)
         wep["type_en"] = wm.group(2).strip()
+    # ---- 陈旧页识别：页面自称的周界对不上 / 内容与上一轮一字不差 ----
+    marks = _page_week_marks(text)
+    pd = (_cache_record(_gm_cache_path()).get("data") or {})
+    same_content = bool(pd) and pd.get("en") == en and \
+        ((pd.get("weapon") or {}).get("en") or "") == (wep.get("en") or "")
+    stale = ""
+    if marks:
+        fmt = "/".join(f"{m}月{d}日" for m, d in sorted(marks))
+        if (wk_end.month, wk_end.day) not in marks:
+            stale = (f"lfcarry 页写的还是 {fmt} 那个周界，不是本周（{wk_end:%m月%d日}"
+                     f" 01:00 北京时间换）")
+    elif same_content:
+        stale = "lfcarry 页没写周界，且宗师与武器跟上一轮一字不差"
+    if stale:
+        n = _GM_GUARD.bump(wk)
+        if n <= _GM_GUARD.tries:
+            raise _GM_GUARD.trip(f"{stale}——数据源还没换轮（第 {n}/{_GM_GUARD.tries} 次，"
+                                 f"稍后自动重取）")
+        print(f"[宗师] {stale}；已重取 {n} 次仍如此，本轮照收并标警告")
     data = {"ok": True, "week": wk, "en": en, "zh": rec.get("zh") or en,
             "hash": str(rec.get("hash") or ""), "pgcr": rec.get("pgcr") or "",
-            "dest_en": dest_en, "dest_zh": dest_zh, "weapon": wep}
+            "dest_en": dest_en, "dest_zh": dest_zh, "weapon": wep,
+            "stale": bool(stale), "warn": stale}
     _json_cache_save(base, GM_CACHE_FILE, _GM_CACHE_VER, wk, data)
     return data
 
