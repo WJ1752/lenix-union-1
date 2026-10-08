@@ -43,15 +43,18 @@ PLAYERS = ["Wj%238984", "goldenmidi%230582"]
 for p in PLAYERS:
     tag = "Wj" if "Wj" in p else "goldenmidi"
     b = check(f"{tag}/总览", f"/card?name={p}&mode=all", must=("生涯概况", "角色", "PVP 生涯", "智谋 生涯"))
-    pvp_must = ("PVP 熔炉竞技场战绩", "最近对局", "胜率", "生涯统计")
-    pve_must = ("PVE 战绩", "通关率", "生涯统计")
+    pvp_must = ("PVP 熔炉竞技场战绩", "最近对局", "胜率", "生涯统计", "全模式 · 跨角色去重")
+    pve_must = ("PVE 战绩", "生涯概况", "终局通关", "突袭通关", "现有成就分", "终极征服", "最近对局")
     if tag == "Wj":  # 只有 Wj 的样本确定有试炼/突袭记录，避免对样本不足的账号误报
         pvp_must += ("模式细分", "奥斯里斯试炼")
-        pve_must += ("突袭任务",)
-    check(f"{tag}/PVP", f"/card?name={p}&mode=pvp", must=pvp_must)
+    check(f"{tag}/PVP", f"/card?name={p}&mode=pvp", must=pvp_must,
+          none_of=("Traceback", "Internal Server Error", "class='gridline'"))  # PVP 默认不画红绿点图
     check(f"{tag}/PVE", f"/card?name={p}&mode=pve", must=pve_must,
-          none_of=("Traceback", "Internal Server Error", "tagl'>失败"))
-    check(f"{tag}/智谋", f"/card?name={p}&mode=gambit", must=("智谋战绩", "胜率"))
+          none_of=("Traceback", "Internal Server Error", "tagl'>失败", "模式细分", "近期战绩",
+                   "打过 "))
+    check(f"{tag}/智谋", f"/card?name={p}&mode=gambit",
+          must=("智谋战绩", "胜率", "荧光", "入侵", "胜点图" if tag == "Wj" else "最近对局"),
+          none_of=("Traceback", "Internal Server Error"))
     check(f"{tag}/战绩", f"/card?name={p}&mode=history", must=("对局", "mtag"))
     br = check(f"{tag}/Raid", f"/card?name={p}&mode=raid")
     bd = check(f"{tag}/地牢", f"/card?name={p}&mode=dungeon", must=("地牢",))
@@ -78,12 +81,16 @@ for p in PLAYERS:
         else:
             results.append((f"{tag}/Raid详情", "FAIL 详情链接未带 amode/base"))
     # 地牢详情：必须沿用 amode=82，否则会拿突袭历史筛出 0/0/0（历史 bug）
+    # 「最近对局」这个 must 已失效：该标题后来挪到 render_match_card（/pvp /pve 页）里，
+    # 详情页共用 render_matches 只出对局格子（class='cell'）+ 行（class='row'）。
+    # 改为断言「确实渲染出了对局列表」——标题在不在不是这份页面的重点，
+    # 列表空才是真问题（维护期拿残缺历史出空详情页就是靠它兜住）。
     if bd:
         import re as _re
         m2 = _re.search(r"mode=raidg&amode=82&base=([^&']+)", bd)
         if m2:
             body2 = check(f"{tag}/地牢详情", f"/card?name={p}&mode=raidg&amode=82&base={m2.group(1)}",
-                          must=("通关次数", "无暇", "最近对局"),
+                          must=("通关次数", "无暇", "class='cell"),
                           none_of=("Traceback", "Internal Server Error", "tagl'>失败"))
             if body2:
                 results.append((f"{tag}/地牢详情非空", "ok" if "副本 " not in body2 else "FAIL 标题回退为哈希"))
@@ -146,7 +153,7 @@ if b:
 # 会报「Event object ... is bound to a different event loop」→ 整页「本周轮换获取失败」
 check("本周轮换", "/rotation", must=("本周轮换", "突袭", "d2nav", "width:900px"),
       none_of=("Traceback", "Internal Server Error", "获取失败", "Event loop"))
-check("光尘商店", "/eververse", must=("d2nav", "width:900px"),
+check("光尘商店", "/eververse", must=("d2nav", "width:900px", "本轮货架", "数据抓取"),
       none_of=("Traceback", "Internal Server Error", "Event loop"))
 check("面板", "/panel", must=("Bot 后端管理",))
 # 英文/繁体词条（build_locale_index.py → manifest_index/name_i18n.json）：面板的联想与
@@ -157,6 +164,9 @@ check("词条/英文perk", "/perks?q=Incandescent", must=("辉耀炽热",))
 check("词条/英文套装", "/armorsets?q=Seventh%20Seraph", must=("第七炽天使",))
 b = check("bot状态", "/api/bot/status")
 check("bot群API", "/api/bot/groups")
+# 维护应对：状态接口 + 未发送图片（发送失败的卡片能预览/重发）
+check("Bungie维护态接口", "/api/bungie/maint", must=('"on"', '"text"'))
+check("未发送图片接口", "/api/bot/unsent", must=('"items"', '"dir"'))
 
 # PGCR:从战绩页取一场
 try:

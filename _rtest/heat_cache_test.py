@@ -75,7 +75,8 @@ def reset(chars=None, hist=None, last_played=None):
     d2.JOBS.clear()
     d2._JOB_DEDUP.clear()
     d2._JOB_QUEUE.clear()
-    d2._JOB_RUNNING = None
+    d2._JOB_RUNNING.clear()
+    d2._JOB_TASK.clear()
     # _heat_cache_ready 也置回 False：下一次会重新读文件，等价于「重启一次进程」
     d2._HEAT_CACHE.clear()
     d2._heat_cache_ready = False
@@ -83,7 +84,7 @@ def reset(chars=None, hist=None, last_played=None):
 
 async def drain():
     for _ in range(500):
-        if d2._JOB_RUNNING is None and not d2._JOB_QUEUE:
+        if not d2._JOB_RUNNING and not d2._JOB_QUEUE:
             break
         await asyncio.sleep(0)
     else:

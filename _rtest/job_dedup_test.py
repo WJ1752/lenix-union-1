@@ -44,7 +44,11 @@ def reset():
     d2.JOBS.clear()
     d2._JOB_DEDUP.clear()
     d2._JOB_QUEUE.clear()
-    d2._JOB_RUNNING = None
+    d2._JOB_RUNNING.clear()
+    d2._JOB_TASK.clear()
+    # 这些用例只看「建了几条任务」，工厂函数一律不真跑：真跑会去打 Bungie 接口，
+    # 结果回来时用例早翻页了，反而把后面几条的状态搅乱
+    d2._enqueue_job = lambda jid, factory: d2.JOBS.setdefault(jid, {}).update(_factory=factory)
 
 
 def finish(jid, status="done"):

@@ -8,8 +8,8 @@ import sys
 
 import httpx
 from playwright.async_api import async_playwright
-
-sys.path.insert(0, r"F:\智谱Zcode数据存储\BOT")
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 仓库根（本脚本在 _rtest/ 下）
 import destiny_data  # noqa: E402
 
 EN2ZH = {
