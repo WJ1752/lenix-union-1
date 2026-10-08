@@ -125,6 +125,14 @@ section{background:#16181b;border:1px solid #2a2e33;border-radius:12px;padding:1
 /* 光尘商店 */
 .evhead{display:flex;align-items:baseline;gap:8px;font-size:13.5px;color:#c5cacd;font-weight:700;letter-spacing:1.5px;border-left:3px solid #35c66b;padding-left:9px;margin:16px 0 8px}
 .evhead span{color:#9aa0a6;font-size:12px;font-weight:400}
+/* 光尘商店的「时间强关联」条：这轮货架属于哪天 1 点刷的 / 下次什么时候换 / 什么时候核过 */
+.evtime{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 14px;margin:8px 0 14px;padding:10px 14px;
+        background:#16181b;border:1px solid #2a2e33;border-left:3px solid #4b8fd4;border-radius:10px;
+        font-size:13px;color:#c5cacd;line-height:1.7}
+.evtime .k{color:#6d737b;font-size:12px;letter-spacing:1px}
+.evtime b{color:#d4b26a;font-weight:700}
+.evtime em{font-style:normal;color:#9aa0a6;font-size:12px;margin-left:auto}
+.evtime em.warn{color:#ff8d85;margin-left:0;flex-basis:100%}
 .evhero{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 .evhero.one{grid-template-columns:1fr}
 .evbig{position:relative;height:176px;border-radius:12px;overflow:hidden;border:1px solid #2a2e33;
@@ -1321,7 +1329,8 @@ def history_card(rep: dict) -> str:
 
 def mode_card(rep: dict, title: str, mode: str, lifetime: dict | None = None,
               lifetime_extra: tuple = ()) -> str:
-    """/pvp、/pve、/智谋：生涯统计 + 近期战绩 + 模式细分"""
+    """/pvp、/pve、/智谋：PvP 走全模式生涯聚合；PvE 走 raid.report 式面板（生涯概况 + 终局通关）；
+    智谋走官方荧光 / 入侵面板 + 胜点图"""
     return _webui().render_match_card(rep, title, mode, lifetime, tuple(lifetime_extra))
 
 
@@ -1555,21 +1564,54 @@ def _cur_img(url: str) -> str:
     return f"<img src='{esc(url)}'>" if url else ""
 
 
+_EV_WD = "一二三四五六日"
+
+
+def _ev_when(ts: float, wd: bool = False) -> str:
+    """epoch → 「10月07日 01:00」（wd=True 再带「（周三）」），一律按北京时间算"""
+    if not ts:
+        return "—"
+    t = d2._ev_dt(float(ts))
+    s = f"{t.month}月{t.day}日 {t:%H:%M}"
+    return f"{s}（周{_EV_WD[t.weekday()]}）" if wd else s
+
+
+def _ev_timebar(store: dict) -> str:
+    """光尘商店首行的时间条：这轮货架属于哪天 01:00 刷的 / 下次什么时候换 / 抓取时刻。
+
+    归属点是官方商品级刷新时刻反推出来的（见 destiny_data._ev_stamp），不是猜的。
+    万一手里还是上一轮的货（官方晚切，维护后最常见），就地在时间条上标一句，不另起提示块。
+    """
+    ra = float(store.get("refresh_at") or 0)
+    nr = float(store.get("next_refresh") or 0)
+    at = float(store.get("fetched_at") or store.get("updated") or 0)
+    behind = d2.ev_behind(store)
+    out = ("<div class='evtime'>"
+           f"<span class='k'>本轮货架</span><b>{_ev_when(ra, True)} 刷新</b>"
+           + (f"<span class='k'>下次刷新</span><b>{_ev_when(nr, True)}</b>" if nr else "")
+           + f"<span class='k'>数据抓取</span><b>{_ev_when(at)}</b>"
+           + (f"<em class='warn'>⚠ 还没取到 {_ev_when(d2.ev_round_at(), True)} 这轮新货架"
+              f"（手里仍是 {_ev_when(ra, True)} 那轮），"
+              f"每 {max(1, int(d2.EV_RETRY_AFTER // 60))} 分钟自动重试</em>"
+              if behind else
+              f"<em>每天 01:00 刷新 · 每 {max(1, int(d2.EV_MAX_AGE // 60))} 分钟自动核对</em>")
+           + "</div>")
+    return out
+
+
 def eververse_card(store: dict) -> str:
-    """光尘商店卡片：按游戏内「主要光尘优惠 / 其他光尘优惠 / 银币优惠」三节展示。
+    """光尘商店卡片：按游戏内「主要光尘优惠 / 其他光尘优惠」分节展示。
 
     武器皮肤与三职业护甲皮肤用游戏里点开物品的那张竖版大图（screenshot）当背景，
     其余的（表情/机灵/飞船/快雀/着色器/传送特效/包裹）只出方形缩略图。
+    首行是时间强关联条：本轮货架归属哪个 1 点刷新 + 下次刷新 + 抓取时刻。
     """
     secs = store.get("sections") or []
     if not secs:
         return notice("光尘商店暂无数据",
                       ["数据源今天没有返回内容，稍后再试。"], kind="warn")
     total = sum(len(s["items"]) for s in secs)
-    day = store.get("day") or "今日"
-    body = ("<h1>光尘商店 · Eververse</h1>"
-            f"<div class='sub'>{esc(day)} 这一轮上架 · 每天凌晨 1 点刷新 · "
-            "皮肤 / 飞船 / 载具出大图，其余缩略图</div>")
+    body = "<h1>光尘商店 · Eververse</h1>" + _ev_timebar(store)
     for sec in secs:
         items = sec["items"]
         cico = _cur_img(d2.ev_cur_icon(sec["cur"]))
@@ -1606,7 +1648,8 @@ def eververse_card(store: dict) -> str:
                           f"<div class='evcost'>{cico}{cost}</div></div>")
             body += f"<div class='evgrid'>{cards}</div>"
     body += (f"<div class='foot'>共 {total} 件 · 当前上架（Bungie 商店接口，需账号授权）"
-             " · 数字单位：光尘</div>")
+             " · 数字单位：光尘 · 皮肤 / 飞船 / 载具出大图，其余缩略图"
+             f" · 数据归属 {_ev_when(float(store.get('refresh_at') or 0), True)} 那轮</div>")
     return _page(body)
 
 
@@ -1936,6 +1979,8 @@ _FT_CSS = (".ft-head{border:1px solid #2a2e33;border-radius:12px;padding:18px 20
            "margin-top:10px;font-size:13.5px;color:#9aa0a6}"
            ".ft-sub b{color:#e8e6e3;font-size:15px}"
            ".ft-q{margin-left:auto;color:#6d737b}"
+           ".ft-last{margin-top:9px;font-size:13px;color:#9aa0a6}"
+           ".ft-last b{color:#c5cacd;font-weight:700}"
            ".ft-badge{border:1px solid #2a2e33;border-left-width:3px;border-radius:6px;"
            "padding:2px 9px;font-size:12.5px;color:#c5cacd;background:#16181b}"
            ".ft-mem{display:flex;align-items:center;gap:14px;background:#1b1e22;"
@@ -1970,7 +2015,8 @@ _FT_CSS = (".ft-head{border:1px solid #2a2e33;border-radius:12px;padding:18px 20
            "overflow:hidden;text-overflow:ellipsis}"
            ".ft-tile i{display:block;font-style:normal;font-size:10.5px;color:#6d737b}"
            ".ft-group{font-size:13px;font-weight:700;color:#9aa0a6;margin:10px 0 1px;"
-           "padding-left:2px}")
+           "padding-left:2px}"
+           ".ft-out{color:#6d737b;font-size:12.5px}")
 
 
 def _ft_tile(t: dict) -> str:
@@ -2008,7 +2054,9 @@ def _ft_row(m: dict, bucket: int) -> str:
 def fireteam_card(data: dict) -> str:
     """「/队伍」：当前在打什么 + 队内（可见）成员在该模式的生涯数据
 
-    成员名单来自官方 Transitory 组件（隐私设置会隐藏成员，脚注已注明）。
+    成员名单：对局中 = 本场 PGCR 里**此刻仍在场**的人（离场/被替补换下的只报个数，
+    见 bot_fireteam._pgcr_roster）；轨道/漫游/社交空间 = 官方 Transitory 实时队伍
+    （隐私设置会隐藏成员，脚注已注明）。
     专属样式全部内联在本函数（_FT_CSS），不占用通用 CSS。"""
     bucket = int(data.get("bucket") or 7)
     color = _FT_COLORS.get(bucket, "#c5cacd")
@@ -2028,12 +2076,19 @@ def fireteam_card(data: dict) -> str:
         parts.append(f"<span>开始 {esc(data.get('started_text') or '')}（UTC+8）</span>")
         dur = int(data.get("duration_min") or 0)
         parts.append(f"<span>{'已进行' if state == 'live' else '对局时长'} {dur} 分钟</span>")
+        # 名单只列此刻还在场的人；中途离场/被替补的只报个数（用户口径：要实时名单，
+        # 不是"本场参与过的所有人"——3 人位活动打一半换过人，PGCR 里躺着 6 个账号）
+        left = int(data.get("left_out") or 0)
+        if left:
+            parts.append(f"<span class='ft-out'>另有 {left} 人已中途离场（不计入名单）</span>")
     elif state == "pending":
         parts.append(f"<b>{esc(data.get('activity') or '进行中的对局')}</b>")
         if data.get("started_text"):
             parts.append(f"<span>开始 {esc(data.get('started_text'))}（UTC+8）</span>")
             parts.append(f"<span>已进行 {int(data.get('duration_min') or 0)} 分钟</span>")
-        parts.append("<span>本场名单还没发布，先显示可见队伍成员</span>")
+        pn = int(data.get("players_now") or 0)
+        parts.append(f"<span>本场实时 {pn} 人在场（官方名单还没发布，先列可见队伍成员）</span>" if pn
+                     else "<span>本场名单还没发布，先显示可见队伍成员</span>")
     elif state == "world":
         parts.append(f"<b>{esc(data.get('activity') or '自由漫游')}</b>")
         parts.append("<span>不在对局里（自由漫游 / 社交空间），队内生涯总览</span>")
@@ -2072,10 +2127,19 @@ def fireteam_card(data: dict) -> str:
             "（生涯总时长 / 成就点数）；名单取自官方实时队伍，队友未公开时可能不全"
             if state in ("orbit", "world", "offline") else
             "命运2 查询 · 数据来自 Bungie.net · 熔炉/智谋按阵营分列，"
-            "突袭/地牢为全队 + 每副本完成数/导师；名单取自本场对局，刚开局或队友未公开时可能不全")
+            "突袭/地牢为全队 + 每副本完成数/导师；名单＝本场对局里此刻仍在场的人"
+            "（中途离场 / 被替补换下的不计入），刚开局或队友未公开时可能不全")
+    # 「上一场」：一出本 204 就换成轨道占位 hash，不补这一行的话刚打完与一直在轨道长得一样
+    # （2026-10-07 用户实测），名单仍是官方实时队伍（当前队伍，不是上一场的人）
+    last = data.get("last") or {}
+    last_html = ""
+    if last and state in ("orbit", "world", "offline"):
+        last_html = (f"<div class='ft-last'>上一场 <b>{esc(last.get('name') or '')}</b>"
+                     f" · {int(last.get('minutes') or 0)} 分钟"
+                     f"（{esc(last.get('span') or '')}）</div>")
     body = (f"<style>{_FT_CSS}</style>"
             f"<div class='ft-head'><div class='ft-t'>当前队伍简报{tag}</div>"
-            f"<div class='ft-sub'>{''.join(parts)}</div></div>"
+            f"<div class='ft-sub'>{''.join(parts)}</div>{last_html}</div>"
             f"<h2>队伍成员（{len(members)}）</h2>"
             + (rows or "<div class='nt warn'>没拿到成员数据</div>")
             + f"<div class='foot'>{foot}</div>")
@@ -2115,7 +2179,7 @@ _LO_CSS = """
 .lo-chip b{font-weight:400;overflow:hidden;text-overflow:ellipsis}
 .lo-chip.sup b{color:#e8c15a;font-weight:700}
 .lo-chip.frag{border-color:#2b3d4d}.lo-chip.frag b{color:#8fd0ff}
-.lo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:start}
+.lo-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:stretch}
 .lo-col{display:flex;flex-direction:column;gap:6px;min-width:0}
 .lo-item{display:flex;gap:9px;background:#1b1e22;border:1px solid #2a2e33;
          border-radius:10px;padding:8px 10px;min-width:0}
@@ -2128,6 +2192,16 @@ _LO_CSS = """
 .lo-itx .ty{font-size:11px;color:#6d737b}
 .lo-chips{display:flex;flex-wrap:wrap;gap:3px;margin-top:5px}
 .lo-chips img{width:22px;height:22px;border-radius:4px;background:#22262b;border:1px solid #2a2e33}
+/* 武器列：三把武器撑满左列高度，perk 栏贴底 → 与右列 5 件护甲等高对齐（用户 2026-10-07 口径） */
+.lo-col.wp .lo-item{flex:1}
+.lo-col.wp .lo-itx{display:flex;flex-direction:column}
+.lo-perks{display:flex;flex-wrap:wrap;gap:4px 5px;flex:0 0 auto;margin-top:auto;
+          padding-top:8px;border-top:1px solid #262a2f}
+.lo-perks .pk{display:inline-flex;align-items:center;gap:5px;background:#22262b;
+              border:1px solid #2a2e33;border-radius:6px;padding:3px 9px 3px 4px;
+              font-size:12.5px;color:#c5cacd;max-width:210px;white-space:nowrap}
+.lo-perks .pk img{width:22px;height:22px;border-radius:4px;flex-shrink:0;background:#181a1d}
+.lo-perks .pk b{font-weight:400;overflow:hidden;text-overflow:ellipsis}
 .lo-hidden{font-size:13px;color:#6d737b;background:#1b1e22;border:1px dashed #2a2e33;
            border-radius:10px;padding:12px;text-align:center}
 .lo-mem{margin-bottom:14px}
@@ -2154,8 +2228,10 @@ def _lo_srow(label: str, chips: list[dict], cls: str = "") -> str:
             f"{_lo_chips_html(chips, cls)}</div>")
 
 
-def _lo_item_html(it: dict, cls: str = "") -> str:
-    """武器/护甲一行：图标 + 名字/类型 + perk/模组芯片排"""
+def _lo_item_html(it: dict, cls: str = "", perks: bool = False) -> str:
+    """武器/护甲一行：图标 + 名字/类型 + perk/模组芯片排。
+
+    perks=True（武器列）：芯片带名字（perk 栏），排在图/名下方；护甲列仍是图标排。"""
     if not it.get("name"):
         return ""
     tier_cls = " ex" if it.get("tier") == "异域" else ""
@@ -2163,9 +2239,14 @@ def _lo_item_html(it: dict, cls: str = "") -> str:
     if it.get("power"):
         ty += f" · {it['power']}"
     ty_html = f"<span class='ty'>{esc(ty)}</span>" if ty else ""
-    chips = "".join(f"<img src='{esc(c['icon'])}' title='{esc(c.get('name') or '')}'>"
-                    for c in (it.get("chips") or []) if c.get("icon"))
-    chips_html = f"<div class='lo-chips'>{chips}</div>" if chips else ""
+    if perks:
+        chips = "".join(f"<span class='pk'><img src='{esc(c['icon'])}'>{esc(c['name'])}</span>"
+                        for c in (it.get("chips") or []) if c.get("icon") and c.get("name"))
+        chips_html = f"<div class='lo-perks'>{chips}</div>" if chips else ""
+    else:
+        chips = "".join(f"<img src='{esc(c['icon'])}' title='{esc(c.get('name') or '')}'>"
+                        for c in (it.get("chips") or []) if c.get("icon"))
+        chips_html = f"<div class='lo-chips'>{chips}</div>" if chips else ""
     ico = f"<img src='{esc(it['icon'])}'>" if it.get("icon") else "<img src=''>"
     return (f"<div class='lo-item'>{ico}"
             f"<div class='lo-itx'><b class='{cls}{tier_cls}'>{esc(it['name'])}</b>{ty_html}"
@@ -2242,12 +2323,12 @@ def loadout_card(data: dict) -> str:
                         f"<div class='lo-row'><span class='lo-lab'></span>"
                         f"<b style='font-size:14px;color:#e8e6e3'>{esc(sc.get('name') or '')}</b></div>"
                         + rows + "</div></div>")
-        wcol = "".join(_lo_item_html(w) for w in (m.get("weapons") or []))
+        wcol = "".join(_lo_item_html(w, perks=True) for w in (m.get("weapons") or []))
         acol = "".join(_lo_item_html(a) for a in (m.get("armor") or []))
         grid = ""
         if wcol or acol:
             grid = ("<div class='lo-grid'>"
-                    f"<div class='lo-col'>{wcol}</div><div class='lo-col'>{acol}</div></div>")
+                    f"<div class='lo-col wp'>{wcol}</div><div class='lo-col'>{acol}</div></div>")
         body += f"<div class='lo-mem'>{head}{stats_html}{sub_html}{grid}</div>"
     if slot:
         body += ("<div class='foot'>命运2 查询 · 数据来自 Bungie.net · 游戏内 20 套配装槽位，"
@@ -2331,7 +2412,6 @@ _CP_CSS = """
 def checkpoint_card(data: dict) -> str:
     """进度点紧凑卡：两列并排小卡（官方活动小图 + 副本 + 第几关/尾王 + 人数）；
     /j 指令在随行的文字消息里可复制"""
-    import time as _time
     rows = data.get("rows") or []
     ready_n = sum(1 for r in rows if r.get("state") == "ready")
     if rows:
@@ -2368,7 +2448,7 @@ def checkpoint_card(data: dict) -> str:
         rows_html = ("<div class='nt warn'>当前没有可用进度点（bot 都在休息）"
                      "<br><span style='font-size:14px'>每周三凌晨 1 点周重置后点位最全，稍后再来</span></div>")
     ts = data.get("ts") or 0
-    when = _time.strftime("%H:%M", _time.localtime(ts)) if ts else ""
+    when = f"{d2._ev_dt(ts):%H:%M}" if ts else ""       # 全盘时钟口径：北京时间
     sub = (f"D2Checkpoint 实时尾王点位 · 可进 <b>{ready_n}</b>/共 {len(rows)} 个"
            + (f" · {when} 核对" if when else ""))
     body = (f"<style>{_CP_CSS}</style>"

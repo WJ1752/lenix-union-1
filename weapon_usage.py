@@ -92,8 +92,12 @@ _PCT_KEYS = {"percentage", "pct", "popularity", "useRate", "usageRate", "usage",
 _HASH_KEYS = {"hash", "plugHash", "perkHash", "itemHash", "item_id", "id"}
 
 
+_TZ8 = datetime.timezone(datetime.timedelta(hours=8))     # 全盘时钟口径：中国北京时间
+
+
 def _now_iso() -> str:
-    return datetime.datetime.now().isoformat(timespec="seconds")
+    """带 +08 偏移的 ISO 时间：`[:10]` 就是北京日期，`fromisoformat().timestamp()` 也准"""
+    return datetime.datetime.now(_TZ8).isoformat(timespec="seconds")
 
 
 def _idx_file(name: str) -> str:

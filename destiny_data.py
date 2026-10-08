@@ -13,7 +13,9 @@ import weakref
 import httpx
 
 import bot_runtime
+import bungie_status as bst
 import name_i18n
+from bungie_status import BungieMaintenanceError
 from jsonio import dump_json
 
 
@@ -102,9 +104,85 @@ def _ttl_for(url: str, params: dict | None) -> float:
     return 60
 
 
+# ---------- 响应判定 / 补查（维护期的第二道检查） ----------
+# 为什么要有这一层：官方维护时不止会「报错」，还会「HTTP 200 + 空数据」——
+# 不报错也没有内容，各调用点以前各自静默退化（返回 {} / [] / 0），统计就变成了
+# 「全是 0」的假结果（2026-10-06 维护期群里查出来一堆错数据就是这么来的）。
+# 这里统一把响应判成三态，调用点据此决定「照旧按空处理」还是「复核后报错」。
+_NA_CODES = {1601, 1620, 1653}   # 档案不存在 / 角色不存在 / PGCR 不存在：业务上「就是没有」
+
+
+def _resp_check(r) -> str:
+    """每个 API 响应过一遍，返回 "ok" / "nocache" / "throttle"
+
+    · 命中维护/系统关闭 → 点亮维护态并抛 BungieMaintenanceError（"nocache"）
+    · 正常响应 → 记一笔 note_ok（维护窗口起点、恢复信号都靠它）→ "ok"
+    · 其它业务错误码 → "nocache"：以前只看 HTTP 200 就缓存，维护期
+      「200 + ErrorCode 5」的脏响应能在缓存里躺到 6 小时（PGCR/Manifest 档）
+    · 纯限流（31/36/37…）→ "throttle"：**不抛**。限流是「请求太密」不是
+      「服务器关了」，几千场的 PGCR 长扫描撞一下限流不该整条任务失败——
+      交回调用点按各自的老口径退化（这次当作没拿到），由 _call 先等两秒重试一次。
+    """
+    body = r.content or b""
+    # 快路径：官方 JSON 是紧凑格式（`"ErrorCode":1` 无空格），且包体里 Response 在前、
+    # ErrorCode 在末尾附近收尾。命中就直接放行——PGCR 这种几百 KB 的包体不必再整份
+    # 解析一遍（各调用点稍后还会各自 r.json() 一次，能省一趟是一趟）。
+    if body.startswith(b"{") and b'"ErrorCode":1,' in body[-160:]:
+        bst.note_ok()
+        return "ok"
+    d = None
+    if body.strip()[:1] == b"{":
+        try:
+            d = json.loads(body.decode("utf-8-sig"))
+        except Exception:  # noqa: BLE001 解析不了当非 JSON 处理
+            d = None
+    if isinstance(d, dict):
+        hit = bst.classify_json(d)
+        if hit:
+            kind, detail = hit
+            if kind == "throttled":
+                return "throttle"
+            bst.trip(kind, detail)
+            raise bst.BungieMaintenanceError(bst.text())
+        if d.get("ErrorCode") == 1:
+            bst.note_ok()
+            return "ok"
+        return "nocache"
+    # 非 JSON（官方维护页）或 5xx
+    bst.note_http(r.status_code, body[:4000])
+    if bst.is_down():
+        raise bst.BungieMaintenanceError(bst.text())
+    return "nocache"
+
+
+class DataSuspiciousError(RuntimeError):
+    """接口这次给的数据不完整/不可信（疑似官方维护或异常）
+
+    宁可报错让用户稍后重发，也不出一份错的统计——用户看到的错数字比看不到数字更糟。
+    """
+
+
+def _verdict(resp: dict) -> tuple[str, str]:
+    """错误码体检（补查层统一口径）→ (verdict, 说明)
+
+    ok  = ErrorCode==1：有没有内容由调用点自己判（空列表有时是正常语义：翻到底了）
+    na  = 业务上「就是没有」（1601 档案不存在 / 1620 角色不存在 / 1653 PGCR 不存在）
+    bad = 服务端出问题却没给可用数据（维护期的空 Response、未知错误码）：
+          调用点应复核一次，仍旧可疑就抛 DataSuspiciousError，绝不能静静变成 0
+    """
+    if not isinstance(resp, dict):
+        return "bad", "响应不是 JSON 对象"
+    code = resp.get("ErrorCode")
+    if code == 1:
+        return "ok", ""
+    if code in _NA_CODES:
+        return "na", str(resp.get("ErrorStatus") or code)
+    detail = f"{resp.get('ErrorStatus') or code}({code}) {str(resp.get('Message') or '')[:80]}"
+    return "bad", detail.strip()
+
+
 class _CachedClient:
     """httpx.AsyncClient 的薄包装：GET/POST 走 TTL 缓存 + 读超时重试，其余原样转发"""
-
     def __init__(self, inner: httpx.AsyncClient):
         self._inner = inner
 
@@ -142,6 +220,8 @@ class _CachedClient:
             hit = self._hit(key, url)
             if hit is not None:
                 return hit
+        # 维护闸门：维护中不打接口、不写缓存，直接把「维护中」抛给上层
+        await bst.guard()
         for attempt in (1, 2):
             t_req = time.perf_counter()
             try:
@@ -154,7 +234,19 @@ class _CachedClient:
                     raise
                 await asyncio.sleep(0.5)
                 kw = {**kw, "timeout": 8}
-        self._save(key, ttl, r)
+        verdict = _resp_check(r)   # 维护类响应在这里抛，且不会被缓存
+        if verdict == "throttle":
+            # 官方限流：等两秒再要一次，多半就过了；还是限流就原样返回，
+            # 由调用点按自己的老口径退化（比如这场 PGCR 归到 missed）
+            await asyncio.sleep(2.0)
+            try:
+                r2 = await getattr(self._inner, method)(url, **kw)
+                if (v2 := _resp_check(r2)) != "throttle":
+                    r, verdict = r2, v2
+            except httpx.TimeoutException:
+                pass
+        if verdict == "ok":
+            self._save(key, ttl, r)
         return r
 
     async def get(self, url, **kw):
@@ -326,12 +418,19 @@ async def resolve_member(name: str, platform: str = ""):
         json={"displayName": fname, "displayNameCode": code},
     )
     resp = _parse(r)
+    # 以前这里不查 ErrorCode：维护/限流时搜索接口回错误码、候选为空，静默变成
+    # 「没找到玩家 XXX」，用户以为名字打错了（10-06 维护期就是这样）
+    sv, why = _verdict(resp)
     cands = resp.get("Response") or []
     n_all = len(cands)
     if platform:
         want = _PLATFORM_IDS.get(platform)
         cands = [p for p in cands if p["membershipType"] == want] if want else cands
         if not cands:
+            if sv == "bad":
+                raise DataSuspiciousError(
+                    f"玩家搜索接口这次没返回结果（{why}），疑似官方维护或接口异常，"
+                    f"稍后重发一次即可")
             return None
     # 注：Bungie 已下线免鉴权模糊搜索（SearchDestinyPlayers 404），带错编号只能报没找到
     # 排序：跨存档主平台(crossSaveOverride)优先，其余候选跟后。
@@ -371,6 +470,11 @@ async def resolve_member(name: str, platform: str = ""):
         mtype, mid, _ts = seen[name]
         return {"mtype": mtype, "mid": mid, "display": fname,
                 "code": code, "icon": ""}
+    if sv == "bad":
+        # 搜索本身就没成功、本地索引里也没有：这不是「没找到玩家」，别误导用户
+        raise DataSuspiciousError(
+            f"玩家搜索接口这次没返回结果（{why}），疑似官方维护或接口异常，"
+            f"稍后重发一次即可")
     return None
 
 
@@ -443,9 +547,11 @@ async def _has_destiny_account(mtype: int, mid: str) -> bool:
     """这个平台成员号下有没有真的命运2档案（没玩过 D2 的平台成员号 GetProfile 会 1601）"""
     try:
         r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/", params={"components": "100"})
-        return _parse(r).get("ErrorCode") == 1
+    except bst.BungieMaintenanceError:
+        raise            # 维护是「问不了」，不能当成「这个号没档案」（会把绑定标成空号）
     except Exception:  # noqa: BLE001  探测失败按没有算
         return False
+    return _parse(r).get("ErrorCode") == 1
 
 
 async def get_profile(mtype: int, mid: str) -> dict:
@@ -460,28 +566,50 @@ async def get_profile(mtype: int, mid: str) -> dict:
     return resp["Response"]
 
 
-async def char_stats(mtype: int, mid: str, char_id: str, groups: str) -> dict:
+async def char_stats(mtype: int, mid: str, char_id: str, groups: str,
+                     no_cache: bool = False) -> dict:
+    """角色生涯统计（补查层：可疑的空响应复核一次再决定报不报错）
+
+    实测（2026-10-08）：真角色的 groups=101,103,104 一定有 allPvP/allPvE/… 那几块；
+    已删角色则是「键还在、每块为空」。所以 **Response 整块为空** 只可能是官方
+    没给数据——维护期返回空响应时以前直接变成「全是 0」的假卡片。
+    """
     r = await client().get(
         f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{char_id}/Stats/",
-        params={"groups": groups},
+        params={"groups": groups}, no_cache=no_cache,
     )
     resp = r.json()
-    if resp.get("ErrorCode") != 1:
+    v, why = _verdict(resp)
+    payload = resp.get("Response")
+    if v == "na":
         return {}
-    return resp["Response"]
+    if v == "ok" and payload:
+        return payload
+    if no_cache:
+        raise DataSuspiciousError(
+            f"角色生涯统计读取失败（{why}）：Bungie 没返回数据（疑似官方维护或接口异常），"
+            f"已拦下避免出错误统计，稍后重发一次即可")
+    # 第一遍可疑：绕开响应缓存再要一次，多半是踩在维护/抖动的窗口里
+    return await char_stats(mtype, mid, char_id, groups, no_cache=True)
 
 
 def _sum(stats_list: list[dict], mode: str) -> dict:
-    """把多个角色的同一模式统计合并求和"""
+    """把多个角色的同一模式统计合并求和（比率取最后一项，最高值取各角色最大）"""
     keys = ("kills", "deaths", "assists", "activitiesEntered", "activitiesWon",
-            "killsDeathsRatio", "killsDeathsAssists", "precisionKills", "winRate")
+            "killsDeathsRatio", "killsDeathsAssists", "precisionKills", "winRate",
+            "secondsPlayed", "bestSingleGameKills", "longestKillSpree")
     out = {k: 0.0 for k in keys}
     for s in stats_list:
         at = s.get(mode, {}).get("allTime", {})
         for k in keys:
             if k in at:
                 v = at[k]["basic"]["value"]
-                out[k] = v if k in ("killsDeathsRatio", "killsDeathsAssists", "winRate") else out[k] + v
+                if k in ("killsDeathsRatio", "killsDeathsAssists", "winRate"):
+                    out[k] = v
+                elif k in ("bestSingleGameKills", "longestKillSpree"):
+                    out[k] = max(out[k], v)
+                else:
+                    out[k] += v
     if out["deaths"]:
         out["kd"] = out["kills"] / out["deaths"]
     else:
@@ -573,7 +701,10 @@ def esc_err(exc: BaseException) -> str:
 
 @_traced(lambda name, group="allPvP": f"生涯统计 {name}")
 async def lifetime_stats(name: str, group: str = "allPvP") -> dict:
-    """Bungie 官方**生涯**统计（跨角色求和）；group: allPvP / allPvE / gambit"""
+    """Bungie 官方**生涯**统计（跨角色求和）；group: allPvP / allPvE
+
+    智谋不在这里——它是 `pvecomp_gambit` 桶，得带 `modes=63` 请求才会出现在响应里，
+    且字段比这几个多（荧光 / 入侵），见 `gambit_career()`；`_sum` 也认不出那些专属键。"""
     member = await resolve_member(name)
     if not member:
         raise LookupError(f"没找到玩家 {name}")
@@ -676,9 +807,40 @@ def _load_time_cache():
             _time_cache.update(data)
     except Exception:  # noqa: BLE001 首次运行/文件损坏都不影响统计
         pass
+    # 维护窗口内封存过的角色：封存水位和那段日子都不算数
+    #   · 官方维护期每日统计会整段缺失，而 done 一旦推过去那些天就永远不会再拉
+    #   · 水位回退到窗口起点，配合 _TIME_TAIL_DAYS 会往前多拉 10 天补齐
+    #   · 窗口起点之后的日表条目直接删掉，免得残留维护期算出的偏小值
+    cs = bst.clean_since()
+    if cs:
+        ws = bst.windows()
+        wstart = ws[-1][0] if ws else cs
+        # 日表键来自对局 period（API 给的 UTC 日），这里也按 UTC 日算才对得上；
+        # 用北京日会晚 8 小时、少作废几天的缓存（全盘北京时间指的是复位/展示口径）
+        since_day = time.strftime("%Y-%m-%d", time.gmtime(wstart))
+        n = 0
+        for ent in _time_cache.values():
+            if not isinstance(ent, dict) or (ent.get("mw") or 0) >= cs:
+                continue
+            if (ent.get("done") or "") >= since_day:
+                ent["done"] = (datetime.date.fromisoformat(since_day)
+                               - datetime.timedelta(days=1)).isoformat()
+            days = ent.get("days") or {}
+            for d in [d for d in days if d >= since_day]:
+                days.pop(d, None)
+            ent["mw"] = cs
+            n += 1
+        if n:
+            print(f"[维护] season_time_cache 回退 {n} 个角色的封存水位到 {since_day}，"
+                  f"这段日子重拉", flush=True)
+            _save_time_cache()
 
 
 def _save_time_cache():
+    cs = bst.clean_since()
+    for ent in _time_cache.values():
+        if isinstance(ent, dict):
+            ent["mw"] = cs          # 写盘时刻的「维护代次」：判定上面那次回退用
     try:
         dump_json(_writable_path(_TIME_CACHE_FILE), _time_cache, separators=(",", ":"))
     except Exception:  # noqa: BLE001 写不进去就算了，只是下次重拉
@@ -686,15 +848,24 @@ def _save_time_cache():
 
 
 async def _fetch_daily_secs(mtype: int, mid: str, cid: str,
-                            day0: str, day1: str) -> dict[str, float]:
-    """一段窗口（≤31 天）的 {日期: 在场秒数}；接口报错（角色已删等）返回空表"""
+                            day0: str, day1: str) -> dict[str, float] | None:
+    """一段窗口（≤31 天）的 {日期: 在场秒数}；角色已删（1601/1620）返回空表
+
+    **取不到数据时返回 None**——调用点绝不能因为 None 推进封存水位，否则这段日子
+    会被永久标记成「已拉过」，时长统计从此少一大截（维护期踩过）。
+    """
     r = await client().get(
         f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{cid}/Stats/",
         params={"periodType": "Daily", "groups": "General",
                 "daystart": day0, "dayend": day1})
     resp = r.json()
-    if resp.get("ErrorCode") != 1:
+    v, why = _verdict(resp)
+    if v == "na":
         return {}
+    if v != "ok":
+        print(f"[补查] {time.strftime('%H:%M:%S')} 每日统计 {day0}~{day1} 取不到数据"
+              f"（{why}），本次不推进封存水位", flush=True)
+        return None
     out: dict[str, float] = {}
     R = resp.get("Response") or {}
     for key in _TIME_DAY_KEYS:
@@ -731,13 +902,25 @@ async def _char_day_secs(mtype: int, mid: str, cid: str) -> dict[str, float]:
         fetch_from = max(start, back)
     else:
         fetch_from = start
+    ok = failed = 0
     for a, b in _month_chunks(fetch_from, today.isoformat()):
-        days.update(await _fetch_daily_secs(mtype, mid, cid, a, b))
+        got = await _fetch_daily_secs(mtype, mid, cid, a, b)
+        if got is None:
+            # 没拿到就什么都不动：不合并、不推进封存点、不落盘（下次还会重拉这段）
+            failed += 1
+            continue
+        days.update(got)
+        ok += 1
         # 封存点推进到「窗口结束」与「今天-10 天」的较早者（当前月只封到今天-10）
         seal = min(datetime.date.fromisoformat(b), today - datetime.timedelta(days=_TIME_TAIL_DAYS))
         if seal.isoformat() > (ent.get("done") or ""):
             ent["done"] = seal.isoformat()
         _save_time_cache()
+    if ok == 0 and failed:
+        # 一段都没拉到的（维护/接口异常）：不能静静当成「这个角色 0 小时」
+        raise DataSuspiciousError(
+            f"每日时长统计一段都没取到（{failed} 段失败）：疑似官方维护或接口异常，"
+            f"已拦下避免出错误统计，稍后重发一次即可")
     return days
 
 
@@ -769,10 +952,16 @@ async def _char_stats_full(mtype: int, mid: str, cid: str, on_batch=None) -> dic
             params={"groups": "General",
                     "modes": ",".join(str(m) for m in modes[i:i + 15])})
         resp = r.json()
-        if resp.get("ErrorCode") != 1:
+        v, why = _verdict(resp)
+        if v == "na":
             continue
-        for key, v in (resp.get("Response") or {}).items():
-            out.setdefault(key, v)
+        if v != "ok":
+            # 以前是 continue：某一批挂了就少算那一批的时长/击杀，卡片上看不出来
+            raise DataSuspiciousError(
+                f"角色统计第 {bi}/{len(batches)} 批读取失败（{why}）："
+                f"疑似官方维护或接口异常，已拦下避免出错误统计，稍后重发一次即可")
+        for key, v2 in (resp.get("Response") or {}).items():
+            out.setdefault(key, v2)
         if on_batch:
             on_batch(bi, len(batches))
     return out
@@ -1184,13 +1373,25 @@ def activity_name(ref_id) -> dict:
 
 
 async def activity_history(mtype: int, mid: str, cid: str, mode: int, count: int = 200, page: int = 0) -> list[dict]:
-    """对局历史（mode: 5=所有PVP 63=智谋 7=所有PVE 0=全部活动）"""
+    """对局历史（mode: 5=所有PVP 63=智谋 7=所有PVE 0=全部活动）
+
+    补查层：以前这里**完全不看 ErrorCode**，维护/限流时直接当成「没有对局」，
+    翻页静默停在一半、卡片按残缺数据出图（10-06 维护就是这么错的）。
+    Response 是 {} 属于正常语义（翻到底了/该角色没打过），只有真报错才抛。
+    """
     r = await client().get(
         f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{cid}/Stats/Activities/",
         params={"mode": mode, "count": count, "page": page} if mode else
                {"count": count, "page": page},
     )
     resp = r.json()
+    v, why = _verdict(resp)
+    if v == "bad":
+        raise DataSuspiciousError(
+            f"对局历史读取失败（{why}）：Bungie 没返回对局数据（疑似官方维护或接口异常），"
+            f"已拦下避免出错误统计，稍后重发一次即可")
+    if v == "na":
+        return []
     acts = (resp.get("Response") or {}).get("activities") or []
     out = []
     for a in acts:
@@ -1220,6 +1421,7 @@ async def activity_history(mtype: int, mid: str, cid: str, mode: int, count: int
             "win": competitive and completed and v.get("standing", {}).get("basic", {}).get("value", 1) == 0,
             "score": int(v.get("score", {}).get("basic", {}).get("value", 0)),
             "eff": v.get("efficiency", {}).get("basic", {}).get("value", 0.0),
+            "opp": int(v.get("opponentsDefeated", {}).get("basic", {}).get("value", 0)),
             "team_score": int(v.get("teamScore", {}).get("basic", {}).get("value", 0)),
             "player_count": int(v.get("playerCount", {}).get("basic", {}).get("value", 0)),
         })
@@ -1279,8 +1481,15 @@ async def get_pgcr(instance_id: str) -> dict:
     """对局详情：全场玩家数据"""
     r = await client().get(f"/Platform/Destiny2/Stats/PostGameCarnageReport/{instance_id}/")
     resp = json.loads(r.content.decode("utf-8-sig"))
-    if resp.get("ErrorCode") != 1:
-        return {}
+    v, why = _verdict(resp)
+    if v == "na":
+        return {}          # 1653：这场对局不存在（过期/被删）——业务语义，照旧当空
+    if v == "bad" or not resp.get("Response"):
+        # 服务端没给数据（维护/异常）时别让上层当成「这场没有明细」继续算——
+        # 维护期这样会静默少算一堆武器击杀
+        raise DataSuspiciousError(
+            f"对局详情读取失败（{why or 'Response 为空'}）：疑似官方维护或接口异常，"
+            f"已拦下避免出错误统计，稍后重发一次即可")
     d = resp["Response"]
     entries = []
     for e in d.get("entries", []):
@@ -1711,6 +1920,17 @@ def _raid_hist_cache() -> dict:
             _RAID_HIST = json.load(open(_RAID_HIST_PATH, encoding="utf-8"))
         except Exception:  # noqa: BLE001
             _RAID_HIST = {}
+        # 维护窗口内翻出来的对局列表不可信（官方维护期会回残缺数据，而下面
+        # 「上次全量翻过且一场没有」的分支会把它当成结论永久复用）
+        # → 直接丢掉重翻
+        bad = [k for k, v in _RAID_HIST.items()
+               if isinstance(v, dict) and bst.suspect_at(v.get("ts"))]
+        for k in bad:
+            _RAID_HIST.pop(k, None)
+        if bad:
+            print(f"[维护] raid_history_cache 丢弃 {len(bad)} 条维护窗口内的缓存，"
+                  f"下次查询重新翻取", flush=True)
+            _raid_hist_save()
     return _RAID_HIST
 
 
@@ -1826,6 +2046,8 @@ async def raid_report_member(member: dict, mode: int, jid: str | None = None) ->
                 # 翻页拿全：早前只翻 3 页（750 场），老记录的低人通关会被截掉
                 page = 0
                 while page < 40:
+                    if jid:  # 暂停/中止都在翻页边界上响应，不至于把一页翻到一半
+                        await _job_checkpoint(jid)
                     acts = await activity_history(at, am, cid, mode, count=250, page=page)
                     page += 1
                     if not _merge_hist_page(acts, gate, seen, matches):
@@ -1835,11 +2057,18 @@ async def raid_report_member(member: dict, mode: int, jid: str | None = None) ->
                                  label=f"/{rname} {disp}",
                                  extra=f"平台 {ai + 1}/{len(accts)} · "
                                        f"角色 {unit}/{nunits} · 第 {page + 1} 页 · 已收 {len(matches)} 场")
-        _raid_hist_cache()[ckey] = {
-            "ts": time.time(), "chars": cur_chars,
-            "gate": max((m["period"] for m in matches), default=gate),
-            "matches": matches}
-        _raid_hist_save()
+        # 补查守卫：这次一场都没翻到、但上次缓存里有（且角色没变）→ 多半是接口
+        # 出了问题而不是「历史被清空」（历史只增不减），保留上次的缓存别覆盖
+        if not matches and hist.get("matches") and hist.get("chars") == cur_chars:
+            log_progress(f"raid:{mid}:{mode}", 0, 0, label=f"/{rname} {disp}", force=True,
+                         extra=f"本次一场都没翻到（上次缓存有 {len(hist['matches'])} 场），"
+                               f"疑似接口异常，保留上次缓存不覆盖")
+        else:
+            _raid_hist_cache()[ckey] = {
+                "ts": time.time(), "chars": cur_chars,
+                "gate": max((m["period"] for m in matches), default=gate),
+                "matches": matches}
+            _raid_hist_save()
     _jp(nunits * 40, nunits * 40)
     log_progress(f"raid:{mid}:{mode}", nunits * 40, nunits * 40, label=f"/{rname} {disp}",
                  force=True, extra=f"历史翻取完成，共 {len(matches)} 场，开始统计")
@@ -1866,6 +2095,8 @@ async def raid_report_member(member: dict, mode: int, jid: str | None = None) ->
                      extra=f"复核 {len(cand)} 场特殊通关（全程 / 低人口径）")
         _jp(0, len(cand))
         for i in range(0, len(cand), 6):
+            if jid:
+                await _job_checkpoint(jid)
             chunk = cand[i:i + 6]
             infos = await asyncio.gather(*[_pgcr_run_info_cached(m["instance"]) for m in chunk])
             for m, info in zip(chunk, infos):
@@ -2028,11 +2259,14 @@ async def start_profile_job(name: str, kind: str, who: str = "") -> str | None:
         return hit
     jid = f"{member['mid']}_{kind}_{len(JOBS)}"
     _register_job(key, jid, {
-        "done": 0, "total": 1, "status": "queued",
+        "done": 0, "total": 1, "status": "running", "started": time.time(),
         "name": f"{member['display']}#{fmt_code(member['code'])}", "result": None,
         "kind": kind, "who": who or "网页",
         "ts": time.time(), "label": _PROFILE_JOB_LABEL.get(kind, kind)})
-    asyncio.get_running_loop().create_task(_run_profile_job(jid, member, kind))
+    # 这几类不翻 PGCR 页，十几秒就完事，不占并行槽位（占着会白白挡住生涯任务），
+    # 但要留运行句柄，好让面板的「中止」按得动
+    _JOB_TASK[jid] = asyncio.get_running_loop().create_task(
+        _run_queued(jid, lambda: _run_profile_job(jid, member, kind)))
     return jid
 
 
@@ -2131,7 +2365,7 @@ def log_progress(key: str, done: int, total: int, label: str = "",
         if done:
             eta = el / done * (total - done)
             tail = (f" · 已用 {_hm(el)} · 预计剩余 {_sec_text(eta)}"
-                    f"（约 {time.strftime('%H:%M:%S', time.localtime(now + eta))} 完成）"
+                    f"（约 {_ev_dt(now + eta):%H:%M:%S} 完成）"
                     + (f" · 速度 {el / done:.1f}s/项" if el >= 3 else ""))
         else:  # 刚拿到总量、还没跑第一条，给不出预估
             tail = f" · 已用 {_hm(el)} · 预估中"
@@ -2180,21 +2414,60 @@ def _scan_pct(oldest: str) -> float:
 
 JOBS: dict[str, dict] = {}
 _JOB_KEEP = 80
+# 任务记录里额外挂的字段（下划线开头的属于内部状态，job_snapshot / job_view 不往外吐）：
+#   _factory  可重跑入口（面板的「重跑/继续」用它；重启程序后老任务没有这个键）
+#   paused    被管理员暂停（不是 status：排队中和运行中都能暂停，面板另有标记）
+#   started   真正开跑的时刻；ended 收尾时刻；ts 是发起时刻
+_JOB_STATUS_ENDED = ("done", "error", "aborted")
 
 
 def _prune_jobs():
-    """任务只增不减会一直吃内存；留最近 _JOB_KEEP 条，已完成/失败的优先清"""
+    """任务只增不减会一直吃内存；留最近 _JOB_KEEP 条，已结束的优先清"""
     # 去重映射指向的任务已经没了就一起清，否则这个 dict 会随「一共查过多少人」一直涨
     for k, v in list(_JOB_DEDUP.items()):
         if v not in JOBS:
             _JOB_DEDUP.pop(k, None)
+    for k in list(_JOB_TASK):  # 任务表里已经没有的，把运行句柄也清掉
+        if k not in JOBS:
+            _JOB_TASK.pop(k, None)
     if len(JOBS) <= _JOB_KEEP:
         return
     for k in list(JOBS):
         if len(JOBS) <= _JOB_KEEP:
             break
-        if JOBS[k].get("status") in ("done", "error"):
+        if JOBS[k].get("status") in _JOB_STATUS_ENDED:
             JOBS.pop(k, None)
+
+
+def _job_can(j: dict) -> dict:
+    """这条任务此刻能做什么（面板按它决定渲染哪几个按钮）"""
+    status = j.get("status")
+    paused = bool(j.get("paused"))
+    if status in ("queued", "running"):
+        return {"pause": not paused, "resume": paused, "abort": True, "retry": False}
+    if status in _JOB_STATUS_ENDED:
+        # 已结束的只剩「重跑」；重启程序后老任务没留下 _factory，重跑键就没有
+        return {"pause": False, "resume": False, "abort": False,
+                "retry": bool(j.get("_factory"))}
+    return {"pause": False, "resume": False, "abort": False, "retry": False}
+
+
+def _job_times(j: dict, now: float) -> dict:
+    """把一段任务拆成三段计时：排队多久 / 跑了多久 / 从发起到现在多久
+
+    排队中这两段会实时增长；已结束的两段就定格了（ended 收尾时打的）。
+    """
+    ts = j.get("ts") or 0
+    started = j.get("started") or 0
+    status = j.get("status") or "?"
+    alive = status not in _JOB_STATUS_ENDED
+    end_at = now if alive else (j.get("ended") or started or ts or now)
+    return {
+        "started": f"{_ev_dt(started):%H:%M:%S}" if started else "",
+        "queued_s": int(max(0.0, (started or end_at) - ts)) if ts else 0,
+        "run_s": int(max(0.0, end_at - started)) if started else 0,
+        "total_s": int(max(0.0, end_at - ts)) if ts else 0,
+    }
 
 
 def job_snapshot() -> list:
@@ -2207,21 +2480,38 @@ def job_snapshot() -> list:
         done = j.get("done") or 0
         status = j.get("status") or "?"
         ts = j.get("ts") or 0
+        tm = _job_times(j, now)
         out.append({"id": jid, "label": j.get("label") or "任务",
                     "kind": j.get("kind") or "", "who": j.get("who") or "网页",
                     "name": j.get("name") or "", "status": status,
                     "done": done, "total": total,
                     "queue_pos": queue_position(jid) if status == "queued" else 0,
                     "pct": int(done * 100 / total) if total else 0,
-                    # 面板显示发起时刻与已耗时（请求时间一目了然）
-                    "time": time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "",
-                    "date": time.strftime("%m-%d", time.localtime(ts)) if ts else "",
+                    # 面板显示发起时刻与分段耗时（请求时间一目了然）
+                    "time": f"{_ev_dt(ts):%H:%M:%S}" if ts else "",
+                    "date": f"{_ev_dt(ts):%m-%d}" if ts else "",
+                    "paused": bool(j.get("paused")),
+                    "can": _job_can(j),
+                    "error": j.get("error") or "",
+                    "note": j.get("note") or "",
                     "reused": j.get("reused") or 0,
                     "reused_by": j.get("reused_by") or [],
-                    "elapsed": int(now - ts) if ts and status in ("running", "queued") else 0})
+                    "reuse_count": j.get("reused") or 0,
+                    "reuse_by": list(j.get("reused_by") or []),
+                    # elapsed 是「已跑」的旧名（老面板脚本还在读它兜底）
+                    "elapsed": tm["run_s"] if status in ("running", "queued") else 0,
+                    **tm})
     # 同一状态内按发起时间倒序（最新的排最上面），面板翻页时先看到刚发的
     out.sort(key=lambda x: (order.get(x["status"], 9), -_job_ts(x["id"])))
     return out
+
+
+def job_view(jid: str) -> dict:
+    """单条任务的状态视图（QQ 侧播报排队位次用）；任务不存在返回 {}"""
+    for it in job_snapshot():
+        if it["id"] == jid:
+            return it
+    return {}
 
 
 def _job_ts(jid: str) -> float:
@@ -2243,31 +2533,61 @@ def _job_log(jid: str, extra: str = "", force: bool = False) -> None:
 
 def _job_start_log(jid: str, note: str = "") -> None:
     j = JOBS.get(jid) or {}
-    pos = queue_position(jid)
-    tail = f"（前面还有 {pos - 1} 位在排队）" if pos > 0 else ""
+    ts = j.get("ts") or 0
+    waited = f"（排了 {_hm(time.time() - ts)}）" if ts and time.time() - ts >= 60 else ""
+    slots = f" · 并行 {len(_JOB_RUNNING)}/{job_parallel()}"
     print(f"[任务] {time.strftime('%H:%M:%S')} ▶ 开始：{_job_label(jid)}"
-          f"{' · ' + note if note else ''}{tail}", flush=True)
+          f"{' · ' + note if note else ''}{waited}{slots}", flush=True)
     _PROG_T0[jid + "#t0"] = time.time()
     _PROG_PCT.pop(jid, None)
 
 
-def _job_end_log(jid: str, ok: bool = True, note: str = "") -> None:
+def _job_end_log(jid: str, kind: str = "ok", note: str = "") -> None:
+    """收尾日志；kind: ok 完成 / err 失败 / abort 中止"""
     t0 = _PROG_T0.get(jid + "#t0")
     used = f" · 总用时 {_hm(time.time() - t0)}" if t0 else ""
-    mark = "✔ 完成" if ok else "✘ 失败"
+    mark = {"ok": "✔ 完成", "err": "✘ 失败", "abort": "⏹ 中止"}.get(kind, kind)
     print(f"[任务] {time.strftime('%H:%M:%S')} {mark}：{_job_label(jid)}{used}"
           f"{' · ' + note if note else ''}", flush=True)
 
 
-# 生涯武器 / 热力图都要逐场拉 PGCR，多个一起跑会被 Bungie 限流拖慢，整体反而更慢，
-# 所以排成一条队逐个跑；排队中的任务能查到自己是第几位。
+# 生涯武器 / 热力图都要逐场拉 PGCR，请求量很大。原来是一条队逐个跑，一个人跑几分钟，
+# 排在后面的人容易等成半小时；现在改成「并行 N 个任务」——它们共享同一个请求并发闸门
+# （见 _pgcr_sem），所以并行不会让总请求量超速，只是把几个人的等待重叠起来。
 _JOB_QUEUE: list[tuple] = []  # [(jid, factory), ...] 等待中（不含正在跑的）
-_JOB_RUNNING: str | None = None
+_JOB_RUNNING: set[str] = set()
+_JOB_TASK: dict[str, "asyncio.Task"] = {}   # 运行中的 asyncio 任务（中止要取消它）
+_JOB_PARALLEL_DEFAULT = 2
+_JOB_PARALLEL_MAX = 4
+
+
+def job_parallel() -> int:
+    """并行槽位：bot_config.json 的 job_parallel（面板「参数设置 → 并行任务数」）
+
+    未设置/非法 = 内置默认 2；1 = 回到原来的「一个个跑」。上限 4：再多也只是互相抢
+    同一个并发预算，单个任务反而变慢。
+    """
+    try:
+        n = int(bot_runtime.load_config().get("job_parallel") or 0)
+    except (TypeError, ValueError) as exc:
+        print(f"[任务] job_parallel 配置值不合法（按默认 {_JOB_PARALLEL_DEFAULT} 处理）：{exc}")
+        n = 0
+    if n <= 0:
+        return _JOB_PARALLEL_DEFAULT
+    return max(1, min(n, _JOB_PARALLEL_MAX))
+
+
+def set_job_parallel(n: int) -> int:
+    def _set(cfg):
+        cfg["job_parallel"] = max(0, min(int(n), _JOB_PARALLEL_MAX))
+    bot_runtime.update_config(_set)
+    _pump_jobs()  # 调大就立刻把队列里的任务提上来跑
+    return job_parallel()
 
 
 def queue_position(jid: str) -> int:
     """0 = 正在跑 / 已结束；>0 = 在等待队列里的位次（1 表示下一个就轮到）"""
-    if jid == _JOB_RUNNING:
+    if jid in _JOB_RUNNING:
         return 0
     for i, (qid, _) in enumerate(_JOB_QUEUE):
         if qid == jid:
@@ -2275,36 +2595,239 @@ def queue_position(jid: str) -> int:
     return 0
 
 
+def _loop_or_none():
+    """当前事件循环；没有（理论上不该发生）就返回 None，让调用方别硬起任务"""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
 def _pump_jobs():
-    """队列空闲就取下一个开跑（串行：同一时间只有一个重任务在跑）"""
-    global _JOB_RUNNING
-    if _JOB_RUNNING is not None or not _JOB_QUEUE:
+    """有空槽就把队列里最靠前、且没被暂停的任务取出来跑"""
+    if not _JOB_QUEUE:
         return
-    jid, factory = _JOB_QUEUE.pop(0)
-    _JOB_RUNNING = jid
-    JOBS.get(jid, {})["status"] = "running"
-    _job_start_log(jid)
-    asyncio.get_event_loop().create_task(_run_queued(jid, factory))
+    loop = _loop_or_none()
+    if loop is None:
+        print("[任务] 没有事件循环，任务留在队列里等下一次调度")
+        return
+    while _JOB_QUEUE and len(_JOB_RUNNING) < job_parallel():
+        idx = next((i for i, (qid, _) in enumerate(_JOB_QUEUE)
+                    if not (JOBS.get(qid) or {}).get("paused")), None)
+        if idx is None:  # 队列里的都被暂停了，谁恢复谁来叫醒队列
+            return
+        jid, factory = _JOB_QUEUE.pop(idx)
+        j = JOBS.get(jid)
+        if not j:  # 排队期间被清理掉了
+            continue
+        j.update(status="running", started=time.time())
+        _JOB_RUNNING.add(jid)
+        _job_start_log(jid)
+        _JOB_TASK[jid] = loop.create_task(_run_queued(jid, factory))
 
 
 async def _run_queued(jid: str, factory):
-    global _JOB_RUNNING
+    """跑一个任务；无论怎么结束都要把状态、耗时、槽位收干净，否则队列会卡死"""
+    j = JOBS.get(jid)
+    if j is None:
+        return
     try:
         await factory()
+    except asyncio.CancelledError:
+        # 维护触发的取消要跟「管理员中止」分开记：文案不一样，用户/管理员才知道该
+        # 等维护结束而不是去查是谁点了按钮（abort_all_jobs 会打 _maint_abort）
+        if j.get("_maint_abort") or bst.is_down():
+            _mark_aborted(jid, "Bungie 服务器维护中，已自动中止（维护结束后重发即可）")
+        else:
+            _mark_aborted(jid, "被管理员中止")
+        _flush_job_caches()  # 已经拉到的对局明细别白拉，重跑时直接复用
+        raise                # 取消要如实往外传，不能当成正常结束
+    except bst.BungieMaintenanceError as exc:
+        # 维护是「暂时做不了」不是「做错了」：按中止处理（面板上区分于失败），
+        # 用户重发即可；已拉到一半的明细仍然落盘复用
+        _mark_aborted(jid, f"Bungie 服务器维护中，已自动中止：{exc}")
+        _flush_job_caches()
     except Exception as exc:  # noqa: BLE001  兜底：别让队列卡死
-        JOBS.get(jid, {}).update(status="error", error=str(exc))
-        _job_end_log(jid, ok=False, note=str(exc))
+        j.update(status="error", error=str(exc))
+        _job_end_log(jid, kind="err", note=str(exc))
     else:
-        _job_end_log(jid)
+        if j.get("status") in ("running", "queued"):
+            # 工厂函数正常返回却没写明结局：按完成处理。不补这一手的话任务会一直
+            # 挂在「运行中」，白占一个并行槽位，面板上的进度条也永远不动。
+            j.update(status="done", done=max(1, j.get("done") or 0),
+                     total=max(1, j.get("total") or 0))
+        st = j.get("status")
+        _job_end_log(jid, kind="abort" if st == "aborted"
+                     else "err" if st == "error" else "ok")
     finally:
-        JOBS.get(jid, {})["ended"] = time.time()  # 复用窗口从这个时刻算起
-        _JOB_RUNNING = None
+        j["ended"] = time.time()  # 复用窗口与面板用时都从这个时刻算起
+        j["paused"] = False
+        _JOB_RUNNING.discard(jid)
+        _JOB_TASK.pop(jid, None)
         _pump_jobs()
 
 
 def _enqueue_job(jid: str, factory):
+    JOBS.setdefault(jid, {})["_factory"] = factory
     _JOB_QUEUE.append((jid, factory))
     _pump_jobs()
+
+
+def _flush_job_caches() -> None:
+    """把已经拉到一半的中间结果落盘。
+
+    任务被中止时进程内存里的对局明细说没就没，落一次盘就能让重跑直接复用。
+    只写已经加载过的缓存：没加载过的还是空的，写下去等于把盘上的数据抹了。
+    """
+    if _pvp_cache_ready:
+        _save_pvp_cache()
+    if _agg_cache_ready:
+        _save_agg_cache()
+
+
+def _mark_aborted(jid: str, note: str = "") -> None:
+    j = JOBS.get(jid)
+    if not j:
+        return
+    j.update(status="aborted", paused=False, error=note or "已中止")
+    _job_end_log(jid, kind="abort", note=note)
+
+
+def _cancel_task(task) -> None:
+    """在任务自己的事件循环上取消它：面板与任务可能分属两条循环（webui / QQ bot），
+    直接 task.cancel() 跨线程调 call_soon 不是线程安全的，轻则取消不掉。"""
+    try:
+        loop = task.get_loop()
+    except AttributeError:  # 老 Python 没有 get_loop
+        loop = None
+    if loop is None or not loop.is_running():
+        return
+    loop.call_soon_threadsafe(task.cancel)
+
+
+def abort_all_jobs(note: str) -> int:
+    """中止所有在跑/在排队的后台任务（维护时自动调用），返回中止条数。
+
+    运行中的任务走取消（检查点也会抛，双保险），排队中的直接从队列摘掉——
+    否则维护期排队的任务会一个接一个跑起来、又一个个失败，把面板刷满错误。
+    """
+    n = 0
+    for jid, _factory in list(_JOB_QUEUE):
+        _JOB_QUEUE[:] = [(q, f) for q, f in _JOB_QUEUE if q != jid]
+        _mark_aborted(jid, note)
+        n += 1
+    for jid in list(_JOB_RUNNING):
+        j = JOBS.get(jid)
+        if not j:
+            continue
+        j["paused"] = False          # 卡在暂停检查点上睡着的，先放掉才好取消
+        j["_maint_abort"] = True     # 让 _run_queued 心里有数（错误文案用维护口径）
+        task = _JOB_TASK.get(jid)
+        if task is not None:
+            _cancel_task(task)
+        _mark_aborted(jid, note)
+        n += 1
+    return n
+
+
+async def _job_checkpoint(jid: str) -> None:
+    """任务循环里的检查点：被暂停就在这里停下，等管理员「继续」
+
+    刻意用轮询而不是 asyncio.Event：任务可能跑在 webui 的事件循环上，而暂停来自
+    QQ bot 那条循环（或反过来），跨线程 set() 不是线程安全的，轮询最稳。
+
+    维护检查也放这里：长任务（翻几万场对局）每翻一页就有一次机会就地停下，
+    不必等下一次请求才发现官方在维护、更不会拿维护期的空数据把卡片出完。
+    """
+    bst.guard_sync()
+    if not (JOBS.get(jid) or {}).get("paused"):
+        return
+    print(f"[任务] {time.strftime('%H:%M:%S')} ⏸ 暂停：{_job_label(jid)}", flush=True)
+    while (JOBS.get(jid) or {}).get("paused"):
+        await asyncio.sleep(0.5)  # 被中止时这里会抛 CancelledError，正好就地退出
+    print(f"[任务] {time.strftime('%H:%M:%S')} ▶ 继续：{_job_label(jid)}", flush=True)
+
+
+def job_control(jid: str, action: str) -> dict:
+    """逐条任务控制（面板按钮）：abort 中止 / pause 暂停 / resume 继续 / retry 重跑"""
+    j = JOBS.get(jid)
+    if not j:
+        return {"ok": False, "msg": "这条任务已经不在了（可能已被清理），重发一次指令即可", "status": ""}
+    status = j.get("status") or ""
+    if action == "abort":
+        if status == "queued":
+            _JOB_QUEUE[:] = [(q, f) for q, f in _JOB_QUEUE if q != jid]
+            _mark_aborted(jid, "排队中被管理员中止")
+            return {"ok": True, "msg": "已从队列里移除", "status": "aborted"}
+        if status == "running":
+            j["paused"] = False  # 先把暂停放掉，否则它正卡在检查点上睡着
+            task = _JOB_TASK.get(jid)
+            if not task or task.done():
+                _mark_aborted(jid, "被管理员中止")
+                return {"ok": True, "msg": "已中止", "status": "aborted"}
+            _cancel_task(task)
+            return {"ok": True, "msg": "已中止（正在收尾，已拉到的对局明细会保留）",
+                    "status": "running"}
+        return {"ok": False, "msg": "这条任务已经结束了", "status": status}
+    if action == "pause":
+        if status not in ("queued", "running"):
+            return {"ok": False, "msg": "这条任务已经结束了", "status": status}
+        if j.get("paused"):
+            return {"ok": True, "msg": "本来就在暂停中", "status": status}
+        j["paused"] = True
+        print(f"[任务] {time.strftime('%H:%M:%S')} ⏸ 管理员暂停：{_job_label(jid)}", flush=True)
+        return {"ok": True,
+                "msg": "已暂停：排队中的不会被提起，运行中的在下一个检查点停下",
+                "status": status}
+    if action == "resume":
+        if status in ("queued", "running"):
+            if not j.get("paused"):
+                return {"ok": True, "msg": "这条任务本来就在跑", "status": status}
+            j["paused"] = False
+            _pump_jobs()  # 排队中被暂停的，恢复后要让队列重新挑它
+            return {"ok": True, "msg": "已恢复", "status": status}
+        return job_control(jid, "retry")  # 已结束的「继续」就是重跑
+    if action == "retry":
+        factory = j.get("_factory")
+        if not factory:
+            return {"ok": False, "msg": "这条任务没有留下可重跑的入口（重启程序后老任务会这样），"
+                                        "重发一次指令即可", "status": status}
+        if status in ("queued", "running"):
+            return {"ok": False, "msg": "这条任务还在跑，先中止再重跑", "status": status}
+        if any(q == jid for q, _ in _JOB_QUEUE):
+            return {"ok": True, "msg": "已经在队列里了", "status": "queued"}
+        _prune_jobs()
+        j.update(status="queued", done=0, total=0, result=None, error="", note="",
+                 paused=False, ts=time.time(), started=0.0, ended=0.0)
+        j.pop("cached", None)   # 上一轮的「命中缓存/被复用」标记不能留给这一轮
+        j.pop("reused", None)
+        j["reused_by"] = []
+        _JOB_QUEUE.append((jid, factory))
+        _pump_jobs()
+        return {"ok": True, "msg": "已重新排队", "status": "queued"}
+    return {"ok": False, "msg": f"不认识的操作 {action}", "status": status}
+
+
+def _on_maintenance(detail: str) -> None:
+    """维护点亮时的自动处理（bungie_status 回调）：清响应缓存 + 中止所有后台任务 + 面板提醒
+
+    响应缓存必须清：维护期的脏响应（200 + 错误码/空数据）可能已经进去了，
+    官方恢复后还会按 TTL（最长 6 小时）继续吐给用户。
+    """
+    n = len(_RESP)
+    _RESP.clear()
+    stopped = abort_all_jobs("Bungie 服务器维护中，已自动中止（维护结束后重发即可）")
+    print(f"[维护] 已清空 {n} 条响应缓存、自动中止 {stopped} 个后台任务", flush=True)
+    try:
+        import bot_log
+        bot_log.add("out", nickname="Bungie 状态",
+                    text=f"[系统] ⛔ 检测到 Bungie 服务器维护（{detail or '官方未给出原因'}）："
+                         f"已自动中止 {stopped} 个查询任务并暂停接单，维护结束后会自动恢复。")
+    except Exception:  # noqa: BLE001 面板日志写不进去不影响拦截
+        pass
+
+
+bst.on_trip(_on_maintenance)
 
 
 # 同一个「谁 + 查什么」已经在跑（或刚跑完）时复用那一个任务，不再排第二遍：
@@ -2379,6 +2902,25 @@ PVE_MATCH_CAP = 3000
 # 探索/巡逻（mode 6）没有实质击杀，实测还偶发没有武器明细，统计里排除（PVE 通关率也已排除它）
 _PVE_SKIP_MODES = frozenset({6})
 
+# 逐场拉 PGCR 的并发闸门：并行的几个任务共用一条，总请求量就等于「并发上限」设置，
+# 不会因为多开任务而超速。按事件循环分开存——webui 与 QQ bot 各有一条循环，
+# asyncio 的信号量跨循环用会报「bound to a different event loop」。
+_PGCR_SEMS: dict[int, tuple] = {}   # id(loop) → (loop, Semaphore, 容量)
+
+
+def _pgcr_sem() -> "asyncio.Semaphore":
+    loop = asyncio.get_running_loop()
+    n = bot_runtime.concurrency_limit(_PVP_CONCURRENCY)
+    ent = _PGCR_SEMS.get(id(loop))
+    if ent is None or ent[2] != n:
+        ent = (loop, asyncio.Semaphore(n), n)  # 连 loop 一起存住，免得 id() 被回收后复用
+        _PGCR_SEMS[id(loop)] = ent
+        if len(_PGCR_SEMS) > 4:
+            for k, (lp, _, _) in list(_PGCR_SEMS.items()):
+                if lp is not loop and not lp.is_running():
+                    _PGCR_SEMS.pop(k, None)
+    return ent[1]
+
 
 def match_cap(kind: str) -> int:
     """生涯统计场次上限：bot_config.json 的 pvp_match_cap / pve_match_cap（运行状态页可调）。
@@ -2396,6 +2938,45 @@ def match_cap(kind: str) -> int:
     except Exception:  # noqa: BLE001
         return default
     return n if n > 0 else 0    # 0 = 无限制（_collect_matches 对 cap<=0 按无限处理）
+
+
+RECENT_DEFAULT = 100      # 近期战绩 / 模式细分窗口：跨角色合并后最近多少场
+_HISTORY_PAGE = 250       # Bungie 对局历史单页上限（实测超过 250 也只给 250）
+_HISTORY_WAVE = 4         # 同一角色一次并发补几页
+_HISTORY_CONCURRENCY = 6  # 跨角色并发上限（历史页比 PGCR 轻，但别一次怼 25/s 限流）
+
+
+def recent_count(kind: str) -> int:
+    """近期战绩窗口局数：bot_config.json 的 pvp_recent_count / pve_recent_count /
+    gambit_recent_count（运行状态页可调）。
+
+    未设置/非法 = 内置默认 100。窗口是**跨角色合并后**的最近 N 局（不是"每角色 N 局"），
+    只影响「近期战绩」与「模式细分」两块——顶部生涯统计走全生涯聚合（见 mode_report 的 career）。"""
+    cfg = bot_runtime.load_config()
+    try:
+        n = int(cfg.get(f"{kind}_recent_count") or 0)
+    except Exception:  # noqa: BLE001
+        return RECENT_DEFAULT
+    return n if n > 0 else RECENT_DEFAULT
+
+
+GRID_DEFAULT = {"pvp": 0, "gambit": 100}   # 胜点图默认场数：0 = 不画（PvP 那一片格子太吵）
+
+
+def grid_count(kind: str) -> int:
+    """胜点图（红绿方块）画多少场：bot_config.json 的 pvp_grid_count / gambit_grid_count。
+
+    kind 为 pvp / gambit；未设置 = 内置默认（智谋 100 场、PvP 不画）。0 = 不画。
+    只影响卡片上那一片方格，不改变任何统计口径。"""
+    default = GRID_DEFAULT.get(kind, 0)
+    cfg = bot_runtime.load_config()
+    key = f"{kind}_grid_count"
+    if key not in cfg:
+        return default
+    try:
+        return max(0, int(cfg.get(key) or 0))
+    except Exception:  # noqa: BLE001
+        return default
 
 
 def _writable_path(name: str) -> str:
@@ -2448,6 +3029,14 @@ def _load_agg_cache():
             _AGG_CACHE.update(data)
     except Exception:  # noqa: BLE001 首次运行/文件损坏都不影响统计
         pass
+    # 维护窗口内算出来的生涯武器聚合不可信（对局历史缺场 → 击杀/KD 全都偏小）
+    bad = [k for k, v in _AGG_CACHE.items()
+           if isinstance(v, dict) and bst.suspect_stamp(v.get("updated"))]
+    for k in bad:
+        _AGG_CACHE.pop(k, None)
+    if bad:
+        print(f"[维护] weapon_agg_cache 丢弃 {len(bad)} 条维护窗口内的缓存，下次查询重算",
+              flush=True)
 
 
 def _save_agg_cache():
@@ -2495,6 +3084,11 @@ async def sync_bindings() -> dict:
     membershipId 无从对回，只能留人工核实。返回给调度器打日志。
     """
     out: dict = {"updated": [], "seeded": 0, "stale": [], "errors": 0}
+    if bst.is_down():
+        # 维护期核对必然全失败：既刷一屏 JSONDecodeError/限流日志，也可能把
+        # 「问不到」误判成「改名了/空号」，不如整轮跳过（下个 tick 再来）
+        print("[bind] Bungie 服务器维护中，跳过本轮绑定改名核对")
+        return out
     try:
         with open(bind_path(), encoding="utf-8") as f:
             binds = json.load(f)
@@ -2645,16 +3239,19 @@ async def pvp_match_contribution(instance: str, mid: str) -> dict | None:
 async def _collect_matches(mtype: int, mid: str, chars: list[str], mode: int,
                            since: str, until: str, cap: int,
                            skip_modes: frozenset = frozenset(),
-                           on_page=None) -> list[dict]:
+                           on_page=None, check=None) -> list[dict]:
     """收集对局（跨角色去重，新→旧）；since/until 为空串表示不限时间
 
     mode: 5=所有PVP 7=所有PVE；skip_modes 里的具体玩法会被丢掉
     on_page: 每翻完一页回调一次 on_page(已翻页数, 已收集场次)，用于打进度日志
+    check: 每翻一页前 await 一次的钩子（后台任务用它响应暂停/中止）
     """
     seen, matches = set(), []
     for ci, cid in enumerate(chars):
         page = 0
         while page < 60 and (cap <= 0 or len(matches) < cap):  # 60页×250 ≈ 1.5万场/角色的接口硬顶
+            if check:
+                await check()
             acts = await activity_history(mtype, mid, cid, mode, count=250, page=page)
             if not acts:
                 break
@@ -2725,27 +3322,139 @@ async def start_pve_weapons(name: str, scope: str = "current", who: str = "") ->
     return await _start_weapon_job(name, scope, "pve", 7, match_cap("pve"), _PVE_SKIP_MODES, who)
 
 
+def _day_shift(day: str, delta: int) -> str:
+    """日期串前后挪几天（时间窗都按 'YYYY-MM-DD' 字符串比大小）"""
+    try:
+        return (datetime.date.fromisoformat(day[:10])
+                + datetime.timedelta(days=delta)).isoformat()
+    except (ValueError, TypeError):
+        return day
+
+
+def _sub_agg_segments(mid: str, kind: str, since: str, until: str,
+                      skip: str) -> list[dict]:
+    """同一玩家同一类统计里，已经被完整缓存、且整段落在本次范围里的其它范围。
+
+    典型场景：先查了某个赛季，再查全生涯——那段赛季就是这里的一「段」，直接折进来，
+    不必再把那段时间的活动历史重新翻一遍（逐场明细本来就有 _PVP_MATCH_CACHE 兜着）。
+
+    只挑「已经结束、且没被场次上限截断」的段：还在进行的段每天都有新对局，折进来会
+    漏掉那次查询之后打的场次；截断过的段数据不全，折进来会少算。全生涯那种开区间的
+    段（没有结束日期）也跳过——它自己就是超集，不可能是别人的子段。
+    """
+    today = _cn_now().date().isoformat()     # 全盘时钟口径：「段结束了没」也按北京时间判
+    out = []
+    for k, v in _AGG_CACHE.items():
+        if k == skip or not v.get("weapons") or v.get("capped"):
+            continue
+        if "cap" not in v:   # 2026-10-07 之前写的段没记上限，判断不了是否完整，不当子段用
+            continue
+        parts = k.split("|", 2)
+        if len(parts) != 3 or parts[0] != mid or parts[1] != kind:
+            continue
+        s, u = v.get("scope_since") or "", v.get("scope_until") or ""
+        if not s or not u or u >= today:
+            continue
+        if (since and s < since) or (until and u > until):
+            continue
+        out.append(v)
+    out.sort(key=lambda v: v["scope_since"], reverse=True)  # 新的在前，配合「取最近 N 场」
+    return out
+
+
+def _fold_segments(agg: dict, tot: dict, segs: list[dict]) -> int:
+    """把缓存段的排名/计数折进本次统计；返回折进来的场次数"""
+    n = 0
+    for seg in segs:
+        for h, w in (seg.get("weapons") or {}).items():
+            a = agg.setdefault(h, {"name": w.get("name", "未知武器"), "icon": w.get("icon", ""),
+                                   "type": w.get("type", ""), "kills": 0, "precision": 0,
+                                   "matches": 0})
+            for k in ("kills", "precision", "matches"):
+                a[k] += int(w.get(k) or 0)
+        for k in tot:
+            tot[k] += int((seg.get("tot") or {}).get(k, 0) or 0)
+        n += int(seg.get("matches") or 0)
+    return n
+
+
+def _gap_windows(since: str, until: str, segs: list[dict]) -> list[tuple[str, str]]:
+    """本次范围里没被这些缓存段盖住的时间段（闭区间，按日期串比较；'' = 不限）
+
+    逐场统计按「对局日期落在哪天」归属，所以相邻两段必须错开一天：
+    折进来的段占了 [s, u]，空档就只能是 [.., s-1] 与 [u+1, ..]，否则边界那天会算两遍。
+    """
+    gaps: list[tuple[str, str]] = [(since or "", until or "")]
+    for seg in sorted(segs, key=lambda v: v["scope_since"]):
+        s, u = seg["scope_since"], seg["scope_until"]
+        nxt: list[tuple[str, str]] = []
+        for a, b in gaps:
+            if (b and s > b) or (a and u < a):   # 这一段跟本窗口不沾边
+                nxt.append((a, b))
+                continue
+            if not a or a < s:
+                nxt.append((a, _day_shift(s, -1)))
+            if not b or u < b:
+                nxt.append((_day_shift(u, 1), b))
+        gaps = nxt
+    out = [(a, b) for a, b in gaps if not (a and b and a > b)]
+    out.sort(key=lambda w: w[0], reverse=True)   # 新的在前：场次上限要先满足最近的
+    return out
+
+
+def _dedup_matches(matches: list[dict]) -> list[dict]:
+    """多段收集来的对局按 instance 去重后合起来（新→旧）"""
+    seen, out = set(), []
+    for m in matches:
+        if m["instance"] and m["instance"] in seen:
+            continue
+        seen.add(m["instance"])
+        out.append(m)
+    out.sort(key=lambda m: m["period"], reverse=True)
+    return out
+
+
 async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                           since: str, until: str, scope: str, label: str,
                           kind: str, mode: int, cap: int, skip_modes: frozenset):
-    """跑生涯武器统计；带"汇总结果"缓存——同范围再查只补拉上次覆盖日期之后的新对局
+    """跑生涯武器统计；两级缓存——同范围增量补拉，别的范围整段折进来
 
-    缓存命中且范围未变时：直接读回上次的排名与覆盖日期，只枚举/统计比它更新的对局，
-    把新增的击杀累加进去（逐场 PGCR 也走 _PVP_MATCH_CACHE），于是第二次查基本只花
-    "翻最近几页活动历史"的时间。
+    ① 同一玩家同一范围再查：读回上次的排名与覆盖日期，只统计比它更新的对局。
+    ② 先查过某个赛季、现在要查全生涯：那个赛季整段落在本次范围里，直接折进来，
+       连那段时间的活动历史都不用重翻（逐场 PGCR 明细本来也走 _PVP_MATCH_CACHE）。
+    ③ 老汇总的覆盖范围不可信时不拿它当基准，整段重算（见下面的 stale 判断）。
     """
     _load_agg_cache()
     key = f"{mid}|{kind}|{scope}"
     base = _AGG_CACHE.get(key)
-    reuse = bool(base and base.get("weapons")
-                 and base.get("scope_since", "") == since
-                 and base.get("scope_until", "") == until)
+    same_scope = bool(base and base.get("weapons")
+                      and base.get("scope_since", "") == since
+                      and base.get("scope_until", "") == until)
+    if same_scope:
+        # 这份老汇总可不可信？
+        #   · 当时的场次上限比现在小 → 它是被截断出来的，最早日期是假边界；而且截断是按
+        #     角色顺序停的，中间那段（后两个角色）也可能整块没统计到。
+        #   · 2026-10-07 之前写的缓存没记 cap/capped，判断不了完整性，按不可信算。
+        # 不可信就丢掉它整段重算：逐场明细有 _PVP_MATCH_CACHE 兜底，重算主要是重新翻一遍
+        # 活动历史，代价很小；不重算的话，上限调大了也永远补不回那几年的对局。
+        prev_cap, prev_capped = base.get("cap"), base.get("capped")
+        if (prev_cap is None or prev_capped is None
+                or (bool(prev_capped) and (cap <= 0 or cap > int(prev_cap)))):
+            log_stage(f"{jid}#collect",
+                      f"{_job_label(jid)}：老汇总（{base.get('matches', 0)} 场，最早 "
+                      f"{base.get('oldest') or '—'}）的场次上限是 "
+                      f"{'未记录' if prev_cap is None else prev_cap}，这次按当前上限整段重算")
+            JOBS[jid]["note"] = ("老汇总只覆盖到 "
+                                 f"{base.get('oldest') or '—'}（当时受场次上限截断），"
+                                 "本次整段重算")
+            base = None
+            same_scope = False
     agg: dict[str, dict] = {}
     tot = {"kills": 0, "precision": 0, "melee": 0, "grenade": 0, "super": 0, "ability": 0}
     base_matches = base_missed = 0
     base_oldest = base_newest_full = ""
-    eff_since = since
-    if reuse:
+    segs: list[dict] = []
+    if same_scope:
         agg = {h: dict(v) for h, v in (base.get("weapons") or {}).items()}
         for k in tot:
             tot[k] = int((base.get("tot") or {}).get(k, 0) or 0)
@@ -2753,37 +3462,63 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
         base_missed = int(base.get("missed", 0) or 0)
         base_oldest = base.get("oldest", "") or ""
         base_newest_full = base.get("newest_full", "") or ""
-        eff_since = base_newest_full[:10] or since
-    empty = {"display": JOBS[jid]["name"], "scope": scope, "scope_label": label,
-             "kind": kind, "matches": base_matches, "missed": base_missed, "capped": False,
-             "cap": cap, "range": (base_oldest, base_newest_full[:10]),
-             "cached": base_matches if reuse else 0, "added": 0,
-             "weapons": sorted(agg.values(), key=lambda x: -x["kills"]), **tot}
+        gaps = [(base_newest_full[:10] or since, until)]
+    else:
+        segs = _sub_agg_segments(mid, kind, since, until, skip=key)
+        base_matches = _fold_segments(agg, tot, segs)
+        base_missed = sum(int(s.get("missed") or 0) for s in segs)
+        olds = [s.get("oldest") or "" for s in segs if s.get("oldest")]
+        news = [s.get("newest_full") or "" for s in segs if s.get("newest_full")]
+        base_oldest = min(olds) if olds else ""
+        base_newest_full = max(news) if news else ""
+        gaps = _gap_windows(since, until, segs)
+        if segs:
+            span = "、".join(s.get("scope_label") or s.get("scope_since", "")
+                             for s in segs)
+            JOBS[jid]["note"] = f"复用已缓存范围：{span}"
+            log_stage(f"{jid}#collect",
+                      f"{_job_label(jid)}：折入 {len(segs)} 段已缓存范围（{span}），"
+                      f"共 {base_matches} 场，只补拉剩下 {len(gaps)} 段")
+    matches: list[dict] = []
+    folded_n = 0 if same_scope else base_matches
     try:
         def _on_page(ci, cn, page, n):
             log_progress(f"{jid}#collect", page, 0,
                          label=f"{_job_label(jid)} · 翻取对局历史",
-                         extra=f"角色 {ci}/{cn} · 第 {page} 页 · 已收集 {n} 场",
+                         extra=f"角色 {ci}/{cn} · 第 {page} 页 · 本次已收 {len(matches) + n} 场",
                          min_gap=1.5, min_pct=0)
 
         log_stage(f"{jid}#collect", f"{_job_label(jid)}：开始翻取对局历史…")
-        matches = await _collect_matches(mtype, mid, chars, mode, eff_since, until, cap,
-                                         skip_modes, on_page=_on_page)
-        if reuse and base_newest_full:  # 边界那天会重复枚举，按完整时间戳只留更新的
-            matches = [m for m in matches if m["period"] > base_newest_full]
+        for gi, (gs, gu) in enumerate(gaps):
+            await _job_checkpoint(jid)
+            remain = cap - folded_n - len(matches) if cap > 0 else 0
+            if cap > 0 and remain <= 0:
+                break  # 场次上限吃满，更早的空档不用再翻
+            span_txt = f"{gs or '最早'} ~ {gu or '现在'}"
+            log_progress(f"{jid}#collect", 0, 0, label=f"{_job_label(jid)} · 翻取对局历史",
+                         extra=f"范围 {span_txt}", force=True, min_pct=0)
+            part = await _collect_matches(mtype, mid, chars, mode, gs, gu, remain,
+                                          skip_modes, on_page=_on_page,
+                                          check=lambda: _job_checkpoint(jid))
+            if gi == 0 and same_scope and base_newest_full:
+                # 边界那天会重复枚举，按完整时间戳只留更新的（只对"更新"那段成立：
+                # 往前补的那段本来就早于 base_oldest，套上这个过滤会把它整段丢掉）
+                part = [m for m in part if m["period"] > base_newest_full]
+            matches += part
+        matches = _dedup_matches(matches)
         if not matches:  # 没有新对局：有缓存就直接返回上次排名，否则返回空态
             log_stage(f"{jid}#collect", f"{_job_label(jid)}：没有新对局，直接出图")
-            JOBS[jid].update(status="done", total=1, done=1, result=empty)
-            return
-        JOBS[jid].update(total=len(matches))
-        log_progress(jid, 0, len(matches), label=_job_label(jid), force=True,
-                     extra="开始逐场拉取对局明细")
+        JOBS[jid].update(total=max(1, len(matches)), done=0 if matches else 1)
+        if matches:
+            log_progress(jid, 0, len(matches), label=_job_label(jid), force=True,
+                         extra="开始逐场拉取对局明细")
         missed = 0
-        sem = asyncio.Semaphore(bot_runtime.concurrency_limit(_PVP_CONCURRENCY))
+        sem = _pgcr_sem()
         lock = asyncio.Lock()
 
         async def one(m: dict):
             nonlocal missed
+            await _job_checkpoint(jid)   # 暂停就在新对局之前停下，已发出去的收完为止
             async with sem:
                 try:
                     c = await pvp_match_contribution(m["instance"], mid)
@@ -2809,33 +3544,39 @@ async def _run_weapon_job(jid: str, mtype: int, mid: str, chars: list[str],
                 JOBS[jid]["done"] += 1
                 _job_log(jid)
 
-        await asyncio.gather(*(one(m) for m in matches))
+        if matches:
+            await asyncio.gather(*(one(m) for m in matches))
         save_seen_players()
         _save_pvp_cache()
         weapons = sorted((v for v in agg.values() if v["kills"] > 0), key=lambda x: -x["kills"])
         total_matches = base_matches + len(matches)
         dates = [m["period"][:10] for m in matches]
-        newest = max(dates) if dates else base_newest_full[:10]
+        newest = max(dates + ([base_newest_full[:10]] if base_newest_full else []), default="")
         pool = [d for d in dates if d] + ([base_oldest] if base_oldest else [])
         oldest = min(pool) if pool else ""
-        newest_full = max([m["period"] for m in matches] + ([base_newest_full] if base_newest_full else []))
+        newest_full = max([m["period"] for m in matches]
+                          + ([base_newest_full] if base_newest_full else []), default="")
         result = {
             "display": JOBS[jid]["name"], "scope": scope, "scope_label": label, "kind": kind,
             "matches": total_matches, "missed": base_missed + missed,
             "capped": cap > 0 and total_matches >= cap, "cap": cap,
             "range": (oldest, newest),
-            "added": len(matches), "cached": base_matches if reuse else 0,
+            "added": len(matches), "cached": base_matches,
+            "note": JOBS[jid].get("note") or "",
             "weapons": weapons,
             # 卡片只展示前 60 把，汇总块要用全量，所以单独给两个总数
             "weapon_kills": sum(w["kills"] for w in weapons),
             "weapon_precision": sum(w["precision"] for w in weapons),
             **tot}
-        JOBS[jid].update(status="done", result=result)
+        JOBS[jid].update(status="done", total=max(1, JOBS[jid].get("total") or 1),
+                         done=max(1, JOBS[jid].get("total") or 1), result=result)
         _AGG_CACHE[key] = {
-            "scope_since": since, "scope_until": until,
+            "scope_since": since, "scope_until": until, "mid": mid, "kind": kind,
             "weapons": agg, "tot": tot, "matches": total_matches,
             "missed": base_missed + missed, "oldest": oldest,
             "newest": newest, "newest_full": newest_full,
+            "cap": cap,   # 记下当时的场次上限：调大之后这份汇总的头就是假边界，要往前补
+            "capped": cap > 0 and total_matches >= cap,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
         _save_agg_cache()
     except Exception as exc:  # noqa: BLE001
@@ -2943,7 +3684,8 @@ async def _run_gm_job(jid: str, mtype: int, mid: str, chars: list[str],
             mtype, mid, chars, 0, since, until, 5000, frozenset(),
             on_page=lambda ci, cn, page, n: log_progress(
                 f"{jid}#collect", page, 0, label=f"{_job_label(jid)} · 翻取活动历史",
-                extra=f"角色 {ci}/{cn} · 第 {page} 页 · 已收集 {n} 场", min_gap=1.5, min_pct=0))
+                extra=f"角色 {ci}/{cn} · 第 {page} 页 · 已收集 {n} 场", min_gap=1.5, min_pct=0),
+            check=lambda: _job_checkpoint(jid))
         JOBS[jid].update(done=1)
         log_progress(jid, 1, 3, label=_job_label(jid), force=True,
                      extra=f"第 2/3 步：读取成就记录（已扫 {len(matches)} 场）")
@@ -3317,6 +4059,15 @@ def _load_heat_cache():
             _HEAT_CACHE.update(data)
     except Exception:  # noqa: BLE001 首次运行/文件损坏都不影响统计
         pass
+    # 维护窗口内跑出来的热力图不可信（官方维护期翻页会缺对局，算出来天数/场次偏少），
+    # 别拿它当「已统计到哪一场」的基准，直接丢掉重跑
+    bad = [k for k, v in _HEAT_CACHE.items()
+           if isinstance(v, dict) and bst.suspect_stamp(v.get("updated"))]
+    for k in bad:
+        _HEAT_CACHE.pop(k, None)
+    if bad:
+        print(f"[维护] heatmap_cache 丢弃 {len(bad)} 条维护窗口内的缓存，下次查询重跑",
+              flush=True)
 
 
 def _save_heat_cache():
@@ -3418,6 +4169,7 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
         for ci, cid in enumerate(chars):
             page = 0
             while page < 60:  # 60页×250 ≈ 上限1.5万场/角色
+                await _job_checkpoint(jid)
                 acts = await activity_history(mtype, mid, cid, 0, count=250, page=page)
                 if not acts:
                     break
@@ -3452,6 +4204,12 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
                     continue
                 break
         total_n = sum(v["matches"] for v in days.values())
+        if not days:
+            # 一场都没翻到：接口出问题（维护/限流），不是「这人没打过」——
+            # 以前会把空 days 写进缓存，把那块热力图永久抹成空白
+            raise DataSuspiciousError(
+                "热力图：对局历史一场都没翻到（疑似官方维护或接口异常），"
+                "已拦下避免出错误统计，稍后重发一次即可")
         # 补拉时数进来的每一场都是新的（遇到已统计过的就停了）；全量重跑则没有「新增」可言
         added = counted if reuse else 0
         _HEAT_CACHE[ckey] = {"display": JOBS[jid]["name"], "chars": chars, "days": days,
@@ -3464,32 +4222,10 @@ async def _run_heatmap(jid: str, mtype: int, mid: str, chars: list[str],
                                             gate=gate, newest_full=newest_full))
     except Exception as exc:  # noqa: BLE001
         JOBS[jid].update(status="error", error=str(exc))
-@_traced(lambda name, mode=5, count=100: f"战绩查询 {name}")
-async def mode_report(name: str, mode: int, count: int = 100) -> dict:
-    """基于对局历史聚合某模式战绩（跨角色合并 + 细分模式 + 胜率）"""
-    member = await resolve_member(name)
-    if not member:
-        raise LookupError(f"没找到玩家 {name}")
-    mtype, mid = member["mtype"], member["mid"]
-    profile = await get_profile(mtype, mid)
-    chars = profile.get("characters", {}).get("data", {})
+def _agg_matches(matches: list[dict]) -> dict:
+    """一批对局（已按 instance 去重、新→旧）→ 战绩汇总：胜负 / K-D / 模式细分 / 连胜。
 
-    seen, matches = set(), []
-    mdisp = f"{member['display']}#{fmt_code(member['code'])}"
-    nch = len(chars) or 1
-    log_progress(f"mode:{mid}:{mode}", 0, nch, label=f"战绩 {mdisp}", force=True,
-                 extra=f"拉取每个角色最近 {count} 场对局历史")
-    for ci, cid in enumerate(chars, 1):
-        for m in await activity_history(mtype, mid, cid, mode, count=count):
-            key = m["instance"] or f"{m['ref']}{m['period']}"
-            if key in seen:
-                continue
-            seen.add(key)
-            matches.append(m)
-        log_progress(f"mode:{mid}:{mode}", ci, nch, label=f"战绩 {mdisp}",
-                     extra=f"角色 {ci}/{nch} 完成 · 已收 {len(matches)} 场")
-    matches.sort(key=lambda m: m["period"], reverse=True)
-
+    「近期战绩」与「全生涯统计」共用这一份聚合，保证两块的算法口径完全一致。"""
     done = [m for m in matches if m["completed"]]
     competitive = any(m["competitive"] for m in matches)
     # 探索(巡逻)这类活动本身没有"完成"概念，别拉低 PVE 通关率
@@ -3500,6 +4236,7 @@ async def mode_report(name: str, mode: int, count: int = 100) -> dict:
     deaths = sum(m["deaths"] for m in done)
     assists = sum(m["assists"] for m in done)
     secs = sum(m["duration"] for m in done)
+    opp = sum(m.get("opp", 0) for m in done)
 
     br: dict[str, dict] = {}
     for m in matches:
@@ -3535,7 +4272,6 @@ async def mode_report(name: str, mode: int, count: int = 100) -> dict:
                 break
     eff_list = [m["eff"] for m in done if m.get("eff")]
     return {
-        "display": f"{member['display']}#{fmt_code(member['code'])}",
         "competitive": competitive,
         "total": len(matches),
         "completed": len(done),
@@ -3546,6 +4282,11 @@ async def mode_report(name: str, mode: int, count: int = 100) -> dict:
         "kills": kills,
         "deaths": deaths,
         "assists": assists,
+        "opp": opp,
+        # 智谋专用：对局历史的 score 实测就是「存入荧光」（120 场逐场与 PGCR motesDeposited
+        # 相等，生涯 8,075 = 官方 motesDeposited 8,075）。其它模式这个键不用。
+        "motes": sum(m["score"] for m in matches),
+        "best_kills": max((m["kills"] for m in done), default=0),
         "kd": (kills / deaths) if deaths else 0.0,
         "kda": ((kills + assists) / deaths) if deaths else 0.0,
         "avg_kills": (kills / len(done)) if done else 0.0,
@@ -3554,8 +4295,299 @@ async def mode_report(name: str, mode: int, count: int = 100) -> dict:
         "clear_rate": (sum(1 for m in rate_base if m["completed"]) / len(rate_base) * 100) if rate_base else 0.0,
         "hours": secs / 3600,
         "breakdown": breakdown,
-        "matches": matches,
     }
+
+
+def _merge_matches(per_char: dict[str, list[dict]]) -> list[dict]:
+    """跨角色合并对局（按 instance 去重，同一场只算一次），新→旧"""
+    seen, out = set(), []
+    for rows in per_char.values():
+        for m in rows:
+            key = m["instance"] or f"{m['ref']}{m['period']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+    out.sort(key=lambda m: m["period"], reverse=True)
+    return out
+
+
+async def _char_history_deep(mtype: int, mid: str, cid: str, mode: int, cap: int,
+                             sem: asyncio.Semaphore) -> tuple[list[dict], bool]:
+    """单角色翻完对局历史：返回 (新→旧的对局列表, 是否被上限/失败截断)。
+
+    cap<=0 = 不限（翻到接口给不出为止，Bungie 每角色约 60 页 × 250 场）。同一角色的
+    几页并发拉，跨角色由 sem 限流——250 场一页的响应就是几百毫秒，冷账号也就几秒。"""
+    out: list[dict] = []
+    page_cap = 0 if cap <= 0 else max(1, (cap + _HISTORY_PAGE - 1) // _HISTORY_PAGE)
+    pg = 0
+    while True:
+        wave = [p for p in range(pg, pg + _HISTORY_WAVE) if not page_cap or p < page_cap]
+        if not wave:
+            return out, True          # 页数到顶：后面还有历史没翻
+        async def _one(p: int):
+            async with sem:
+                try:
+                    return await activity_history(mtype, mid, cid, mode, count=_HISTORY_PAGE, page=p)
+                except BungieMaintenanceError:
+                    # 维护要一路抛上去（上层会换成「维护中」的提示）：不能当成「这一页坏了」，
+                    # 否则拿半截历史出卡——维护期最典型的现象就是「这模式没打过 / 已达上限」
+                    raise
+                except Exception:  # noqa: BLE001  单页失败：保留已拿到的，标记不完整
+                    return None
+        rows_list = await asyncio.gather(*(_one(p) for p in wave))
+        short = False
+        for rows in rows_list:
+            if rows is None:
+                return out, True
+            out += rows
+            if len(rows) < _HISTORY_PAGE:
+                short = True
+        pg += len(wave)
+        if short:
+            return out, False
+        if page_cap and pg >= page_cap:
+            return out, True
+
+
+async def _history_deep(mtype: int, mid: str, cids, mode: int, cap: int) -> tuple[dict[str, list[dict]], bool]:
+    """跨角色翻全生涯对局历史 → ({cid: [对局…]}, 是否有角色被截断)"""
+    sem = asyncio.Semaphore(_HISTORY_CONCURRENCY)
+    res = await asyncio.gather(*(_char_history_deep(mtype, mid, c, mode, cap, sem) for c in cids))
+    return {c: r[0] for c, r in zip(cids, res)}, any(r[1] for r in res)
+
+
+def _emblem_of(chars: dict) -> tuple[str, str]:
+    """玩家名片（宽幅底图 + 96×96 纹章）：取「玩得最久的角色」，和 /生涯 的名牌同源"""
+    top = max(chars.values(), key=lambda c: int(c.get("minutesPlayedTotal") or 0), default=None)
+    if not top:
+        return "", ""
+    return BASE + (top.get("emblemPath") or ""), BASE + (top.get("emblemBackgroundPath") or "")
+
+
+def _is_gm_nightfall(name: str) -> bool:
+    """宗师难度日落：两种历史写法（新「宗师日落: X」/ 旧「日落: 宗师」），也含赛季活动的宗师档"""
+    return (name.startswith("宗师日落") or "日落: 宗师" in name or "日落：宗师" in name
+            or name.endswith("：宗师") or name.endswith(": 宗师"))
+
+
+def _is_master_nightfall(name: str) -> bool:
+    """大师难度日落：「日落: 大师」这种写法（大师突袭 / 大师地牢另算，不混进来）"""
+    return "日落" in name and "大师" in name
+
+
+def _pve_endgame(matches: list[dict]) -> dict:
+    """终局 PvE 通关数（只算完成的对局）：突袭(4) / 地牢(82) / 宗师日落 / 大师日落 /
+    终极征服。
+
+    官方统计接口没有「分难度日落」，也没有逐副本计数——只能按对局历史数（raid.report
+    同源做法）。实测 Wj#8984：大师日落 30 与 raid.report 完全一致、突袭 535 ≈ 对方的 536。
+    征服系列（专家/大师/宗师/终极）是赛季中心的高难活动，实测顺着 mode=7 的历史一起拿到
+    （modes=[7,3,18]），这里只把最高档「终极征服」单列出来。"""
+    out = {"raid": 0, "raid_all": 0, "dungeon": 0, "dungeon_all": 0,
+           "gm": 0, "gm_all": 0, "master_nf": 0, "master_nf_all": 0,
+           "ultimate": 0, "ultimate_all": 0}
+    for m in matches:
+        if m["mode"] == 4:
+            out["raid_all"] += 1
+            out["raid"] += int(bool(m["completed"]))
+        elif m["mode"] == 82:
+            out["dungeon_all"] += 1
+            out["dungeon"] += int(bool(m["completed"]))
+        elif m["name"].startswith(_GM_CONQUEST_TIERS[0]):     # 终极征服
+            out["ultimate_all"] += 1
+            out["ultimate"] += int(bool(m["completed"]))
+        elif _is_gm_nightfall(m["name"]):
+            out["gm_all"] += 1
+            out["gm"] += int(bool(m["completed"]))
+        elif _is_master_nightfall(m["name"]):
+            out["master_nf_all"] += 1
+            out["master_nf"] += int(bool(m["completed"]))
+    return out
+
+
+def _conqueror_gild_hash() -> str:
+    """「征服者」称号的镀金记录 hash（在记录索引里找带 gildingTrackingRecordHash 的那个）。
+
+    这条记录的 `completedCount` = 历史累计镀金次数（实测 Wj#8984 = 4，与 raid.report 的
+    「GILDED CONQUEROR」一致）；objectives 里的 progress/completionValue 只是**本季**进度。"""
+    for h, d in _records.items():
+        ti = d.get("titleInfo") or {}
+        if not ti.get("gildingTrackingRecordHash"):
+            continue
+        if "征服者" in ((d.get("displayProperties") or {}).get("name") or ""):
+            return str(ti["gildingTrackingRecordHash"])
+    return ""
+
+
+_GAMBIT_SUM_KEYS = ("activitiesEntered", "activitiesWon", "kills", "deaths", "assists",
+                    "secondsPlayed", "precisionKills", "bestSingleGameKills",
+                    "motesDeposited", "motesPickedUp", "motesDenied", "motesLost",
+                    "bankOverage", "invasions", "invasionKills", "invasionDeaths",
+                    "invaderKills", "invaderDeaths", "primevalKills", "primevalDamage",
+                    "highValueKills", "blockerKills", "smallBlockersSent",
+                    "mediumBlockersSent", "largeBlockersSent", "roundsPlayed", "roundsWon")
+
+
+async def gambit_career(mtype: int, mid: str, chars) -> dict:
+    """智谋生涯（官方角色级 modes=63 跨角色求和）：荧光 / 入侵 / 原始使者这些专属数据只有它给。
+
+    官方 gambit 桶实测是**完整**的（Wj#8984 三角色 activitiesEntered 285+4+109 = 398
+    = 对局历史去重 398 场，逐角色相等）；与 PvP 的 allPvP 少算 2020 年后的试炼/铁旗不同，
+    所以智谋顶部放心用官方数。字段名（官方 statId，2026-10 实测都存在）：
+    motesDeposited/motesDenied/motesLost/motesPickedUp = 存入/截夺/丢失/拾取荧光，
+    invasions/invasionKills/invasionDeaths = 入侵次数/入侵击杀/入侵中阵亡，
+    invaderKills/invaderDeaths = 击败入侵者/被入侵者击败，primevalKills = 原始使者击杀。
+    任角色拉不到就跳过，全拉不到返回 {}（卡片退化成窗口聚合那套）。"""
+    tot = {k: 0 for k in _GAMBIT_SUM_KEYS}
+    ok, bad = False, ""
+    for cid in chars:
+        # 注意：gambit 桶不是 groups 能选出来的——必须带 modes=63，返回体里才出现
+        # `pvecomp_gambit`（实测 groups=101,103 只给 allPvP/allPvE/raid… 那几个）
+        r = await client().get(
+            f"/Platform/Destiny2/{mtype}/Account/{mid}/Character/{cid}/Stats/",
+            params={"groups": "101,103", "modes": 63})
+        resp = _parse(r)
+        v, why = _verdict(resp)
+        if v == "bad":
+            bad = why
+            continue
+        st = resp.get("Response") or {}
+        at = (st.get("pvecomp_gambit") or {}).get("allTime") or {}
+        if not at:
+            continue
+        ok = True
+        for k in _GAMBIT_SUM_KEYS:
+            v2 = ((at.get(k) or {}).get("basic") or {}).get("value")
+            if v2:
+                tot[k] += int(v2)
+    if not ok:
+        if bad:
+            # 以前任角色拉不到就跳过、全拉不到返回 {}——维护期整块智谋生涯会静静消失，
+            # 卡片退化成窗口聚合，用户看不出来数字少了一大截
+            raise DataSuspiciousError(
+                f"智谋生涯统计读取失败（{bad}）：疑似官方维护或接口异常，"
+                f"已拦下避免出错误统计，稍后重发一次即可")
+        return {}
+    ent, wins = tot["activitiesEntered"], tot["activitiesWon"]
+    tot["win_rate"] = (wins / ent * 100) if ent else 0.0
+    tot["kd"] = (tot["kills"] / tot["deaths"]) if tot["deaths"] else 0.0
+    tot["kda"] = ((tot["kills"] + tot["assists"]) / tot["deaths"]) if tot["deaths"] else 0.0
+    tot["avg_kills"] = (tot["kills"] / ent) if ent else 0.0
+    tot["hours"] = tot["secondsPlayed"] / 3600.0
+    tot["blockers"] = (tot["smallBlockersSent"] + tot["mediumBlockersSent"]
+                       + tot["largeBlockersSent"])
+    return tot
+
+
+async def _profile_extras(mtype: int, mid: str) -> dict:
+    """成就分 + 征服者镀金次数 + 终极征服本季进度（GetProfile components=900，一次请求；失败不拖垮卡片）
+
+    成就分有两个口径：`lifetimeScore` = 生涯累计（含已失效的传承分数，raid.report 用的就是它）、
+    `score`/`activeScore` = 现有（游戏内当前凯旋分）。实测 Wj#8984：现有 17,223 / 累计 84,592。"""
+    out = {"triumph": 0, "triumph_now": 0, "gilds": 0, "ultimate": (0, 0)}
+    try:
+        r = await client().get(f"/Platform/Destiny2/{mtype}/Profile/{mid}/",
+                               params={"components": "900"})
+        pr = (_parse(r).get("Response") or {}).get("profileRecords") or {}
+        # 注意：分数与记录都嵌在 profileRecords.data 里（同 _merged_records 的读法）
+        pdata = pr.get("data") if isinstance(pr.get("data"), dict) else {}
+        pdata = pdata or {}
+        out["triumph"] = int(pdata.get("lifetimeScore") or pdata.get("score")
+                             or pdata.get("activeScore") or 0)
+        out["triumph_now"] = int(pdata.get("score") or pdata.get("activeScore")
+                                 or pdata.get("lifetimeScore") or 0)
+        recs = pdata.get("records") or {}
+        gild_rec = recs.get(_conqueror_gild_hash()) or {}
+        out["gilds"] = int(gild_rec.get("completedCount") or 0)
+        if not out["gilds"]:      # 老数据回退：拿本季目标进度（至少不为空）
+            for o in (recs.get(_GM_REC_GILD, {}).get("objectives") or []):
+                out["gilds"] = max(out["gilds"], int(o.get("progress") or 0))
+        out["ultimate"] = _obj_progress(recs.get(_GM_REC_ULTIMATE, {}))   # 本季终极征服 x/y
+    except Exception:  # noqa: BLE001  记录拉不到就显示 0，不影响其它数据
+        pass
+    return out
+
+
+@_traced(lambda name, mode=5, count=0, career=False, jid="": f"战绩查询 {name}")
+async def mode_report(name: str, mode: int, count: int = 0, career: bool = False,
+                      jid: str = "", endgame: bool = False) -> dict:
+    """基于对局历史聚合某模式战绩（跨角色合并 + 细分模式 + 胜率）
+
+    count：近期窗口 = **跨角色合并后**的最近多少场（0 = 读后台配置 pvp/pve/gambit_recent_count，
+        默认 100；每角色仍先各拉 count 场，保证合并后能凑齐全局最近 count 场）
+    career：再算一份全生涯聚合放进 rep["career"]（跨角色去重、含全部模式）。PvP 顶部
+        生涯统计用它——官方 allPvP 少算 2020 年之后的试炼/铁旗（实测差一半以上），
+        只有对局历史是全的；受 match_cap("pvp") 约束，被截断时 career["capped"]=True。
+    endgame：/pve 用。翻全生涯 PvE 历史（不受生涯武器场次上限约束——只翻历史页，不拉 PGCR），
+        数出突袭 / 地牢 / 宗师日落 / 大师日落 / 终极征服通关数（rep["endgame"]），并附带
+        成就分（现有 + 生涯累计）与征服者镀金次数（rep["triumph"] / rep["triumph_now"] /
+        rep["gilds"] / rep["ultimate"]）。
+    mode=63（智谋）时额外取官方 gambit 生涯桶（rep["gambit"]：荧光 / 入侵 / 原始使者）；
+    智谋卡片的「最近对局」窗口里，对局历史的 score 就是存入荧光（rep["motes"]）。
+    """
+    member = await resolve_member(name)
+    if not member:
+        raise LookupError(f"没找到玩家 {name}")
+    mtype, mid = member["mtype"], member["mid"]
+    profile = await get_profile(mtype, mid)
+    chars = profile.get("characters", {}).get("data", {})
+    if not chars:
+        raise LookupError(f"{member['display']} 档案下没有角色")
+
+    mdisp = f"{member['display']}#{fmt_code(member['code'])}"
+    nch = len(chars)
+    cids = list(chars)
+    kind = {5: "pvp", 63: "gambit"}.get(mode, "pve")
+    n_recent = count or recent_count(kind)
+    deep = career or endgame
+    # 只有 PvP 的全模式生涯聚合吃「生涯武器场次上限」（它和 /pvp生涯武器 共用一份口径）；
+    # /pve 的终局通关数不吃——它只翻对局历史页、不逐场拉 PGCR，翻全生涯也就十几秒，
+    # 而按上限截断会让「突袭 / 大师日落」这些老记录直接数丢（实测截到 3000 场时大师日落变 0）。
+    cap = match_cap(kind) if career else 0
+    # 胜点图可以比窗口长：按需多翻几页（智谋默认画 100 个格子，窗口也是 100，一般不额外翻）
+    grid = grid_count(kind) if mode in (5, 63) else 0
+    fetch_n = max(n_recent, grid)
+
+    # 两种模式都走翻页器：窗口模式下每角色也只翻首页（250 场），合并后再截全局最近 N 场，
+    # 这样"设定 300 局"就是整个账号最近 300 局，而不是每角色各 300 局
+    fetch_cap = cap if deep else fetch_n
+    log_progress(f"mode:{mid}:{mode}", 0, nch, label=f"战绩 {mdisp}", force=True,
+                 extra=(f"拉取对局历史（每角色最多 {fetch_cap or '不限'} 场）" if deep
+                        else f"拉取每个角色最近 {fetch_n} 局对局历史"))
+    hist, capped = await _history_deep(mtype, mid, cids, mode, fetch_cap)
+    log_progress(f"mode:{mid}:{mode}", nch, nch, label=f"战绩 {mdisp}", force=True,
+                 extra=f"已收 {sum(len(v) for v in hist.values())} 场历史")
+
+    all_matches = _merge_matches(hist)
+    window = all_matches[:n_recent]            # 窗口 = 跨角色合并后的最近 N 局
+    emblem, emblem_bg = _emblem_of(chars)
+    rep = {"display": mdisp, "emblem": emblem, "emblem_bg": emblem_bg,
+           "window": n_recent, "grid": grid, "mode": mode,
+           "playtime_hours": sum(int(c.get("minutesPlayedTotal") or 0)
+                                 for c in chars.values()) / 60.0}
+    rep.update(_agg_matches(window))
+    rep["matches"] = window          # 「最近对局」列表用（渲染层自己截前 N 条）
+    rep["grid_matches"] = all_matches[:grid] if grid else []
+    if mode == 63:
+        try:
+            rep["gambit"] = await gambit_career(mtype, mid, cids)
+        except Exception:  # noqa: BLE001  官方智谋桶拉不到就只显示窗口聚合
+            rep["gambit"] = {}
+    if career:
+        car = _agg_matches(all_matches)
+        car["cap"] = cap
+        car["capped"] = bool(capped and cap)
+        rep["career"] = car
+        rep["history_total"] = sum(len(v) for v in hist.values())
+    if endgame:
+        eg = _pve_endgame(all_matches)
+        eg["scanned"] = len(all_matches)
+        eg["cap"] = cap
+        eg["capped"] = bool(capped and cap)
+        rep["endgame"] = eg
+        rep.update(await _profile_extras(mtype, mid))
+    return rep
 
 
 # ---------- Eververse 光尘商店（数据源：Bungie 官方 GetVendors，需账号授权） ----------
@@ -3589,9 +4621,25 @@ EV_BIG_TYPES = ("武器皮肤", "泰坦皮肤", "猎人皮肤", "术士皮肤", 
                 "飞船", "载具", "快雀")
 
 EV_CACHE_FILE = "eververse_cache.json"
-EV_CACHE_VER = 3      # 换缓存结构/展示规则时 +1，旧缓存自动作废
-_EV_CACHE: dict = {"at": 0.0, "day": "", "data": None}
+EV_CACHE_VER = 4      # 4: 记官方 nextRefreshDate / 本轮归属刷新点 / 抓取时刻（时间强关联）
+_EV_CACHE: dict = {"data": None}
+_EV_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = \
+    weakref.WeakKeyDictionary()
 _EV_INDEX = None
+
+# ---------- 时间强关联（货架什么时候换，以官方字段为准） ----------
+# 官方 GetVendors 里每个 vendor 带 nextRefreshDate、**每件商品**带 overrideNextRefreshDate，
+# 后者才是货架的刷新时刻。实测 2026-10-08：10 个光尘 vendor 的实体都是 10-14 01:00（周值）、
+# 而挂着的 18 件商品全是 10-09 01:00（次日 1 点）——**货架每天 1 点换**（用户口径对，
+# 只看 vendor 字段会误判成周刷）。所以下面一律以商品级 override 为准，没有才退回 vendor 值。
+# 用户报的「光尘商店没刷新」根因：2026-10-07/08 那两天官方维护，货架冻住不换，
+# 而旧实现按「每天 1 点换缓存键」重取时官方接口仍回同一批旧货，落到盘里就当成了新货架。
+EV_RESET_HOUR = 1                      # 复位时刻：北京时间凌晨 1 点（校验/回退口径）
+EV_TZ = datetime.timezone(datetime.timedelta(hours=8))
+EV_MAX_AGE = 30 * 60                   # 缓存最长保留：超过就跟官方核一次（官方可能临时换架）
+EV_RETRY_AFTER = 10 * 60               # 过了官方刷新点却还没换架（官方延迟）：最快 10 分钟再问
+EV_AFTER_RESET = 30 * 60               # 复位点后 30 分钟 = 「官方可能还没切完」窗口
+EV_AFTER_RESET_TTL = 10 * 60           # 该窗口内缓存只留 10 分钟
 
 # 货币图标也走索引（光尘 2817410917 / 银币 3147280338 都在 eververse_items.json 里）
 _EV_CUR_ITEM = {"光尘": "2817410917", "银币": "3147280338"}
@@ -3617,10 +4665,58 @@ def _ev_index() -> dict:
     return _EV_INDEX
 
 
+def _ev_dt(ts: float) -> datetime.datetime:
+    """epoch → 北京时间 datetime（商店复位按北京时间算，与本机时区无关）"""
+    return datetime.datetime.fromtimestamp(ts, EV_TZ)
+
+
+def cn_str(fmt: str, ts: float | None = None) -> str:
+    """北京时间格式化（日志/面板/卡片统一走这里；本机时区不是 +8 也不会写错）"""
+    return _ev_dt(ts if ts is not None else time.time()).strftime(fmt)
+
+
+def _cn_now() -> datetime.datetime:
+    """当前北京时间（aware）。
+
+    全盘时钟口径：游戏的日复位 / 周复位都是 UTC 锚点（UTC 17:00 = 北京次日 01:00），
+    凡是「算今天是哪天 / 这周是哪周 / 谁在场」的逻辑只用这里，不碰本机时区——
+    机器时区一变（或带 DST），用本机时间就会把「今天」算错一天。
+    """
+    return datetime.datetime.now(EV_TZ)
+
+
 def _ev_day(ts: float | None = None) -> str:
-    """商店「当日」缓存键：商店北京时间凌晨 1 点刷新，所以 1 点前查到的东西算前一天。"""
-    t = datetime.datetime.fromtimestamp(ts if ts is not None else time.time())
-    return (t - datetime.timedelta(hours=1)).strftime("%Y-%m-%d")
+    """「当日」口径：商店按北京时间凌晨 1 点复位，所以 1 点前算前一天（其他日缓存也用）"""
+    t = _ev_dt(ts if ts is not None else time.time())
+    return (t - datetime.timedelta(hours=EV_RESET_HOUR)).strftime("%Y-%m-%d")
+
+
+def _ev_reset_prev(ts: float) -> float:
+    """≤ ts 的最近一个 01:00（北京时间）epoch——官方字段缺失时的回退口径"""
+    t = _ev_dt(ts) - datetime.timedelta(hours=EV_RESET_HOUR)
+    b = t.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (b + datetime.timedelta(hours=EV_RESET_HOUR)).timestamp()
+
+
+def _ev_parse_when(v) -> float:
+    """官方 ISO8601 时间 → epoch。哨兵（9999-12-31 = 不再刷新）与坏值返回 0.0"""
+    try:
+        d = datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if d.year > 2099:
+        return 0.0
+    return d.timestamp()
+
+
+def _ev_lock() -> asyncio.Lock:
+    """当前事件循环专用的锁（exe 里三个循环并存，同 client() 的处理）"""
+    loop = asyncio.get_running_loop()
+    lk = _EV_LOCKS.get(loop)
+    if lk is None:
+        lk = asyncio.Lock()
+        _EV_LOCKS[loop] = lk
+    return lk
 
 
 def _ev_cache_path() -> str:
@@ -3629,22 +4725,149 @@ def _ev_cache_path() -> str:
     return os.path.join(base, EV_CACHE_FILE)
 
 
-def _ev_cache_load(day: str) -> dict | None:
+def _ev_cache_get() -> dict | None:
+    """内存 / 落盘统一入口：返回整条记录（时间戳在 data 里），能不能用交给 _ev_usable。
+
+    以前这里按「缓存键 == 今天」判，1 点一过整条作废，看着在刷新，其实不问官方口径；
+    现在只按时间戳判有效期（含官方 nextRefreshDate），跨天不再强制作废。
+    """
+    if _EV_CACHE.get("data"):
+        return _EV_CACHE
     try:
         d = json.load(open(_ev_cache_path(), encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
-    if d.get("ver") != EV_CACHE_VER or d.get("day") != day:
+    if d.get("ver") != EV_CACHE_VER or not isinstance(d.get("data"), dict):
         return None
-    return d.get("data")
+    _EV_CACHE.update(d)          # 落盘命中回填内存
+    return _EV_CACHE
 
 
-def _ev_cache_save(day: str, data: dict):
+def _ev_cache_save() -> None:
     try:
-        dump_json(_ev_cache_path(),
-                  {"ver": EV_CACHE_VER, "day": day, "at": time.time(), "data": data})
+        dump_json(_ev_cache_path(), _EV_CACHE)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _ev_reason(ent: dict, now: float) -> str:
+    """这条货架现在还能不能直接出卡片。'' = 可以，否则给一句「为什么要重取」。"""
+    d = ent.get("data") or {}
+    at = float(d.get("fetched_at") or ent.get("at") or 0.0)
+    nr = float(d.get("next_refresh") or 0.0)
+    ra = float(d.get("refresh_at") or 0.0)
+    if not d.get("sections"):
+        return "缓存里没有商品"
+    if bst.suspect_at(at):
+        return "货架是维护窗口内抓的（维护期官方会冻住货架，恢复后不重取就是旧货）"
+    if at < bst.clean_since():
+        return "货架早于最近一次维护恢复，官方可能是在维护后才换的架"
+    if nr and now >= nr:
+        # 过了官方刷新点：要么官方已换架（我们拿的是旧货），要么官方延迟没换。
+        # 两种都得再问一次，但 10 分钟内问过就别问了，免得把接口打成死循环。
+        if now - at < EV_RETRY_AFTER:
+            return ""
+        return f"已过官方刷新点（{_ev_dt(nr):%m-%d %H:%M}）"
+    ttl = EV_MAX_AGE
+    if ra and now - ra < EV_AFTER_RESET:
+        ttl = EV_AFTER_RESET_TTL      # 复位点后官方常在半小时内才真正切完货架
+    if now - at >= ttl:
+        return f"距上次跟官方核对已 {int(now - at) // 60} 分钟"
+    return ""
+
+
+def _ev_usable(ent: dict, now: float) -> bool:
+    return not _ev_reason(ent, now)
+
+
+def ev_round_at(now: float | None = None) -> float:
+    """当前这一轮的刷新点（≤now 的最近一个北京 01:00）——卡片说「这轮」时的指代对象"""
+    return _ev_reset_prev(now if now is not None else time.time())
+
+
+def ev_behind(data: dict, now: float | None = None) -> bool:
+    """手里的货架是不是「还没轮到今天这一轮」（当前轮 = 最近一个 01:00 之后上架的货）。
+
+    卡片据此标一句「今天 01:00 的新货架还没取到」——官方偶尔晚切（维护后最常见）时，
+    我们手里确实只有上一轮的货，宁可写在脸上也不假装是当天刷的。
+    """
+    ra = float(data.get("refresh_at") or 0)
+    if not ra:
+        return False
+    return ra < _ev_reset_prev(now if now is not None else time.time())
+
+
+def _ev_cycle_days(nr: float, now: float, prev_days: int = 0) -> int:
+    """官方这栏货架的周期（天）：优先用上一轮实测出来的周期，其次看官方字段本身。
+
+    周三 01:00 是周重置锚点（D2 周复位 = UTC 周二 17:00），落在它上面当 7 天；
+    否则按「离下次刷新还有多久」判：>1.5 天当周周期，否则当天周期。
+    """
+    if prev_days:
+        return prev_days
+    if nr:
+        t = _ev_dt(nr)
+        if t.weekday() == 2 and t.hour == EV_RESET_HOUR:
+            return 7
+        if nr - now > 1.5 * 86400:
+            return 7
+    return 1
+
+
+def _ev_stamp(data: dict, now: float, prev: dict | None) -> dict:
+    """给刚抓到的货架盖时间戳：本轮归属的复位点 / 官方下次刷新 / 刷新周期 / 抓取时刻。
+
+    归属点（refresh_at）的算法，从准到糙：
+      ① 上一轮抓取时官方说的「下次刷新」刚过去 → 那就是本轮起点（复位点当场就知道，最准）；
+      ② 都没有（首跑/换机器/官方没给字段）→ 从官方给的下次刷新按周期回推到 ≤ now 的那个点。
+    官方说的刷新点已过却仍回上一轮货架时（stale），归属点是**上一轮**——货架内容确实还是上一轮的，
+    卡片那头另出警告条说明官方延迟，别把旧货标成新一轮。
+    """
+    nr = float(data.get("next_refresh") or 0.0)
+    prev_d = (prev or {}).get("data") or {}
+    prev_next = float(prev_d.get("next_refresh") or 0.0)
+    ra = 0.0
+    if nr and prev_next and prev_next <= now and prev_next < nr:
+        ra = prev_next
+    if not ra and nr:
+        step = 86400 * _ev_cycle_days(nr, now, int(prev_d.get("cycle_days") or 0))
+        ra = nr - step
+        while ra > now:              # 罕见：官方这次给的周期比上一轮长
+            ra -= step
+    if not ra:
+        ra = _ev_reset_prev(now)     # 官方没给（旧数据/接口异常）：退回「最近一个 1 点」
+    days = (nr - ra) / 86400.0 if nr else 0.0
+    data["refresh_at"] = ra
+    data["next_refresh"] = nr
+    data["cycle_days"] = int(round(days)) if 0.4 < days < 400 else 0
+    data["fetched_at"] = now
+    data["updated"] = now
+    data["stale"] = bool(nr and now >= nr)        # 官方刷新点已过 = 官方还没换架，卡片要提示
+    data["day"] = _ev_day(ra)                     # 归属哪一轮（卡片抬头用）
+    return data
+
+
+def _ev_next_refresh(resps: list) -> float:
+    """官方给的下次刷新时刻 = 跟踪的全部光尘商品里最早的刷新时刻。
+
+    **以商品级 overrideNextRefreshDate 为准**：vendor 实体自己的 nextRefreshDate 是周刷新值
+    （实测 10-14 01:00），而挂在上面的每件商品都带 override = **次日 01:00**——真正每天换的
+    是货架（用户口径「每天一刷」对，vendor 字段会把人带偏）。商品没给 override 才退回 vendor 值。
+    """
+    want = [vh for _, _, vs in EV_SECTIONS for vh in vs]
+    item_ts, ven_ts = [], []
+    for resp in resps:
+        vd = ((resp.get("vendors") or {}).get("data")) or {}
+        sd = ((resp.get("sales") or {}).get("data")) or {}
+        for vh in want:
+            ven_ts.append(_ev_parse_when((vd.get(vh) or {}).get("nextRefreshDate")))
+            group = sd.get(vh)
+            items = (group.get("saleItems") or {}) if isinstance(group, dict) else {}
+            for sale in items.values():
+                if isinstance(sale, dict):
+                    item_ts.append(_ev_parse_when(sale.get("overrideNextRefreshDate")))
+    pick = [t for t in item_ts if t] or [t for t in ven_ts if t]
+    return min(pick) if pick else 0.0
 
 
 def _ev_from_vendors(resps: list) -> dict:
@@ -3697,7 +4920,8 @@ def _ev_from_vendors(resps: list) -> dict:
             items.sort(key=lambda it: (EV_BIG_TYPES.index(it["ty"])
                                        if it["ty"] in EV_BIG_TYPES else len(EV_BIG_TYPES)))
             sections.append({"name": title, "cur": cur, "items": items})
-    return {"sections": sections, "source": "bungie"}
+    return {"sections": sections, "source": "bungie",
+            "next_refresh": _ev_next_refresh(resps)}
 
 
 async def _ev_vendor_responses() -> list:
@@ -3731,27 +4955,51 @@ async def _ev_vendor_responses() -> list:
 async def eververse_store(force: bool = False) -> dict:
     """游戏内**当前上架**的光尘商品，按「主要光尘 / 其他光尘」分节。
 
-    商店北京时间凌晨 1 点刷新：当天取过一次就直接复用（内存 + 落盘 eververse_cache.json），
-    过了 1 点缓存键换成新的日期，会自动重新拉一轮。force=True 强制重取。
+    **时间强关联**：货架「哪一轮」以官方商品级 overrideNextRefreshDate 为准（实测 =
+    每天 01:00，见上面常量区的实测记录），输出前必查手里的货架在不在有效期：
+
+      · 过了官方刷新点 → 重问官方（最快 EV_RETRY_AFTER 一次，防死循环）；
+      · 复位点后 30 分钟内 → 缓存只留 10 分钟（官方常在复位点之后才真正切完货架）；
+      · 维护窗口内抓的、早于最近一次维护恢复的 → 一律重取（维护期货架冻在上一轮，就是
+        用户报的「光尘商店没刷新」）；
+      · 其余 30 分钟跟官方核一次（官方偶尔临时换架）。
+
+    返回的 data 带 refresh_at（本轮归属的 1 点）/ next_refresh（官方下次刷新）/
+    fetched_at（抓取时刻）/ stale（刷新点已过但官方还没换架），卡片据此标注归属日，
+    并用 `ev_behind` 判断要不要标「今天的新货架还没取到」。
 
     未授权时抛 BungieAuthRequired（上层提示去面板点授权）。
     """
     now = time.time()
-    day = _ev_day(now)
-    if not force:
-        if _EV_CACHE["data"] and _EV_CACHE["day"] == day:
-            return _EV_CACHE["data"]
-        disk = _ev_cache_load(day)
-        if disk:
-            _EV_CACHE.update(at=now, day=day, data=disk)
-            return disk
-    resps = await _ev_vendor_responses()
-    data = _ev_from_vendors(resps)
-    data["updated"] = now
-    data["day"] = day
-    _EV_CACHE.update(at=now, day=day, data=data)
-    _ev_cache_save(day, data)
-    return data
+    ent = None if force else _ev_cache_get()
+    if ent:
+        why = _ev_reason(ent, now)
+        if not why:
+            return ent["data"]
+        print(f"[光尘] {time.strftime('%H:%M:%S')} 重取货架：{why}", flush=True)
+    async with _ev_lock():
+        now = time.time()
+        if not force:
+            ent = _ev_cache_get()
+            if ent and not _ev_reason(ent, now):
+                return ent["data"]        # 等锁期间别的调用（调度预取/并发查询）刚取过
+        resps = await _ev_vendor_responses()
+        data = _ev_from_vendors(resps)
+        if not any(s.get("items") for s in (data.get("sections") or [])):
+            # 官方维护/异常时会「成功但空货架」：这时落盘缓存会把一整天定成「没有商品」，
+            # 而 1 点才换缓存键——用户看到的就是「光尘商店自动刷新失效了，一整天都是空的」
+            raise DataSuspiciousError(
+                "光尘商店：Bungie 返回的货架是空的（疑似官方维护或接口异常），"
+                "已拦下不落缓存，稍后重发一次即可")
+        _ev_stamp(data, now, ent)
+        if data["stale"]:
+            print(f"[光尘] {time.strftime('%H:%M:%S')} 官方刷新点 "
+                  f"{_ev_dt(data['next_refresh']):%m-%d %H:%M} 已过，但官方仍回上一轮货架"
+                  f"（{EV_RETRY_AFTER // 60} 分钟后自动再核）", flush=True)
+        _EV_CACHE.clear()
+        _EV_CACHE.update({"ver": EV_CACHE_VER, "at": now, "day": data["day"], "data": data})
+        _ev_cache_save()
+        return data
 
 
 # ---------- 老九（仄 / Xûr）每周商品 ----------
@@ -3786,18 +5034,28 @@ def _sock_types() -> dict:
 
 
 async def _item_def(hash_int: int) -> dict:
-    """单件物品定义（公开实体接口，client 自带 6 小时 /Manifest/ 缓存）。"""
+    """单件物品定义（公开实体接口，client 自带 6 小时 /Manifest/ 缓存）。
+
+    取不到时**不写 _DEF_CACHE**：以前失败也把空 dict 缓存进去（进程活着一辈子），
+    那个 hash 之后永远拿不到定义——和维护期查过就永久坏数据是同一个坑。
+    """
     h = str(hash_int)
-    if h not in _DEF_CACHE:
-        try:
-            r = await client().get(
-                f"/Platform/Destiny2/Manifest/DestinyInventoryItemDefinition/{h}/")
-            resp = r.json()
-            _DEF_CACHE[h] = (resp.get("Response") or {}) \
-                if resp.get("ErrorCode") == 1 else {}
-        except Exception:  # noqa: BLE001
-            _DEF_CACHE[h] = {}
-    return _DEF_CACHE[h]
+    if h in _DEF_CACHE:
+        return _DEF_CACHE[h]
+    try:
+        r = await client().get(
+            f"/Platform/Destiny2/Manifest/DestinyInventoryItemDefinition/{h}/")
+        resp = r.json()
+    except bst.BungieMaintenanceError:
+        raise            # 维护中：如实报错，别把「问不了」缓存成「这件物品没有定义」
+    except Exception:  # noqa: BLE001 网络抖动：这次没有，下次再试
+        return {}
+    if resp.get("ErrorCode") != 1:
+        return {}
+    d = resp.get("Response") or {}
+    if d:
+        _DEF_CACHE[h] = d
+    return d
 
 
 async def _weapon_socket_plugs(item_hash: int, live: list) -> tuple[dict | None, list, bool]:
@@ -3855,8 +5113,8 @@ def _vi_index() -> dict:
 
 
 def _xur_present(ts: float) -> bool:
-    """在场窗口：周六 01:00 → 周三 01:00（维护重置离场），本机时间=北京时间。"""
-    t = datetime.datetime.fromtimestamp(ts)
+    """在场窗口：周六 01:00 → 周三 01:00（维护重置离场），一律北京时间（见 _cn_now）。"""
+    t = _ev_dt(ts)
     wd, hm = t.weekday(), (t.hour, t.minute)
     if wd == 5:                       # 周六：1 点后算到场
         return hm >= (1, 0)
@@ -3868,8 +5126,8 @@ def _xur_present(ts: float) -> bool:
 
 
 def _xur_next_arrival(ts: float) -> float:
-    """下次抵达 = 下一个周六 01:00（含今天周六但还没到 1 点的情况）。"""
-    t = datetime.datetime.fromtimestamp(ts)
+    """下次抵达 = 下一个周六 01:00（含今天周六但还没到 1 点的情况），一律北京时间。"""
+    t = _ev_dt(ts)
     d = t.replace(hour=1, minute=0, second=0, microsecond=0)
     d += datetime.timedelta(days=(5 - d.weekday()) % 7)   # 周六 weekday()==5
     if d.timestamp() <= ts:
@@ -4168,7 +5426,7 @@ async def xur_stock(force: bool = False) -> dict:
             it["intr"], it["plugs"], it["rolled"] = intr, plugs, rolled
         it.pop("_live", None)
     arr = 0.0 if present else _xur_next_arrival(now)
-    at = datetime.datetime.fromtimestamp(arr) if arr else None
+    at = _ev_dt(arr) if arr else None
     data = {"present": present, "source": "api", "items": items, "updated": now,
             "arrives": arr,
             "arrives_txt": (f"{['周一', '周二', '周三', '周四', '周五', '周六', '周日'][at.weekday()]}"
@@ -4249,7 +5507,14 @@ async def rotation_week(force: bool = False) -> dict:
     解析不出配对表时退化为「只列官方查到有周常挑战的突袭」，不会报错。
     """
     r = await client().get("/Platform/Destiny2/Milestones/")
-    resp = r.json().get("Response") or {}
+    rd = r.json()
+    v, why = _verdict(rd)
+    if v != "ok":
+        # 以前不查 ErrorCode：维护期 Response 为空 → 轮换卡变成「什么都没有」并按
+        # key="unknown" 落盘缓存，用户看到的是空轮换而不是「查不了」
+        raise DataSuspiciousError(
+            f"本周轮换里程碑读取失败（{why}）：疑似官方维护或接口异常，稍后重发一次即可")
+    resp = rd.get("Response") or {}
     pairs = _rot_pairs()
     raid_rows = [p for p in pairs if p.get("raid")]
     raid_names = {p["raid"] for p in raid_rows}
@@ -4310,9 +5575,9 @@ async def rotation_week(force: bool = False) -> dict:
 
 # ---------- 扭曲星球轮换（每小时换目的地，7 小时一轮） ----------
 # 数据来源同 rotation_pairs.json 里的 distortion 段（scrape_starside_rotation.py 抓）。
-# 口径与 starside 轮换页一致：页面按访问者本机时钟高亮，表以「本机周一 00:00」为
-# 起点，目的地 = cycle[slots[周几(周一=0)][小时]]；周期 7 小时、一周 168 时段，
-# 因此每周的表相同。bot 跑在用户机器上（UTC+8），直接用本机时间即可。
+# 口径与 starside 轮换页一致：表以「周一 00:00」为起点，目的地 =
+# cycle[slots[周几(周一=0)][小时]]；周期 7 小时、一周 168 时段，因此每周的表相同。
+# 时钟一律北京时间（`_cn_now`）：机器时区一变整张表就错位，锚在 +08 才和页面/游戏一致。
 # 对齐自检：Bungie 周复位 = UTC 周二 17:00 = 北京周三 01:00，距周一 00:00 恰
 # 49h = 7 整循环，复位点自动回到 cycle[0]，无需单独对齐。
 _DIST = None
@@ -4330,7 +5595,7 @@ def _distortion() -> dict:
 
 
 def distortion_now(dt_: datetime.datetime | None = None) -> dict:
-    """扭曲星球当前时段。dt_ 缺省取本机当前时间（bot 所在机器的本地时区）。
+    """扭曲星球当前时段。dt_ 缺省取当前北京时间（表按本机时钟高亮，全盘统一北京）。
 
     返回 {"ok": True, dest 当前目的地, range 时段文字, start/end 时段起止,
           next_dest 下一个目的地, next_at 切换时刻, next_hm 切换时刻(HH:MM),
@@ -4339,7 +5604,7 @@ def distortion_now(dt_: datetime.datetime | None = None) -> dict:
     """
     d = _distortion()
     cyc, slots = d.get("cycle") or [], d.get("slots") or []
-    now = dt_ or datetime.datetime.now()
+    now = dt_ or _cn_now()
     if not cyc or not slots:
         return {"ok": False}
     try:
@@ -4403,8 +5668,8 @@ def _rot_zh() -> dict:
 
 
 def _gm_week_key(ts: float | None = None) -> str:
-    """每周缓存键：周三凌晨 1 点（=周二 17:00 UTC）刷新，1 点前算上一周。"""
-    t = datetime.datetime.fromtimestamp(ts if ts is not None else time.time())
+    """每周缓存键：周三凌晨 1 点（=周二 17:00 UTC）刷新，1 点前算上一周。一律北京时间。"""
+    t = _ev_dt(ts if ts is not None else time.time())
     t -= datetime.timedelta(hours=1)
     mon = (t.weekday() - 2) % 7          # 周三=2，往回退到本周三
     return (t - datetime.timedelta(days=mon)).strftime("%G-W%V")

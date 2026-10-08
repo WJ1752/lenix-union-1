@@ -19,9 +19,9 @@
   /生涯 玩家名#1234    → 生涯面板（逐赛季等级 + 分职业分模式时长 + 三模式）别名 d2周报、周报；已绑定可省略名字
   /raid                → 突袭战绩（通关/无暇/大师/单人双人三人/无暇）别名 突袭、d2raid
   /地牢                → 地牢战绩                          别名 dungeon、d2地牢
-  /pvp                 → 熔炉：生涯统计 + 近期战绩 + 模式细分  别名 熔炉、d2pvp
-  /pve                 → PVE：生涯统计 + 近期战绩 + 模式细分   别名 d2pve
-  /智谋                → 智谋战绩                          别名 gambit、d2智谋
+  /pvp                 → 熔炉：全模式生涯统计 + 近期战绩 + 模式细分  别名 熔炉、d2pvp
+  /pve                 → PVE：官方生涯统计 + 终局通关（含终极征服） 别名 d2pve
+  /智谋                → 智谋：官方生涯 + 荧光/入侵 + 胜点图   别名 gambit、d2智谋
   /战绩                → 最近对局流（全模式）                别名 历史、最近对局、d2历史
   /热力图              → 按赛季分组的全历史活跃日历           别名 活跃、d2热力图
   /锻造                → 武器锻造图案进度                   别名 图案、d2锻造
@@ -65,7 +65,7 @@ from nonebot import on_command, on_message, on_type
 from nonebot.adapters import Event, Message
 from nonebot.exception import FinishedException, IgnoredException, SkippedException
 from nonebot.internal.matcher import Matcher
-from nonebot.message import event_preprocessor, run_postprocessor
+from nonebot.message import event_preprocessor, run_postprocessor, run_preprocessor
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 
@@ -163,9 +163,9 @@ def _as_command(event: Event):
 event_preprocessor(_as_command)
 
 
-def _log_out(event: Event, text: str):
+def _log_out(event: Event, text: str, extra: dict | None = None):
     bot_log.add("out", text=text, group_id=bp.group_key(event),
-                user_id=bp.self_id(event), nickname="Bot")
+                user_id=bp.self_id(event), nickname="Bot", extra=extra)
 
 
 def _at_sender(event: Event, *segs):
@@ -173,15 +173,160 @@ def _at_sender(event: Event, *segs):
     return bp.reply_msg(event, *segs)
 
 
-async def _reply(matcher, event: Event, text: str):
-    """文本回复（仅渲染失败时的兜底）；发送层异常只记日志，理由见 _reply_image"""
-    _log_out(event, text)
+# ---------- 发送层：失败分类 + 超时自查 ----------
+# NapCat 调 QQ 的 sendMsg 回执超时（retcode 1200 / NTEvent Timeout）时消息其实多半已进群，
+# 只是 QQ 没在时限内回执，重发反而双发 —— 这类「疑似超时」单列一个标签，并在查得动的
+# 时候翻一次消息历史，把「多半」变成确证。自查只改日志与返回值，绝不重发。
+_SEND_TIMEOUT_TAG = "[发送超时·多半已送达]"
+_PROBE_WINDOW_SEC = 180.0   # 自查只看最近 3 分钟的历史，更早的图/消息是上一次回复，不算数
+_PROBE_DEAD_HINTS = ("offline", "风控", "not_login", "connection")
+
+
+def _history_messages(resp) -> list:
+    """取消息历史接口返回里的消息列表
+
+    OneBot v11 的常见形状是 {"data": {"messages": [...]}}，也有实现把列表平铺在顶层"""
+    if not isinstance(resp, dict):
+        return []
+    for src in (resp.get("data"), resp):
+        if isinstance(src, dict) and isinstance(src.get("messages"), list):
+            return src["messages"]
+    return []
+
+
+def _probe_bot(event: Event):
+    """取这条事件对应的 bot（多账号按 self_id 挑）；取不到就 None，自查直接放弃"""
     try:
-        await matcher.finish(_at_sender(event, bp.text_seg(event, text)))
+        from nonebot import get_bot
+        return get_bot(bp.self_id(event) or None)
+    except Exception:  # noqa: BLE001  没连上 / 挑不出账号都当查不了
+        return None
+
+
+async def _probe_delivered(bot, event: Event, label: str, text: str = "") -> bool | None:
+    """发送超时后自查这条消息是否真的进了会话：True 已进 / False 没查到 / None 查不了
+
+    只有 NapCat（OneBot v11）有消息历史接口可问，官方通道没有对等接口，一律 None。
+    只看「机器人自己在最近 180 秒内发的」消息，群友说话不算数；图片回复认图片段，
+    文本回复要求纯文本一字不差，免得把上一条回复当成本次的证据。
+    """
+    if bp.is_official(event) or bot is None:
+        return None
+    gid = bp.group_key(event)
+    try:
+        if gid:
+            resp = await bot.call_api("get_group_msg_history", group_id=int(gid), count=10)
+        else:
+            resp = await bot.call_api("get_friend_msg_history",
+                                      user_id=int(bp.uid(event) or 0), count=10)
+    except Exception as exc:  # noqa: BLE001  接口不存在/没权限：只能当查不了
+        print(f"[发送自查] {label} 查不了消息历史（多为协议端不支持该接口）：{exc}")
+        return None
+    me = str(bp.self_id(event) or "")
+    if not me:
+        return None
+    want = text.strip()
+    now = time.time()
+    for m in _history_messages(resp):
+        if not isinstance(m, dict) or str(m.get("user_id") or "") != me:
+            continue
+        try:
+            ts = float(m.get("time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not ts or now - ts > _PROBE_WINDOW_SEC:
+            continue            # 太旧：那是上一次的回复，不能当本次的证据
+        segs = m.get("message")
+        if isinstance(segs, str):   # 少数实现把 message 给成 CQ 码字符串而不是段列表
+            if "[CQ:image" in segs or (want and want in segs):
+                return True
+            continue
+        if not isinstance(segs, list):
+            continue
+        plain, has_img = [], False
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "image":
+                has_img = True
+            elif seg.get("type") == "text":
+                plain.append(str((seg.get("data") or {}).get("text") or ""))
+        if has_img or (want and "".join(plain).strip() == want):
+            return True
+    return False
+
+
+async def _log_send_error(event: Event, exc: Exception, label: str,
+                          text: str = "", png: bytes | None = None) -> bool | None:
+    """发送层异常 → 面板日志；疑似超时先自查是否真已进群，再决定写哪一句
+
+    掉线/风控期间消息根本没出去，查历史也必然查不到，不查、沿用「多半已送达」。
+
+    存盘（extra 里的 unsent）只在**确实没送达**时才做：自查「已核实进群」的那条不能再进
+    unsent_images/，否则面板上会多出一个「重发」按钮，点一下就是同一条消息两张。
+    """
+    tag = _send_err_tag(exc)
+    s = f"{type(exc).__name__}: {exc}"
+    if tag != _SEND_TIMEOUT_TAG or any(h in s.lower() for h in _PROBE_DEAD_HINTS):
+        _log_out(event, f"{tag} {label}：{exc}", extra=_unsent_extra(event, png, label))
+        return None
+    got = await _probe_delivered(_probe_bot(event), event, label, text)
+    if got is True:
+        _log_out(event, f"[发送超时·已核实进群] {label}")
+    elif got is False:
+        _log_out(event, f"[发送超时·未查到，建议重发] {label}",
+                 extra=_unsent_extra(event, png, label))
+    else:
+        _log_out(event, f"{tag} {label}：{exc}", extra=_unsent_extra(event, png, label))
+    return got
+
+
+def _unsent_extra(event: Event, png: bytes | None, label: str) -> dict:
+    """发送失败时把卡片存盘，并把「收件人 + 文件名」写进日志条目
+
+    存盘是给面板用的：那张卡在用户那边没发出去，管理员要能一眼看到内容（预览）、
+    直接重发（「重发」按钮），或者打开文件夹人工检查。
+    收件人按平台分开记：群号（NapCat）/ openid（官方），私聊则记发起人。
+    """
+    if not png:
+        return {}
+    try:
+        gid = bp.group_key(event)
+        uid = bp.uid(event)
+        fn = bot_log.save_unsent(png, label, gid, "" if gid else uid)
+        if not fn:
+            return {}
+        return {"unsent": fn, "resend_group": gid,
+                "resend_user": "" if gid else str(uid or ""),
+                "resend_official": bp.is_official(event)}
+    except Exception as exc:  # noqa: BLE001 存盘失败不能影响「已经失败」这件事的记账
+        print(f"[发送] 未发送图片存盘失败：{type(exc).__name__}: {exc}", flush=True)
+        return {}
+
+
+async def _finish_send(matcher, event: Event, segs: tuple, label: str, text: str = "",
+                       png: bytes | None = None):
+    """统一的发送出口（发完结束 matcher）：发送层异常只记面板日志，不向上抛
+
+    不抛的理由见 _reply_image；FinishedException 是发送成功时 nonebot 用来结束
+    matcher 的信号，必须原样放行。超时先自查是否真的已进群（只影响日志与返回值），
+    **不重发**：QQ 多半已经收到了，重发就是同一条消息两张。
+
+    真发送失败（掉线/风控/被动回复窗口过期）时把图片存到 unsent_images/，
+    面板上可以预览与重发——不然那张卡就彻底没了。
+    """
+    try:
+        await matcher.finish(_at_sender(event, *segs))
     except FinishedException:
         raise
     except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"{_send_err_tag(exc)} {text[:24]}：{exc}")
+        return await _log_send_error(event, exc, label, text, png=png)
+
+
+async def _reply(matcher, event: Event, text: str):
+    """文本回复（仅渲染失败时的兜底）；发送层异常只记日志，理由见 _reply_image"""
+    _log_out(event, text)
+    await _finish_send(matcher, event, (bp.text_seg(event, text),), text[:24], text)
 
 
 async def _reply_image(matcher, event: Event, png: bytes, label: str):
@@ -191,16 +336,12 @@ async def _reply_image(matcher, event: Event, png: bytes, label: str):
     窗口只有 5 分钟——超窗口这条会发失败，日志里有记录，让用户重发一次即可。
 
     发送失败（协议端掉线/重连中）单独记一行，否则这种「回复丢失」在面板上看不出来。
+    图片同时落到 unsent_images/（面板可预览/重发）。
     **不再向上抛**：QQ 侧 sendMsg 超时（retcode 1200）时卡片往往其实已送达，
     抛出去只会触发兜底后处理器再补一张「查询失败」卡 —— 同一指令两张卡。"""
     _log_out(event, f"[图片] {label}")
     seg = bp.image_seg(event, png, f"{label}.png" if label else "card.png")
-    try:
-        await matcher.finish(_at_sender(event, seg))
-    except FinishedException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _log_out(event, f"{_send_err_tag(exc)} {label}：{exc}")
+    await _finish_send(matcher, event, (seg,), label, png=png)
 
 
 async def _send_card(matcher, event: Event, html: str, label: str, fallback: str):
@@ -219,6 +360,63 @@ async def _notice(matcher, event: Event, title: str, lines: list[str],
                      title, fallback or f"{title}\n" + "\n".join(lines))
 
 
+def _maint_lines(exc: Exception) -> list[str]:
+    """维护提示的正文（统一措辞，细节看异常里带的官方原文）"""
+    from bungie_status import state
+    st = state()
+    out = [str(exc) or "Bungie 服务器正在维护中。"]
+    if st.get("detail"):
+        out.append(f"官方原文：{st['detail'][:120]}")
+    out.append("维护期间查不了数据（硬查只会拿到错数字），官方恢复后重发一次即可；"
+               "已经排队的查询会自动中止，不用手动取消。")
+    return out
+
+
+async def _maint_notice(matcher, event: Event, exc: Exception, title: str = "服务器维护中"):
+    await _notice(matcher, event, title, _maint_lines(exc), kind="warn",
+                  fallback=f"{title}：{exc}")
+
+
+# ---------- 维护闸门（全指令统一入口） ----------
+# 「维护时查询自动告知用户服务器维护中」：与其在十几个 handler 里各自 catch 一遍
+# （漏一个就是「查询失败，重发一次」误导用户一直重发），不如在门口统一拦。
+# 纯本地数据的指令照旧可用（帮助/武器图鉴/perk/护甲/掉落表/绑定表/进度查询），
+# 它们不需要 Bungie 接口；碰 Bungie 的一律拦下并说明原因。
+#
+# 用 IgnoredException 而不是 matcher.finish()：nonebot 对 run_preprocessor 里的
+# IgnoredException 是「取消这个响应器」的正式语义（INFO 级日志），而别的异常会被
+# 记成「Error when running RunPreProcessors」的红色堆栈，吓人且没意义。
+_MAINT_NOTIFIED: dict = {}      # 同一事件只提示一次（一条消息可能命中多个响应器）
+
+
+def _maint_notified(event: Event) -> bool:
+    now = time.time()
+    for k in [k for k, t in _MAINT_NOTIFIED.items() if now - t > 120]:
+        _MAINT_NOTIFIED.pop(k, None)
+    key = id(event)
+    if key in _MAINT_NOTIFIED:
+        return True
+    _MAINT_NOTIFIED[key] = now
+    return False
+
+
+@run_preprocessor
+async def _maint_gate(matcher: Matcher, event: Event):
+    import bungie_status as bst
+    if not bst.is_down() or matcher.state.get("maint_ok"):
+        return
+    if not bp.is_message_event(event) or not _allowed_group(event):
+        return                      # 未启用群不吭声（与其它指令一致）
+    if not _maint_notified(event):
+        try:
+            await _maint_notice(matcher, event, bst.BungieMaintenanceError(bst.text()))
+        except FinishedException:
+            pass                  # 发送成功就是这个信号（matcher.finish 的收尾），别记成失败
+        except Exception as exc:  # noqa: BLE001 提示发不出去也不能让事件继续往下跑
+            _log_out(event, f"[维护] 提示发送失败：{type(exc).__name__}: {exc}")
+    raise IgnoredException("Bungie 服务器维护中，本次查询已拦下")
+
+
 def _exc_msg(exc: Exception) -> str:
     # 超时类异常（httpx.ReadTimeout 等）的 str() 是空串，只拼 exc 会显示成
     # 「接口暂时不可用：」，带上类型名才能看出是超时
@@ -230,8 +428,8 @@ def _send_err_tag(exc: Exception) -> str:
     NTEvent Timeout）时消息其实多半已进群——只是 QQ 没在时限内回执，重发反而双发。
     单独标「发送超时」，面板上一眼区分于真失败（掉线/风控）；其余照旧标「发送失败」"""
     s = f"{type(exc).__name__}: {exc}"
-    return ("[发送超时·多半已送达]" if ("1200" in s or "Timeout" in s or "超时" in s)
-            else "[发送失败]")
+    hit = "1200" in s or "Timeout" in s or "超时" in s
+    return _SEND_TIMEOUT_TAG if hit else "[发送失败]"
 
 
 @run_postprocessor
@@ -243,6 +441,23 @@ async def _unhandled_error(matcher: Matcher, event: Event, exception: Exception)
     if type(exception).__name__ == "ActionFailed":
         # 发送层问题（各适配器同名）：_reply_image 已记日志并吞掉；漏到这里也应是
         # 「消息其实已送达」的超时，再补一张「查询失败」卡反而让用户收到两张卡
+        return
+    if isinstance(exception, d2.BungieMaintenanceError):
+        # 维护是最常见的一类失败，单独给一张说明卡——「查询失败/接口抖动，重发一次」
+        # 会让用户一直重发，而维护期间重发多少次都是错的
+        try:
+            await _maint_notice(matcher, event, exception)
+        except Exception:  # noqa: BLE001  兜底里再出错就只留日志
+            _log_out(event, f"[兜底失败] {type(exception).__name__}: {exception}")
+        return
+    if isinstance(exception, d2.DataSuspiciousError):
+        # 补查层拦下的「数据不完整」：不是用户的错，也不是要重授权，就是稍后重发
+        try:
+            await _notice(matcher, event, "这次的数据不完整",
+                          [str(exception), "已拦下避免出错误统计，稍后重发一次即可。"],
+                          kind="warn", fallback=str(exception))
+        except Exception:  # noqa: BLE001
+            _log_out(event, f"[兜底失败] {type(exception).__name__}: {exception}")
         return
     try:
         await _notice(matcher, event, "查询失败",
@@ -498,7 +713,7 @@ async def _(event: Event, args: Message = CommandArg()):
                       kind="warn", fallback=f"没找到玩家 {name}")
         return
     await _working(base_query, event, "查询中",
-                   [*_queue_line(jid, serial=False), "拉取档案和三模式统计，请稍候…"])
+                   [*_queue_line(jid, show_pos=False), "拉取档案和三模式统计，请稍候…"])
     await _jobs_card(base_query, event, jid, "玩家卡片",
                      bot_cards.player_card, f"玩家卡片 {name}")
 
@@ -517,7 +732,7 @@ async def _(event: Event, args: Message = CommandArg()):
                       kind="warn", fallback=f"没找到玩家 {name}")
         return
     await _working(career_query, event, "生涯统计中",
-                   [*_queue_line(jid, serial=False),
+                   [*_queue_line(jid, show_pos=False),
                     "要拉各角色分模式统计和逐赛季数据，第一次查要十几秒，请稍候…"])
     await _jobs_card(career_query, event, jid, "生涯面板",
                      bot_cards.career_card, f"生涯面板 {name}")
@@ -1069,22 +1284,101 @@ async def _working(matcher, event: Event, title: str, lines: list[str]):
     await matcher.send(_at_sender(event, bp.image_seg(event, png, f"{title}.png")))
 
 
-async def _wait_job(jid: str, timeout: float = 1200.0) -> dict:
-    """等后台任务跑完（destiny_data.JOBS）；超时返回当前状态
+JOB_WAIT_MAX = 21600.0   # 等任务的安全上限（6 小时）：正常收场靠「任务没了」，这只防协程挂死
+TICK_MIN_GAP = 45.0      # 排队位次播报的最小间隔（秒）：位次挪一格不值得连发消息
 
-    生涯任务现在排队串行（避免同时跑被 Bungie 限流拖慢），排在后面的要等前面的跑完，
-    所以给足 20 分钟；排到第几位会先在「统计中」卡片里告诉用户。"""
+
+def _dur_text(sec) -> str:
+    """秒数 → 「4 分 12 秒」这样的中文时长（排队播报用；超过 1 小时退化成小时+分）"""
+    try:
+        s = max(0, int(sec or 0))
+    except (TypeError, ValueError):
+        s = 0
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} 分 {s:02d} 秒" if m else f"{s} 秒"
+    h, m = divmod(m, 60)
+    return f"{h} 小时 {m:02d} 分"
+
+
+def _parallel_slots() -> int:
+    """后台并行槽位数；destiny_data 还没提供这个接口时返回 0（播报里就不提并行数）"""
+    try:
+        return max(0, int(d2.job_parallel()))
+    except Exception:  # noqa: BLE001  接口缺失/实现未落地都不该影响等任务
+        return 0
+
+
+def _job_view(jid: str) -> dict:
+    """任务状态视图：优先用 destiny_data.job_view，它还没落地就按 JOBS 记录自己拼一份
+
+    字段语义同 job_view：queue_pos > 0 是排队位次（1 = 下一个就轮到），paused 是管理员
+    暂停，queued_s/run_s/total_s 单位秒。自己拼的时候「已排队/已运行」只能用发起时刻
+    ts 近似（对播报够了），pct 与并行数这些拿不到的字段就不再往下传。
+    """
+    fn = getattr(d2, "job_view", None)
+    if callable(fn):
+        try:
+            view = fn(jid) or {}
+            if view:
+                return view
+        except Exception:  # noqa: BLE001  视图接口出错不能连累等任务，退回直接读 JOBS
+            pass
+    j = d2.JOBS.get(jid) or {}
+    if not j:
+        return {}
+    status = str(j.get("status") or "")
+    ts = float(j.get("ts") or 0)
+    total_s = int(time.time() - ts) if ts else 0
+    pos = 0
+    if status == "queued":
+        try:
+            pos = max(0, int(d2.queue_position(jid) or 0))
+        except Exception:  # noqa: BLE001  同上
+            pos = 0
+    done, total = int(j.get("done") or 0), int(j.get("total") or 0)
+    return {"id": jid, "label": j.get("label") or "任务", "kind": j.get("kind") or "",
+            "who": j.get("who") or "", "name": j.get("name") or "", "status": status,
+            "done": done, "total": total, "pct": int(done * 100 / total) if total else 0,
+            "queue_pos": pos, "paused": bool(j.get("paused")),
+            "queued_s": total_s if status == "queued" else 0,
+            "run_s": total_s if status == "running" else 0, "total_s": total_s,
+            "reuse_count": int(j.get("reused") or 0), "note": j.get("note") or ""}
+
+
+async def _wait_job(jid: str, timeout: float = JOB_WAIT_MAX, on_tick=None) -> dict:
+    """等后台任务结束，返回任务记录；只有「任务从 JOBS 里没了」才算失败（返回 {}）
+
+    以前这里写死 20 分钟墙钟：生涯任务排队时排在后面的等超 20 分钟是常态，于是超时就
+    被 _jobs_card 当成「统计失败」报出去，而后台其实还在跑。现在排队/运行/被管理员暂停
+    都继续等，timeout 只是防协程永久挂住的安全上限。
+
+    on_tick(view, waited) 每轮轮询回调一次（状态视图 + 已等待秒数），调用方据此播报
+    排队位次等变化；回调里出错不影响等待本身（播报只是附带，不能耽误出图）。
+    """
     t0 = time.time()
-    while time.time() - t0 < timeout:
-        j = d2.JOBS.get(jid) or {}
-        if j.get("status") in ("done", "error"):
+    while True:
+        waited = time.time() - t0
+        j = d2.JOBS.get(jid)
+        if not j:            # 被清理或压根没建起来：这才是真没了
+            return {}
+        if on_tick is not None:
+            try:
+                await on_tick(_job_view(jid), waited)
+            except Exception:  # noqa: BLE001  见 docstring：播报失败不能中断等待
+                pass
+        if str(j.get("status") or "") in ("done", "error", "aborted"):
             return j
+        if waited >= timeout:
+            return j         # 到安全上限但任务还活着：交给调用方说「还在统计中」，别报失败
         await asyncio.sleep(2)
-    return d2.JOBS.get(jid) or {}
 
 
-def _queue_line(jid: str, serial: bool = True) -> list[str]:
-    """任务状态提示。返回若干行：命中去重/缓存时不说「要翻几百页」，免得用户以为又在全量重跑"""
+def _queue_line(jid: str, show_pos: bool = True) -> list[str]:
+    """任务状态提示。返回若干行：命中去重/缓存时不说「要翻几百页」，免得用户以为又在全量重跑
+
+    show_pos=False 的任务（玩家卡片/生涯面板这类翻不了多少页的）只给一句「正在查询」。
+    """
     j = d2.JOBS.get(jid) or {}
     if j.get("status") == "done":
         if j.get("cached") and not j.get("reused"):
@@ -1094,37 +1388,122 @@ def _queue_line(jid: str, serial: bool = True) -> list[str]:
                 f"{d2.job_reuse_window() // 60} 分钟后再发可以强制重跑）"]
     if d2.job_shared(jid):  # 复用了别人正在跑的那个任务
         return ["这份数据已经在统计了，跑完直接出图，不用重复排队"]
-    pos = d2.queue_position(jid)
-    if not serial:
+    if not show_pos:
         return ["正在查询，请稍候…"]
+    # 后台是多个任务并行跑（共用一个请求并发上限），别再说「一个个跑」：那是老的串行队列
+    slots = _parallel_slots()
+    par = f"（现在是 {slots} 个任务并行统计）" if slots > 1 else ""
+    pos = d2.queue_position(jid)
     if not pos:
-        return ["生涯任务一个个跑（避免同时拉 PGCR 被 Bungie 限流拖慢），现在正在统计…"]
-    return [f"前面还有 <b>{pos}</b> 位在统计，已排队；生涯任务一个个跑反而更快，跑完会自动出图"]
+        return [f"正在统计…{par}"]
+    return [f"前面还有 <b>{pos}</b> 位在统计{par}，跑完会自动出图"]
+
+
+def _tick_reporter(matcher, event: Event, title: str):
+    """给 _wait_job 用的 on_tick 回调：任务状态变化时补一条短提示，同一状态不重复发
+
+    位次挪动（第 5 位 → 第 2 位）限流成 45 秒一条；「开跑/暂停/恢复/中止」是关键变化，
+    不受限流。首轮只记基线：「统计中」卡片已经说过位次，再说一遍就是刷屏。
+    """
+    st = {"ready": False, "pos": 0, "status": "", "paused": False, "sent": 0.0}
+
+    async def _tick(view: dict, waited: float):
+        status = str(view.get("status") or "")
+        pos = int(view.get("queue_pos") or 0)
+        paused = bool(view.get("paused"))
+        if not st["ready"]:
+            st.update(ready=True, pos=pos, status=status, paused=paused)
+            return
+        line, key = "", False
+        if status == "aborted" and st["status"] != "aborted":
+            line, key = ("Bungie 服务器维护中，这个统计已自动中止（见下面的说明卡）"
+                         if "维护" in str(view.get("error") or "")
+                         else "管理员中止了这个统计"), True
+        elif paused and not st["paused"]:
+            line, key = "管理员把这个统计暂停了，恢复后会继续", True
+        elif st["paused"] and not paused and status in ("queued", "running"):
+            line, key = "已恢复统计", True
+        elif status == "running" and st["status"] == "queued":
+            queued = _dur_text(view.get("queued_s") or waited)
+            line, key = f"轮到了，开始统计（前面排了 {queued}）", True
+        elif status == "queued" and pos and pos != st["pos"]:
+            line = f"前面还有 {pos} 位在统计，已排队 {_dur_text(view.get('queued_s') or waited)}"
+            slots = _parallel_slots()
+            if slots > 1:
+                line += f"（现在是 {slots} 个任务并行统计）"
+        now = time.time()
+        if line and (key or now - st["sent"] >= TICK_MIN_GAP):
+            st["sent"] = now
+            _log_out(event, f"[排队提示] {title}：{line}")
+            try:
+                await matcher.send(_at_sender(event, bp.text_seg(event, line)))
+            except Exception as exc:  # noqa: BLE001  提示发不出去不影响继续等结果卡
+                _log_out(event, f"{_send_err_tag(exc)} 排队提示：{exc}")
+        else:
+            # 位次被限流时先不认它：下一轮还拿最新位次来试，免得把一个位次悄悄吞掉
+            pos = st["pos"]
+        st.update(pos=pos, status=status, paused=paused)
+    return _tick
 
 
 async def _jobs_card(matcher, event: Event, jid: str, title: str, card_fn, label: str):
-    """后台任务 → 等结果 → 出卡片（失败给提示卡）"""
-    j = await _wait_job(jid)
-    if j.get("status") != "done":
+    """后台任务 → 等结果 → 出卡片；等待期间状态有变化就补一条短提示，用户不用干等
+
+    只有「任务从 JOBS 里没了」才算失败；被管理员中止、到安全上限但任务还活着，
+    都按各自的说法回，不能一律报「统计失败」——那正是排在后面的任务被误报的原因。
+    """
+    j = await _wait_job(jid, on_tick=_tick_reporter(matcher, event, title))
+    if not j:
+        await _notice(matcher, event, f"{title}失败",
+                      ["统计没跑完（接口超时或网络中断），稍后再试"],
+                      kind="warn", fallback=f"{title}失败")
+        return
+    status = str(j.get("status") or "")
+    if status != "done":
         err = str(j.get("error") or "")
-        if "档案" in err:
+        if status == "aborted":
+            if "维护" in err:
+                # 维护导致的自动中止（见 destiny_data.abort_all_jobs）：跟「管理员中止」
+                # 要分开说，否则用户以为是有人手滑点了按钮，又去重发一遍
+                import bungie_status as _bst
+                await _maint_notice(matcher, event, d2.BungieMaintenanceError(_bst.text()),
+                                    title=f"{title}已中止")
+            else:
+                await _notice(matcher, event, f"{title}已中止",
+                              ["这个统计被管理员中止了，重发一次即可重新排队"],
+                              kind="warn", fallback=f"{title}已中止：重发一次即可重新排队")
+        elif "档案" in err:
             # 私密档案 / 平台空号：这是明确的"查不了"，不是故障
             await _notice(matcher, event, "查不了这个玩家", [err], kind="warn", fallback=err)
         else:
-            await _notice(matcher, event, f"{title}失败",
-                          ["统计没跑完（接口超时或网络中断），稍后再试"],
-                          kind="warn", fallback=f"{title}失败")
+            view = _job_view(jid)
+            pos = int(view.get("queue_pos") or 0)
+            if status in ("queued", "running") or pos:
+                # 等到了安全上限任务还活着（排队/运行/被暂停）：报失败会误导
+                if view.get("paused"):
+                    tail = "（管理员暂停了，恢复后会继续）"
+                else:
+                    tail = f"（前面还有 {pos} 位）" if pos else ""
+                msg = f"还在统计中{tail}，跑完会自动出图"
+                await _notice(matcher, event, f"{title}还在统计中",
+                              [msg, "重发不会重复排队，面板「后台任务」里能看到实时进度"],
+                              kind="info", fallback=msg)
+            else:
+                await _notice(matcher, event, f"{title}失败",
+                              ["统计没跑完（接口超时或网络中断），稍后再试"],
+                              kind="warn", fallback=f"{title}失败")
         return
     await _send_card(matcher, event, card_fn(j["result"]), label, title)
 
 
 async def _mode_cmd(matcher, event: Event, args: Message, mode: int, title: str,
-                    life_group: str = "", life_extra: tuple = ()):
+                    life_group: str = "", life_extra: tuple = (), career: bool = False,
+                    endgame: bool = False):
     name = await _need_player(matcher, event, args)
     if not name:
         return
     try:
-        rep = await d2.mode_report(name, mode)
+        rep = await d2.mode_report(name, mode, career=career, endgame=endgame)
     except LookupError:
         await _not_found(matcher, event, name)
         return
@@ -1175,15 +1554,19 @@ async def _(event: Event, args: Message = CommandArg()):
 async def _(event: Event, args: Message = CommandArg()):
     if not _allowed_group(event):
         return
-    await _mode_cmd(pvp_query, event, args, 5, "PVP 熔炉竞技场战绩", "allPvP",
-                    ("activitiesWon", "assists", "precisionKills"))
+    # PvP 顶部生涯统计走「全模式对局历史聚合」：官方 allPvP 生涯不含 2020 年之后的
+    # 试炼 / 铁旗（实测差一半以上），所以不再拿 lifetime_stats 的官方数当生涯
+    await _mode_cmd(pvp_query, event, args, 5, "PVP 熔炉竞技场战绩", career=True)
 
 
 @pve_query.handle()
 async def _(event: Event, args: Message = CommandArg()):
     if not _allowed_group(event):
         return
-    await _mode_cmd(pve_query, event, args, 7, "PVE 战绩", "allPvE", ("precisionKills",))
+    # PvE 面板对齐 raid.report 个人页：游戏时长 / 成就分 / 总击杀 + 突袭·地牢·宗师·大师日落通关
+    # + 征服者镀金次数。通关数要按对局历史数（官方统计没有分难度日落），所以走 endgame 深翻
+    await _mode_cmd(pve_query, event, args, 7, "PVE 战绩", "allPvE", ("precisionKills",),
+                    endgame=True)
 
 
 @gambit_query.handle()
@@ -1280,7 +1663,7 @@ async def _(event: Event, args: Message = CommandArg()):
         await _not_found(cata_query, event, name)
         return
     await _working(cata_query, event, "催化统计中",
-                   [*_queue_line(jid, serial=False), "拉取全部异域催化记录，请稍候…"])
+                   [*_queue_line(jid, show_pos=False), "拉取全部异域催化记录，请稍候…"])
     await _jobs_card(cata_query, event, jid, "异域催化",
                      bot_cards.nodes_card, f"异域催化 {name}")
 
@@ -1542,3 +1925,17 @@ async def _(event: Event, args: Message = CommandArg()):
         return
     await _send_card(loadout_query, event, bot_cards.loadout_card(data),
                      f"队伍配装 {data['name']}", f"{data['name']} · 队伍配装")
+
+
+# ---------- 维护期白名单标记 ----------
+# 这些指令只用本地数据（manifest 索引 / 掉落表 / 绑定表 / 第三方进度接口），
+# 不需要 Bungie 接口，所以维护期不拦（见 _maint_gate）。
+# at_lookup 是「@机器人 接武器名/perk/护甲」那条路，同样是本地索引查询，一并放行。
+# msg_logger 必须放行：它是「每条消息都记一笔面板日志」的响应器（priority=1，匹配所有消息），
+# 漏标的话维护期群里**随便说句话都会收到一张维护卡**（给日志用的响应器不该触发用户提示）。
+# 标在 _default_state 上：nonebot 每次触发都会 state = _default_state.copy()，
+# 于是这个标记对每个实例都生效，不必逐个 handler 去判。
+for _m in (help_query, unbind_query, mine_query, weapon_query, perk_query, armor_query,
+           filter_query, armor_lookup, drop_query, cp_query, login_query, callback_query,
+           at_lookup, msg_logger):
+    _m._default_state["maint_ok"] = True

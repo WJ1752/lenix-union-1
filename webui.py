@@ -54,6 +54,16 @@ def err_page(title: str, detail: str) -> HTMLResponse:
 @app.exception_handler(Exception)
 async def on_error(request, exc: Exception):
     """兜底：上游/网络异常不再吐 500 白页，给一句人话 + 重试提示"""
+    if isinstance(exc, d2.BungieMaintenanceError):
+        # 维护是「现在做不了」，不是「你的操作有问题」：单独一页，别让管理员去查网络
+        return err_page("Bungie 服务器维护中",
+                        f"{exc}<br><span style='color:#9aa0a6'>维护期间所有查询都拿不到数据，"
+                        f"官方恢复后刷新本页重试即可（维护窗口与状态见「后端管理 → 总览」）。</span>")
+    if isinstance(exc, d2.DataSuspiciousError):
+        # 补查层拦下的「数据不完整」：宁可不显示，也不显示错的数字
+        return err_page("这次的数据不完整",
+                        f"{exc}<br><span style='color:#9aa0a6'>已自动拦下避免出错误统计，"
+                        f"稍等片刻刷新重试即可。</span>")
     return err_page("数据获取失败",
                     "Bungie 接口或网络暂时不可用，请点上方标签重试（已自动重试 2 次）。<br>"
                     f"<span style='color:#9aa0a6'>{d2.esc_err(exc)}</span>")
@@ -101,6 +111,7 @@ code{background:#1b1e22;border-radius:4px;padding:1px 6px;font-size:12px;color:#
 .pbar{height:8px;background:#1b1e22;border-radius:4px;overflow:hidden;margin-top:6px}
 .pfill{height:100%;background:linear-gradient(90deg,#35c66b,#4b8fd4);transition:width .4s}
 .pfill.err{background:#b04a42}
+.pfill.mute{background:#4a4f55}   /* 已中止：中性灰，别跟「已完成」的绿混淆 */
 /* 真进度条：数据卡片里带百分比/剩余时间的粗条；准备阶段（起通道/等验证）走不定进度动画 */
 .pwrap{margin-top:8px}
 .pwrap .pbar{height:12px;margin-top:0}
@@ -126,7 +137,7 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
 .rtile .s{font-size:12px;color:#9aa0a6;margin-top:4px}
 .rbar{height:5px;background:#24282d;border-radius:3px;margin-top:8px;overflow:hidden}
 .rbar i{display:block;height:100%;background:#35c66b;border-radius:3px;transition:width .4s}
-#msg,#capmsg{font-size:13px;color:#35c66b;margin-left:10px}
+#msg,#capmsg,#parmsg{font-size:13px;color:#35c66b;margin-left:10px}
 </style></head><body>
 <h1>Bot 后端管理</h1>
 <div class="wrap">
@@ -139,6 +150,10 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
   <span class="tb" data-t="settings">参数设置</span>
 </div>
 
+<!-- 维护横幅：维护中管理页每一页都能看到（切标签也在，因为它在 tabs 下面） -->
+<div id="maintBanner" style="display:none;margin:0 0 14px;padding:12px 16px;border-radius:10px;
+  background:#3a1f1d;border:1px solid #b04a42;color:#ffb4ad;font-size:14px;line-height:1.7"></div>
+
 <!-- ============ 总览 ============ -->
 <div class="tab on" id="tab-overview">
   <div class="grid4">
@@ -148,6 +163,8 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
       <div class="go"><button class="ghost" onclick="showTab('login')">去登录管理</button></div></div>
     <div class="tile"><div class="k">Bungie 授权</div><div class="v" id="ovBungie">…</div>
       <div class="go"><button class="ghost" onclick="showTab('login')">去授权</button></div></div>
+    <div class="tile"><div class="k">Bungie 服务器状态</div><div class="v" id="ovMaint">…</div>
+      <div class="go"><button class="ghost" onclick="refreshMaint(true)">重新探测</button></div></div>
     <div class="tile"><div class="k">数据概况</div><div class="v" id="ovData">…</div>
       <div class="go"><button class="ghost" onclick="showTab('data')">数据管理</button>
       <button class="ghost" onclick="showTab('settings')">参数设置</button></div></div>
@@ -274,10 +291,25 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
    <button onclick="saveConc()">保存</button><span id="msg"></span>
   </div>
   <div class="sec">
+   <h2>并行任务数</h2>
+   <p>同时推进几个后台重任务（生涯武器 / 热力图 / 宗师）。它们<b>共享</b>上面那个「并发上限」：
+    并行只是把几个任务交错着跑，请求总量不会超速，想更快要把并发上限也一起调大；
+    默认 2 个，调成 1 即回到原来的一次只跑一个（串行排队）。</p>
+   <select id="par">
+    <option value="0">默认（2 个）</option>
+    <option value="1">1（串行，与原来相同）</option>
+    <option value="2">2（默认）</option>
+    <option value="3">3</option><option value="4">4</option>
+   </select>
+   <button onclick="savePar()">保存</button><span id="parmsg"></span>
+  </div>
+  <div class="sec">
    <h2>生涯统计场次上限</h2>
    <p>/pvp生涯武器 逐场统计默认最多 2000 场、/pve生涯武器 默认 3000 场（防止十年老号
-    跑几十分钟）。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能要跑
-    很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
+    跑几十分钟）；/pvp 卡片顶部的全模式生涯统计也按这个 PvP 上限翻对局历史。/pve 卡片的
+    终局通关数（突袭 / 地牢 / 宗师·大师日落 / 终极征服）不受这里影响——它只翻历史页不拉
+    PGCR，默认就翻全生涯。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能
+    要跑很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <label>PvP　<select id="capPvp">
      <option value="default">默认 2000</option>
@@ -292,13 +324,58 @@ select,input{font-family:inherit;font-size:14px;background:#1b1e22;color:#e8e6e3
     <button onclick="saveCaps()">保存</button><span id="capmsg"></span>
    </div>
   </div>
+  <div class="sec">
+   <h2>近期战绩局数</h2>
+   <p>/pvp /pve /智谋 卡片上的「近期战绩」与「模式细分」只统计<b>跨角色合并后</b>最近这么多局
+    （默认 100，不是每角色各 100）：调大更完整，但每次查询要多翻几页对局历史。顶部生涯统计
+    不受这里影响——PvP 的生涯统计按全生涯对局历史聚合，PvE 用 Bungie 官方生涯数，
+    智谋用官方 gambit 生涯桶。</p>
+   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label>PvP　<select id="recPvp">
+     <option value="default">默认 100</option>
+     <option value="200">200</option><option value="300">300</option>
+     <option value="500">500</option><option value="1000">1000</option>
+    </select></label>
+    <label>PvE　<select id="recPve">
+     <option value="default">默认 100</option>
+     <option value="200">200</option><option value="300">300</option>
+     <option value="500">500</option><option value="1000">1000</option>
+    </select></label>
+    <label>智谋　<select id="recGb">
+     <option value="default">默认 100</option>
+     <option value="200">200</option><option value="300">300</option>
+     <option value="500">500</option><option value="1000">1000</option>
+    </select></label>
+    <button onclick="saveRecent()">保存</button><span id="recmsg"></span>
+   </div>
+  </div>
+  <div class="sec">
+   <h2>胜点图场数</h2>
+   <p>卡片上那一片红绿方块（绿 = 胜 / 通关，红 = 负，灰 = 未完成）画多少场。
+    <b>智谋默认画 100 场</b>（和近期窗口一样长），PvP 默认不画（格子太吵，想要可以自己开）；
+    调大时会多翻几页对局历史，设「不画」则一个格子都不画。</p>
+   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label>智谋　<select id="gridGb">
+     <option value="0">不画</option>
+     <option value="50">50</option><option value="100">100（默认）</option>
+     <option value="200">200</option><option value="500">500</option>
+    </select></label>
+    <label>PvP　<select id="gridPvp">
+     <option value="0">不画（默认）</option>
+     <option value="50">50</option><option value="100">100</option>
+     <option value="200">200</option><option value="500">500</option>
+    </select></label>
+    <button onclick="saveGrid()">保存</button><span id="gridmsg"></span>
+   </div>
+  </div>
 </div>
 </div>
 <script>
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function fmtElapsed(sec){
   if(!sec && sec !== 0) return '';
-  const m = Math.floor(sec/60), s = sec%60;
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  if(h) return m ? `${h}小时${m}分` : `${h}小时`;   // 长任务动辄过小时，别显示成「95分3秒」
   return m ? `${m}分${s}秒` : `${s}秒`;
 }
 function fmtB(n){if(!isFinite(n))return'–';if(n<1024)return n.toFixed(0)+' B';
@@ -313,18 +390,20 @@ function fmtSize(n){
 }
 
 /* ---------- 标签页 ---------- */
+let curTab = 'overview';
 const TAB_REFRESH = {
   login:   ()=>{ refreshNap(); refreshBungie(); },
-  jobs:    ()=>{ refreshJobs(); refreshLogs(); },
+  jobs:    ()=>{ refreshJobs(); refreshLogs(true); },
   groups:  ()=>{ refreshGroups(); refreshBindings(); },
   data:    ()=>{ refreshUsage(); refreshCaches(true); },
-  settings:()=>{ refreshStats(); loadCaps(); loadConc(); },
+  settings:()=>{ refreshStats(); loadCaps(); loadRecent(); loadGrid(); loadConc(); loadPar(); },
 };
 function showTab(id){
   document.querySelectorAll('.tab').forEach(s=>s.classList.remove('on'));
   document.querySelectorAll('#tabs .tb').forEach(b=>b.classList.toggle('on', b.dataset.t===id));
   const sec = document.getElementById('tab-'+id);
   if(sec) sec.classList.add('on');
+  curTab = id;
   try{ localStorage.setItem('panelTab', id); }catch(e){}
   (TAB_REFRESH[id]||(()=>{}))();
 }
@@ -343,6 +422,26 @@ function ovDataRender(){
 
 /* ---------- QQ 连接 / 群 ---------- */
 let groupNames = {};
+// Bungie 维护态：维护中面板顶部给一条红色横幅（管理员一眼知道「不是机器人坏了」）
+let _maintOn = false;
+async function refreshMaint(force){
+  const el = document.getElementById('ovMaint');
+  let m = {};
+  try{
+    m = await (await fetch('/api/bungie/maint' + (force ? '?probe=1' : ''))).json();
+  }catch(e){ if(el) el.textContent = '状态未知'; return; }
+  const ban = document.getElementById('maintBanner');
+  _maintOn = !!m.on;
+  if(el){
+    el.innerHTML = m.on
+      ? `<span class="off">● 维护中</span><br><span class="dim">${esc(m.text||'')}</span>`
+      : '<span class="on">● 正常</span><br><span class="dim">接口可用</span>';
+  }
+  if(ban){
+    ban.style.display = m.on ? 'block' : 'none';
+    ban.textContent = m.on ? ('⛔ ' + (m.text || 'Bungie 服务器维护中')) : '';
+  }
+}
 async function refreshStatus(){
   try{
     const s = await (await fetch('/api/bot/status')).json();
@@ -350,6 +449,7 @@ async function refreshStatus(){
       ? `<span class="on">● 已连接</span><br>${esc(s.nickname)}（${s.uin}）`
       : '<span class="off">● 未连接</span><br><span class="dim">等待协议端接入</span>';
   }catch(e){}
+  refreshMaint();
   try{
     const g = await (await fetch('/api/bot/groups')).json();
     groupNames = Object.fromEntries((g.groups||[]).map(x=>[String(x.group_id), x.group_name]));
@@ -512,27 +612,81 @@ async function bungieLogout(){
 }
 
 /* ---------- 消息日志 ---------- */
-async function refreshLogs(){
+// 轮询（2.5s，只在这一页可见时拉）：以前只在切标签页时刷新一次，群里来消息面板不会动，
+// 得手动切走再切回才看到新的——现在内容变了才重绘，且保住滚动位置与下拉框。
+let _logSig = '', _logOptSig = '';
+async function refreshLogs(force){
   const sel = document.getElementById('logGroup');
-  const cur = sel.value;
-  const r = await (await fetch('/api/bot/logs?limit=200&group_id=' + encodeURIComponent(cur))).json();
-  const opts = r.groups.map(g =>
-    `<option value="${g}" ${g===cur?'selected':''}>${esc(groupNames[g]||('群 '+g))}</option>`).join('');
-  sel.innerHTML = `<option value="" ${cur===''?'selected':''}>全部</option>${opts}` +
-    (r.has_private ? `<option value="private" ${cur==='private'?'selected':''}>私聊</option>` : '');
   const box = document.getElementById('logs');
-  document.getElementById('logCount').textContent = `共 ${r.items.length} 条`;
-  if(!r.items.length){ box.innerHTML = '<span class="dim">暂无记录</span>'; return; }
-  box.innerHTML = r.items.map(e=>{
+  if(!sel || !box) return;
+  const cur = sel.value;
+  let r;
+  try{
+    r = await (await fetch('/api/bot/logs?limit=200&group_id=' + encodeURIComponent(cur))).json();
+  }catch(e){ return; }
+  const items = r.items || [];
+  const first = items[0] ? `${items[0].time}|${items[0].text}` : '';
+  const last = items.length ? `${items[items.length-1].time}|${items[items.length-1].text}` : '';
+  const sig = `${cur}|${items.length}|${first}|${last}|${r.has_private ? 1 : 0}`;
+  if(!force && sig === _logSig) return;          // 没变化：不重绘，别打断滚动/选中
+  _logSig = sig;
+  const optSig = `${cur}|${r.groups.join(',')}|${r.has_private ? 1 : 0}`;
+  if(optSig !== _logOptSig){                     // 群列表没变就不重建下拉框（避免打断展开）
+    _logOptSig = optSig;
+    const opts = r.groups.map(g =>
+      `<option value="${g}" ${g===cur?'selected':''}>${esc(groupNames[g]||('群 '+g))}</option>`).join('');
+    sel.innerHTML = `<option value="" ${cur===''?'selected':''}>全部</option>${opts}` +
+      (r.has_private ? `<option value="private" ${cur==='private'?'selected':''}>私聊</option>` : '');
+  }
+  const keep = box.scrollTop;
+  document.getElementById('logCount').textContent = `共 ${items.length} 条`;
+  if(!items.length){ box.innerHTML = '<span class="dim">暂无记录</span>'; return; }
+  box.innerHTML = items.map(e=>{
     const gname = e.group_id ? (groupNames[e.group_id] || ('群 ' + e.group_id)) : '私聊';
     const tag = e.dir === 'out'
       ? '<span class="on">回</span>'
       : (e.enabled === false ? '<span class="off">未启用群</span>'
          : (e.skip ? `<span class="off">${esc(e.skip)}</span>` : '<span class="dim">收</span>'));
+    // 发送失败的图片：面板上直接能看到那张卡（点开看大图），并给「重发 / 打开文件夹」
+    // 参数走 data-*（esc 已转义引号），别拼进 onclick 的 JS 字符串里
+    const un = e.unsent ? `<div class="unbox" data-name="${esc(e.unsent)}"
+        data-gid="${esc(e.group_id||'')}" data-uid="${esc(e.resend_user||'')}"
+        data-official="${e.resend_official?1:0}" style="margin-top:6px">
+      <a href="/unsent/${encodeURIComponent(e.unsent)}" target="_blank" title="点开看大图">
+        <img src="/unsent/${encodeURIComponent(e.unsent)}" style="max-width:210px;max-height:150px;
+          border:1px solid #2a2e33;border-radius:6px;display:block"></a>
+      <div class="dim" style="margin-top:3px">没发出去的卡片：${esc(e.unsent)}</div>
+      <div style="margin-top:4px;display:flex;gap:6px">
+        <button class="ghost" style="padding:3px 10px;font-size:12px"
+          onclick="resendUnsent(this)">重发</button>
+        <button class="ghost" style="padding:3px 10px;font-size:12px"
+          onclick="openUnsentDir()">打开文件夹</button>
+      </div></div>` : '';
     return `<div style="padding:6px 10px;border-radius:6px;margin:3px 0;background:#16181b">
       <div class="dim">${e.time} · ${esc(gname)} · ${esc(e.dir==='out'?'机器人':(e.nickname||e.user_id))} ${tag}</div>
-      <div style="white-space:pre-wrap;word-break:break-all;margin-top:2px">${esc(e.text)}</div></div>`;
+      <div style="white-space:pre-wrap;word-break:break-all;margin-top:2px">${esc(e.text)}</div>${un}</div>`;
   }).join('');
+  box.scrollTop = keep;                          // 最新在前：停在原地，别把正在看的记录顶走
+}
+async function resendUnsent(btn){
+  const box = btn.closest('.unbox');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '重发中…';
+  let r = {};
+  try{
+    r = await (await fetch('/api/bot/resend', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({unsent: box.dataset.name, group_id: box.dataset.gid,
+        user_id: box.dataset.uid, official: box.dataset.official === '1'})})).json();
+  }catch(e){ r = {ok:false, msg:'请求失败：'+e}; }
+  btn.disabled = false; btn.textContent = old;
+  alert(r.ok ? '已重发' : ('重发失败：' + (r.msg || '未知原因')));
+  refreshLogs(true);
+}
+async function openUnsentDir(){
+  let r = {};
+  try{ r = await (await fetch('/api/bot/unsent/open', {method:'POST'})).json(); }
+  catch(e){ r = {ok:false, msg:String(e)}; }
+  if(!r.ok) alert('打不开文件夹：' + (r.msg || '未知原因'));
 }
 async function clearLogs(){
   if(!confirm('清空当前日志？')) return;
@@ -565,30 +719,64 @@ async function refreshJobs(){
   box.innerHTML = slice.map(j=>{
     const running = j.status === 'running';
     const queued = j.status === 'queued';
-    const pctv = running && !j.total ? 0 : j.pct;
+    const pctv = running && !j.total ? 0 : (j.pct || 0);
     const tail = running
       ? (j.total ? `${j.done} / ${j.total} 场（${j.pct}%）` : '准备中…')
-      : queued ? `排队中 · 第 ${j.queue_pos || 1} 位`
-      : (j.status === 'done' ? '已完成' : j.status === 'error' ? '失败' : j.status);
-    const width = running ? (pctv || 3) : queued ? 3 : 100;
+      : queued ? (j.paused ? '排队中 · 已暂停' : `排队中 · 第 ${j.queue_pos || 1} 位`)
+      : (j.status === 'done' ? '已完成' : j.status === 'error' ? '失败'
+         // 中止要分两种：维护自动中止（用户重发也没用，得等官方）与管理员点了中止
+         : j.status === 'aborted'
+           ? ((j.error || '').includes('维护') ? '已中止 · Bungie 维护中' : '已中止（管理员）')
+         : j.status);
+    const width = running ? (pctv || 3) : queued ? 3
+      : (j.status === 'aborted' ? (pctv || 3) : 100);
     const when = (j.date ? j.date + ' ' : '') + (j.time || '');
-    const el = (running || queued) && j.elapsed ? ` · 已跑 ${fmtElapsed(j.elapsed)}` : '';
+    // 排队与运行分开计时：排队中只报已排队；运行中单列「已跑」，等过的再补一段排队时长；
+    // 已结束给总运行时长，同样把排队时长单独括起来（总耗时 = 排队 + 运行，一眼能对上）
+    // 老版快照只有 elapsed（从发起算起）：run_s/total_s 都缺时退回它，别显示「已跑 0秒」
+    const runS = j.run_s != null ? j.run_s : (j.total_s != null ? j.total_s : (j.elapsed || 0));
+    const queuedTip = j.queued_s > 5 ? `（排队 ${fmtElapsed(j.queued_s)}）` : '';
+    let el = '';
+    if(queued) el = j.queued_s ? ` · 已排队 ${fmtElapsed(j.queued_s)}` : '';
+    else if(running) el = ` · 已跑 ${fmtElapsed(runS)}${queuedTip}`;
+    else if(j.run_s != null || j.total_s != null) el = ` · 用时 ${fmtElapsed(runS)}${queuedTip}`;
+    if(j.paused && !queued) el += ' · 已暂停';   // 排队的「已暂停」已写在状态里，别重复
     const reuse = j.reused
       ? `<span class="dim"> · 已复用于 ${esc((j.reused_by || []).join('、') || '同一查询')}</span>` : '';
+    const note = j.note ? `<span class="dim"> · ${esc(j.note)}</span>` : '';
+    // 每 2 秒整表重绘：按钮必须用内联 onclick 调全局函数（addEventListener 会随重绘失效）；
+    // label 里若带引号/反斜杠会截断内联 JS 字符串，先滤掉再进 confirm 文案
+    const can = j.can || {};
+    const jlabel = String(j.label || '任务').replace(/['\\\\]/g, '');
+    const btn = (act, text)=> can[act]
+      ? `<button class="ghost" style="padding:2px 8px;font-size:12px"
+           onclick="jobCtrl('${esc(j.id)}','${act}','${esc(jlabel)}')">${text}</button>` : '';
+    const btns = btn('pause','暂停') + btn('resume','继续') + btn('abort','中止') + btn('retry','重跑');
     return `<div style="padding:8px 10px;border-radius:6px;margin:4px 0;background:#1b1e22">
       <div style="display:flex;justify-content:space-between;gap:10px">
         <span><b>${esc(j.label)}</b> <span class="dim">${esc(j.name)}</span></span>
-        <span class="dim" style="white-space:nowrap">${esc(j.who)}${reuse}</span>
+        <span class="dim" style="white-space:nowrap">${esc(j.who)}${reuse}${note}</span>
       </div>
-      <div class="pbar"><div class="pfill ${j.status==='error'?'err':''}" style="width:${width}%"></div></div>
+      <div class="pbar"><div class="pfill ${j.status==='error'?'err':(j.status==='aborted'?'mute':'')}" style="width:${width}%"></div></div>
       <div class="dim" style="margin-top:3px;display:flex;justify-content:space-between;gap:8px">
         <span>${esc(tail)}</span>
         <span style="white-space:nowrap">🕒 ${esc(when)}${esc(el)}</span>
-      </div></div>`;
+      </div>
+      ${btns ? `<div style="margin-top:5px;display:flex;gap:6px;justify-content:flex-end">${btns}</div>` : ''}</div>`;
   }).join('');
   document.getElementById('jobPageInfo').textContent = `第 ${jobPage + 1} / ${pages} 页`;
   document.getElementById('jobPrev').disabled = jobPage <= 0;
   document.getElementById('jobNext').disabled = jobPage >= pages - 1;
+}
+async function jobCtrl(jid, action, label){
+  if(action === 'abort' && !confirm('确定中止「' + label + '」？已完成的部分会保留在缓存里，重跑时会复用')) return;
+  let r = {};
+  try{
+    r = await (await fetch('/api/bot/jobs/control',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:jid,action:action})})).json();
+  }catch(e){ alert('操作失败：' + e); return; }
+  if(!r.ok) alert(r.msg || '操作失败');
+  refreshJobs();
 }
 
 /* ---------- 账号绑定 ---------- */
@@ -763,6 +951,17 @@ async function saveConc(){
   const m = document.getElementById('msg'); m.textContent = '已保存，即刻生效';
   setTimeout(()=>m.textContent='',2500);
 }
+async function loadPar(){
+  try{ document.getElementById('par').value = String((await (await fetch('/api/settings/jobparallel')).json()).value || 0); }
+  catch(e){}
+}
+async function savePar(){
+  const v = parseInt(document.getElementById('par').value);
+  await fetch('/api/settings/jobparallel',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+  const m = document.getElementById('parmsg'); m.textContent = '已保存，即刻生效';
+  setTimeout(()=>m.textContent='',2500);
+}
 async function loadCaps(){
   try{
     const d = await (await fetch('/api/settings/matchcaps')).json();
@@ -784,6 +983,50 @@ async function saveCaps(){
   m.textContent = d.ok?`已保存，生效：PvP ${show(d.pvp_eff)} / PVE ${show(d.pve_eff)}`:'保存失败';
   setTimeout(()=>m.textContent='',4000);
 }
+async function loadRecent(){
+  try{
+    const d = await (await fetch('/api/settings/recent')).json();
+    const set = (id,v)=>{const s = document.getElementById(id);
+      if(![...s.options].some(o=>o.value===String(v))){
+        const o = document.createElement('option'); o.value = String(v);
+        o.textContent = v+'（自定义）'; s.add(o);}
+      s.value = String(v);};
+    set('recPvp',d.pvp); set('recPve',d.pve); set('recGb',d.gambit);
+  }catch(e){}
+}
+async function saveRecent(){
+  const body = {pvp:document.getElementById('recPvp').value,
+                pve:document.getElementById('recPve').value,
+                gambit:document.getElementById('recGb').value};
+  const d = await (await fetch('/api/settings/recent',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  const m = document.getElementById('recmsg');
+  m.textContent = d.ok?`已保存，生效：PvP ${d.pvp_eff} 局 / PVE ${d.pve_eff} 局 / 智谋 ${d.gambit_eff} 局`:'保存失败';
+  setTimeout(()=>m.textContent='',4000);
+}
+async function loadGrid(){
+  try{
+    const d = await (await fetch('/api/settings/grid')).json();
+    const set = (id,v)=>{const s = document.getElementById(id);
+      if(![...s.options].some(o=>o.value===String(v))){
+        const o = document.createElement('option'); o.value = String(v);
+        o.textContent = (v===0?'不画':v+' 场')+'（自定义）'; s.add(o);}
+      s.value = String(v);};
+    // 「未设置」就显示实际生效值（智谋 100 / PvP 不画），这样下拉框里始终是一个具体场数
+    set('gridPvp', d.pvp === 'default' ? d.pvp_eff : d.pvp);
+    set('gridGb',  d.gambit === 'default' ? d.gambit_eff : d.gambit);
+  }catch(e){}
+}
+async function saveGrid(){
+  const body = {pvp:document.getElementById('gridPvp').value,
+                gambit:document.getElementById('gridGb').value};
+  const d = await (await fetch('/api/settings/grid',{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  const m = document.getElementById('gridmsg');
+  const show = n=>n===0?'不画':n+' 场';
+  m.textContent = d.ok?`已保存，生效：智谋 ${show(d.gambit_eff)} / PvP ${show(d.pvp_eff)}`:'保存失败';
+  setTimeout(()=>m.textContent='',4000);
+}
 
 /* ---------- 启动 ---------- */
 let _bootTab = 'overview';
@@ -793,6 +1036,8 @@ refreshStatus(); setInterval(refreshStatus, 5000);
 refreshNap();    setInterval(refreshNap, 5000);
 refreshBungie(); setInterval(refreshBungie, 10000);
 setInterval(refreshJobs, 2000);  refreshJobs();
+// 消息日志也走轮询（只在「任务与日志」页可见时拉）：不用再切标签页才看到新消息
+setInterval(()=>{ if(curTab==='jobs' && !document.hidden) refreshLogs(); }, 2500);
 refreshBindings(); setInterval(refreshBindings, 10000);
 refreshUsage();  setInterval(refreshUsage, 3000);
 setInterval(refreshStats, 2000);
@@ -865,6 +1110,24 @@ async def bot_jobs():
     return {"jobs": d2.job_snapshot()}
 
 
+@app.post("/api/bot/jobs/control")
+async def bot_jobs_control(request: dict):
+    """后台任务逐条控制：中止 / 暂停 / 继续 / 重跑（面板按钮用）"""
+    jid = str(request.get("id") or "")
+    action = str(request.get("action") or "")
+    if not jid:
+        return {"ok": False, "msg": "缺少任务 id"}
+    if not action:
+        return {"ok": False, "msg": "缺少操作类型"}
+    try:
+        # job_control 只改内存状态与 asyncio 事件对象，不会阻塞事件循环，直接调即可
+        return d2.job_control(jid, action)
+    except Exception as e:  # noqa: BLE001
+        # 面板轮询密集，出错只回一句中文提示，别把 500 抛给前端
+        print(f"[面板] 任务控制失败 {jid}/{action}：{type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "msg": f"操作失败：{type(e).__name__}: {e}"}
+
+
 @app.get("/api/bot/bindings")
 async def bot_bindings():
     """面板用：QQ → 绑定账号 一览（编号统一补零到 4 位）"""
@@ -875,6 +1138,117 @@ async def bot_bindings():
 async def bot_logs_clear():
     bot_log.clear()
     return {"ok": True}
+
+
+# ---------- 发送失败的图片：预览 / 重发 / 打开文件夹 ----------
+# 卡片是现渲染现发的，QQ 侧发送失败（被动回复窗口过期/掉线/风控）后进程里没有第二份，
+# 所以插件在发送失败的那一刻把图片落到 unsent_images/，面板据此提供这三件事。
+
+async def _resend_image(path: str, gid: str, uid: str, official: bool) -> dict:
+    """把存盘的那张图重发到原收件人。跑在 nonebot 驱动循环上（call_api 得在它的循环里）"""
+    import base64
+    import bot_runtime
+    with open(path, "rb") as f:
+        png = f.read()
+    if not png:
+        return {"ok": False, "msg": "文件是空的"}
+    name = os.path.basename(path)
+    bots = list(bot_runtime.get_bots().values())
+    if not bots:
+        return {"ok": False, "msg": "QQ 协议端当前没连上，等协议端恢复后再重发"}
+    last = ""
+    for bot in bots:
+        mod = type(bot).__module__
+        # 必须写 adapters.onebot：单查 "onebot" 会被 "nonebot（适配器都在 nonebot.adapters 下）"
+        # 这个子串误命中，官方通道的 bot 也会被当成 NapCat（两条通道 API 完全不同）
+        is_ob = "adapters.onebot" in mod
+        if is_ob == official:
+            continue          # 官方通道 ↔ NapCat 各走各的，别拿错适配器
+        try:
+            if is_ob:
+                from nonebot.adapters.onebot.v11 import MessageSegment
+                seg = MessageSegment.image("base64://" + base64.b64encode(png).decode())
+                if gid:
+                    await bot.call_api("send_group_msg", group_id=int(gid), message=seg)
+                else:
+                    await bot.call_api("send_private_msg", user_id=int(uid), message=seg)
+            else:
+                from nonebot.adapters.qq import Message, MessageSegment
+                msg = Message(MessageSegment.file_image(png, name))
+                # msg_id 不传 = 主动消息（被动回复窗口早过了，只能走这条）
+                if gid:
+                    await bot.send_to_group(group_openid=gid, message=msg)
+                else:
+                    await bot.send_to_c2c(openid=uid, message=msg)
+            bot_log.add("out", text=f"[面板重发] {name}", group_id=gid,
+                        nickname="Bot（面板）")
+            return {"ok": True, "msg": "已重发"}
+        except Exception as exc:  # noqa: BLE001 换下一个协议端再试
+            last = f"{type(exc).__name__}: {exc}"
+            print(f"[面板] 重发失败 {name}：{last}", flush=True)
+    return {"ok": False, "msg": last or "没有可用的协议端连接"}
+
+
+@app.get("/unsent/{name}")
+async def unsent_file(name: str):
+    """面板里直接看那张没发出去的图（日志条目上的缩略图点开就是这里）"""
+    p = bot_log.unsent_path(name)
+    if not p:
+        return err_page("图片不在了", "这张没发出去的图已被清理（只保留最近 "
+                                    f"{bot_log.UNSENT_KEEP} 张），或在文件夹里被手动删掉了。")
+    # 不要自己拼 Content-Disposition：文件名是中文，starlette 用 latin-1 编码响应头，
+    # 一拼就 UnicodeEncodeError（整页变成「数据获取失败」）。image/png 默认就是内联预览。
+    return FileResponse(p, media_type="image/png")
+
+
+@app.get("/api/bot/unsent")
+async def unsent_list():
+    return {"dir": bot_log.unsent_dir(create=False), "items": bot_log.unsent_list()}
+
+
+@app.post("/api/bot/unsent/open")
+def unsent_open():
+    """打开未发送图片的文件夹（Windows 资源管理器），人工检查用"""
+    d = bot_log.unsent_dir()
+    if not d:
+        return {"ok": False, "msg": "文件夹建不出来（程序目录没有写权限？）"}
+    try:
+        os.startfile(d)                        # noqa: S606 本机面板功能，路径写死
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "msg": f"{type(exc).__name__}: {exc}", "dir": d}
+    return {"ok": True, "msg": d, "dir": d}
+
+
+@app.post("/api/bot/resend")
+def bot_resend(request: dict):
+    """重发一条发送失败的图片（面板日志条目上的「重发」按钮）
+
+    刻意用同步函数：FastAPI 会把它丢进线程池，里面等另一个事件循环的结果
+    （fut.result）就不会卡住面板自己的事件循环。
+    """
+    import concurrent.futures as _fut
+    import bot_scheduler
+    name = str(request.get("unsent") or "")
+    p = bot_log.unsent_path(name)
+    if not p:
+        return {"ok": False, "msg": "找不到那张图（可能已被清理）"}
+    loop = bot_scheduler.bot_loop()
+    if loop is None:
+        return {"ok": False, "msg": "QQ 协议端当前没连上，等协议端恢复后再重发"}
+    coro = _resend_image(p, str(request.get("group_id") or ""),
+                         str(request.get("user_id") or ""),
+                         bool(request.get("official")))
+    try:
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "msg": f"{type(exc).__name__}: {exc}"}
+    try:
+        return fut.result(timeout=60)
+    except _fut.TimeoutError:
+        fut.cancel()   # 必须取消：不然协议端那边还在发，面板上却已经报失败了
+        return {"ok": False, "msg": "重发超时（协议端 60 秒没回执）"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "msg": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------- 武器使用率数据（light.gg 快照：状态 / 全库刷新 / 单武器校准） ----------
@@ -1101,6 +1475,21 @@ async def set_concurrency(request: dict):
     return {"ok": True, "value": bot_runtime.load_config().get("max_concurrency") or 0}
 
 
+@app.get("/api/settings/jobparallel")
+async def get_job_parallel():
+    """并行任务数（面板下拉用）：1..4，0 表示「默认」"""
+    return {"value": d2.job_parallel()}
+
+
+@app.post("/api/settings/jobparallel")
+async def set_job_parallel(request: dict):
+    try:
+        n = int(request.get("value") or 0)   # 0 = 默认，由 set_job_parallel 内部换算
+    except Exception:  # noqa: BLE001
+        n = 0
+    return {"ok": True, "value": d2.set_job_parallel(n)}
+
+
 @app.get("/api/settings/matchcaps")
 async def get_matchcaps():
     """生涯统计场次上限（原始值：'default'=默认，数字=上限，0=无限制）+ 当前生效值"""
@@ -1129,6 +1518,68 @@ async def set_matchcaps(request: dict):
     return {"ok": True, "pvp_eff": d2.match_cap("pvp"), "pve_eff": d2.match_cap("pve")}
 
 
+@app.get("/api/settings/recent")
+async def get_recent():
+    """近期战绩窗口（跨角色合并后最近多少局）：战绩卡的「近期战绩」与「模式细分」用它"""
+    cfg = bot_runtime.load_config()
+    return {"pvp": cfg.get("pvp_recent_count", "default"),
+            "pve": cfg.get("pve_recent_count", "default"),
+            "gambit": cfg.get("gambit_recent_count", "default"),
+            "pvp_eff": d2.recent_count("pvp"), "pve_eff": d2.recent_count("pve"),
+            "gambit_eff": d2.recent_count("gambit")}
+
+
+@app.post("/api/settings/recent")
+async def set_recent(request: dict):
+    def _set(cfg):
+        for kind in ("pvp", "pve", "gambit"):
+            v = request.get(kind)
+            if v is None:
+                continue
+            key = f"{kind}_recent_count"
+            if v == "default":
+                cfg.pop(key, None)
+            else:
+                try:
+                    n = int(v)
+                except Exception:  # noqa: BLE001
+                    continue
+                if n > 0:
+                    cfg[key] = n
+    bot_runtime.update_config(_set)
+    return {"ok": True, "pvp_eff": d2.recent_count("pvp"), "pve_eff": d2.recent_count("pve"),
+            "gambit_eff": d2.recent_count("gambit")}
+
+
+@app.get("/api/settings/grid")
+async def get_grid():
+    """胜点图场数：卡片上红绿方块画多少场（0 = 不画）"""
+    cfg = bot_runtime.load_config()
+    return {"pvp": cfg.get("pvp_grid_count", "default"),
+            "gambit": cfg.get("gambit_grid_count", "default"),
+            "pvp_eff": d2.grid_count("pvp"), "gambit_eff": d2.grid_count("gambit")}
+
+
+@app.post("/api/settings/grid")
+async def set_grid(request: dict):
+    def _set(cfg):
+        for kind in ("pvp", "gambit"):
+            v = request.get(kind)
+            if v is None:
+                continue
+            key = f"{kind}_grid_count"
+            if v == "default":
+                cfg.pop(key, None)          # 默认：PvP 不画 / 智谋 100 场
+            else:
+                try:
+                    n = max(0, int(v))
+                except Exception:  # noqa: BLE001
+                    continue
+                cfg[key] = n                # 0 = 不画
+    bot_runtime.update_config(_set)
+    return {"ok": True, "pvp_eff": d2.grid_count("pvp"), "gambit_eff": d2.grid_count("gambit")}
+
+
 RUNTIME_PAGE = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>运行状态</title>
 <style>
 body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0f1113;color:#e8e6e3;padding:22px}
@@ -1146,7 +1597,7 @@ h1{font-size:20px;margin:0 0 16px}
 select,button{font-family:inherit;font-size:14px;background:#0f1113;color:#e8e6e3;
 border:1px solid #2a2e33;border-radius:8px;padding:8px 12px}
 button{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold;cursor:pointer}
-#msg{font-size:13px;color:#35c66b;margin-left:10px}
+#msg,#parmsg{font-size:13px;color:#35c66b;margin-left:10px}
 </style></head><body>
 <h1>运行状态</h1>
 <div class="grid">
@@ -1176,10 +1627,25 @@ button{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold;curso
  <button onclick="save()">保存</button><span id="msg"></span>
 </div>
 <div class="sec" style="margin-top:14px">
+ <h2>并行任务数</h2>
+ <p>同时推进几个后台重任务（生涯武器 / 热力图 / 宗师）。它们<b>共享</b>上面那个「并发上限」：
+ 并行只是把几个任务交错着跑，请求总量不会超速，想更快要把并发上限也一起调大；
+ 默认 2 个，调成 1 即回到原来的一次只跑一个（串行排队）。</p>
+ <select id="par">
+  <option value="0">默认（2 个）</option>
+  <option value="1">1（串行，与原来相同）</option>
+  <option value="2">2（默认）</option>
+  <option value="3">3</option><option value="4">4</option>
+ </select>
+ <button onclick="savePar()">保存</button><span id="parmsg"></span>
+</div>
+<div class="sec" style="margin-top:14px">
  <h2>生涯统计场次上限</h2>
  <p>/pvp生涯武器 逐场统计默认最多 2000 场、/pve生涯武器 默认 3000 场（防止十年老号
- 跑几十分钟）。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能要跑
- 很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
+ 跑几十分钟）；/pvp 卡片顶部的全模式生涯统计也按这个 PvP 上限翻对局历史。/pve 卡片的
+ 终局通关数（突袭 / 地牢 / 宗师·大师日落 / 终极征服）不受这里影响——它只翻历史页不拉
+ PGCR，默认就翻全生涯。这里可放宽到无限制——无限制 = 统计全部可读生涯，老号 PVE 可能
+ 要跑很久且吃满接口每角色 15000 场的可读历史硬顶；保存即生效，只对之后发起的任务生效。</p>
  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
   <label>PvP　<select id="capPvp">
    <option value="default">默认 2000</option>
@@ -1192,6 +1658,50 @@ button{background:#35c66b;border-color:#35c66b;color:#fff;font-weight:bold;curso
    <option value="20000">20000</option><option value="0">无限制（全生涯）</option>
   </select></label>
   <button onclick="saveCaps()">保存</button><span id="capmsg"></span>
+ </div>
+</div>
+<div class="sec" style="margin-top:14px">
+ <h2>近期战绩局数</h2>
+ <p>/pvp /pve /智谋 卡片上的「近期战绩」与「模式细分」只统计<b>跨角色合并后</b>最近这么多局
+ （默认 100，不是每角色各 100）：调大更完整，但每次查询要多翻几页对局历史。顶部生涯统计
+ 不受这里影响——PvP 的生涯统计按全生涯对局历史聚合，PvE 用 Bungie 官方生涯数，
+ 智谋用官方 gambit 生涯桶。</p>
+ <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <label>PvP　<select id="recPvp">
+   <option value="default">默认 100</option>
+   <option value="200">200</option><option value="300">300</option>
+   <option value="500">500</option><option value="1000">1000</option>
+  </select></label>
+  <label>PvE　<select id="recPve">
+   <option value="default">默认 100</option>
+   <option value="200">200</option><option value="300">300</option>
+   <option value="500">500</option><option value="1000">1000</option>
+  </select></label>
+  <label>智谋　<select id="recGb">
+   <option value="default">默认 100</option>
+   <option value="200">200</option><option value="300">300</option>
+   <option value="500">500</option><option value="1000">1000</option>
+  </select></label>
+  <button onclick="saveRecent()">保存</button><span id="recmsg"></span>
+ </div>
+</div>
+<div class="sec" style="margin-top:14px">
+ <h2>胜点图场数</h2>
+ <p>卡片上那一片红绿方块（绿 = 胜 / 通关，红 = 负，灰 = 未完成）画多少场。
+ <b>智谋默认画 100 场</b>（和近期窗口一样长），PvP 默认不画（格子太吵，想要可以自己开）；
+ 调大时会多翻几页对局历史，设「不画」则一个格子都不画。</p>
+ <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <label>智谋　<select id="gridGb">
+   <option value="0">不画</option>
+   <option value="50">50</option><option value="100">100（默认）</option>
+   <option value="200">200</option><option value="500">500</option>
+  </select></label>
+  <label>PvP　<select id="gridPvp">
+   <option value="0">不画（默认）</option>
+   <option value="50">50</option><option value="100">100</option>
+   <option value="200">200</option><option value="500">500</option>
+  </select></label>
+  <button onclick="saveGrid()">保存</button><span id="gridmsg"></span>
  </div>
 </div>
 <script>
@@ -1228,6 +1738,15 @@ async function save(){
   headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
  const m=document.getElementById('msg');m.textContent='已保存，即刻生效';
  setTimeout(()=>m.textContent='',2500)}
+async function loadPar(){
+ try{ document.getElementById('par').value=String((await (await fetch('/api/settings/jobparallel')).json()).value||0); }
+ catch(e){}}
+async function savePar(){
+ const v=parseInt(document.getElementById('par').value);
+ await fetch('/api/settings/jobparallel',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});
+ const m=document.getElementById('parmsg');m.textContent='已保存，即刻生效';
+ setTimeout(()=>m.textContent='',2500)}
 async function loadCaps(){
  try{
   const d=await (await fetch('/api/settings/matchcaps')).json();
@@ -1247,7 +1766,45 @@ async function saveCaps(){
  const show=n=>n===0?'无限制':n+' 场';
  m.textContent=d.ok?`已保存，生效：PvP ${show(d.pvp_eff)} / PVE ${show(d.pve_eff)}`:'保存失败';
  setTimeout(()=>m.textContent='',4000)}
-refresh();setInterval(refresh,2000);loadCaps();
+async function loadRecent(){
+ try{
+  const d=await (await fetch('/api/settings/recent')).json();
+  const set=(id,v)=>{const s=document.getElementById(id);
+   if(![...s.options].some(o=>o.value===String(v))){
+    const o=document.createElement('option');o.value=String(v);
+    o.textContent=v+'（自定义）';s.add(o);}
+   s.value=String(v);};
+  set('recPvp',d.pvp);set('recPve',d.pve);set('recGb',d.gambit);
+ }catch(e){}}
+async function saveRecent(){
+ const body={pvp:document.getElementById('recPvp').value,
+             pve:document.getElementById('recPve').value,
+             gambit:document.getElementById('recGb').value};
+ const d=await (await fetch('/api/settings/recent',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ const m=document.getElementById('recmsg');
+ m.textContent=d.ok?`已保存，生效：PvP ${d.pvp_eff} 局 / PVE ${d.pve_eff} 局 / 智谋 ${d.gambit_eff} 局`:'保存失败';
+ setTimeout(()=>m.textContent='',4000)}
+async function loadGrid(){
+ try{
+  const d=await (await fetch('/api/settings/grid')).json();
+  const set=(id,v)=>{const s=document.getElementById(id);
+   if(![...s.options].some(o=>o.value===String(v))){
+    const o=document.createElement('option');o.value=String(v);
+    o.textContent=(v===0?'不画':v+' 场')+'（自定义）';s.add(o);}
+   s.value=String(v);};
+  set('gridPvp',d.pvp);set('gridGb',d.gambit);
+ }catch(e){}}
+async function saveGrid(){
+ const body={pvp:document.getElementById('gridPvp').value,
+             gambit:document.getElementById('gridGb').value};
+ const d=await (await fetch('/api/settings/grid',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ const m=document.getElementById('gridmsg');
+ const show=n=>n===0?'不画':n+' 场';
+ m.textContent=d.ok?`已保存，生效：智谋 ${show(d.gambit_eff)} / PvP ${show(d.pvp_eff)}`:'保存失败';
+ setTimeout(()=>m.textContent='',4000)}
+refresh();setInterval(refresh,2000);loadCaps();loadRecent();loadGrid();loadPar();
 </script></body></html>"""
 
 
@@ -1432,12 +1989,10 @@ async def card(name: str, mode: str = "all", base: str = "", month: str = "",
                amode: int = 4, diff: str = ""):
     try:
         if mode == "pvp":
-            rep = await d2.mode_report(name, 5)
-            life = await d2.lifetime_stats(name, "allPvP")
-            return HTMLResponse(render_match_card(rep, "PVP 熔炉竞技场战绩", "5", life,
-                                                  ("activitiesWon", "assists", "precisionKills")))
+            rep = await d2.mode_report(name, 5, career=True)   # 生涯统计=全模式历史聚合
+            return HTMLResponse(render_match_card(rep, "PVP 熔炉竞技场战绩", "5"))
         if mode == "pve":
-            rep = await d2.mode_report(name, 7)
+            rep = await d2.mode_report(name, 7, endgame=True)   # raid.report 式 PvE 面板
             life = await d2.lifetime_stats(name, "allPvE")
             return HTMLResponse(render_match_card(rep, "PVE 战绩", "7", life, ("precisionKills",)))
         if mode == "gambit":
@@ -1618,6 +2173,10 @@ async def eververse_page(force: int = 0):
         store = await d2.eververse_store(force=bool(force))
     except d2.BungieAuthRequired:
         return HTMLResponse(needs_bungie_page())
+    except d2.BungieMaintenanceError as exc:
+        return err_page("Bungie 服务器维护中", f"{exc}<br>官方恢复后刷新本页即可。")
+    except d2.DataSuspiciousError as exc:
+        return err_page("这次的数据不完整", f"{exc}<br>稍等片刻刷新重试即可。")
     except Exception as exc:  # noqa: BLE001
         return err_page("光尘商店获取失败",
                         "读取 Bungie 商店接口失败，稍后刷新重试。<br>"
@@ -1630,6 +2189,10 @@ async def rotation_page(force: int = 0):
     """本周轮换页：与 QQ 卡片同一份排版（bot_cards.rotation_card），顶部补一行导航"""
     try:
         rot = await d2.rotation_week(force=bool(force))
+    except d2.BungieMaintenanceError as exc:
+        return err_page("Bungie 服务器维护中", f"{exc}<br>官方恢复后刷新本页即可。")
+    except d2.DataSuspiciousError as exc:
+        return err_page("这次的数据不完整", f"{exc}<br>稍等片刻刷新重试即可。")
     except Exception as exc:  # noqa: BLE001
         return err_page("本周轮换获取失败",
                         "读取 Bungie 里程碑接口失败，稍后刷新重试。<br>"
@@ -1685,6 +2248,29 @@ def needs_bungie_page() -> str:
 @app.get("/api/bungie/status")
 def bungie_status():
     return bungie_auth.status()
+
+
+@app.get("/api/bungie/maint")
+async def bungie_maint(probe: int = 0):
+    """Bungie 维护态（面板总览的横幅用）。
+
+    probe=1 = 管理员点「重新探测」：真的去问一次官方状态接口，
+    不然维护已结束时面板要等到下一次真实查询才会自己发现。
+    """
+    import bungie_status as bst
+    if probe:
+        try:
+            await bst.refresh()
+        except Exception as exc:  # noqa: BLE001 探测失败保持原判定
+            print(f"[面板] 维护态探测失败：{type(exc).__name__}: {exc}", flush=True)
+    st = bst.state()
+    since = st.get("since") or 0
+    return {"on": bst.is_down(), "text": bst.text() if bst.is_down() else "",
+            "kind": st.get("kind") or "", "detail": st.get("detail") or "",
+            "since": since, "until": st.get("until") or 0,
+            "last_ok": st.get("last_ok") or 0,
+            "windows": [[a, b] for a, b in st.get("windows") or []],
+            "unsent_dir": bot_log.unsent_dir(create=False)}
 
 
 @app.post("/api/bungie/trust_cert")
@@ -1997,7 +2583,7 @@ def render_raid_detail(rep: dict, base: str, month: str, amode: int = 4, diff: s
     )
     body = (f"<h1>{rname}</h1>"
             f"<div class='sub'>{rep['display']} · 副本细分战绩{(' · ' + month) if month else ''}</div>"
-            f"{mlinks}{hdr}{render_matches(ms, limit=40)}")
+            f"{mlinks}{hdr}{render_matches(ms, limit=40, grid=ms)}")
     return CARD_CSS.replace("__BODY__", body)
 
 
@@ -3189,96 +3775,382 @@ def match_result(m: dict) -> tuple[str, str]:
     return ("<span class='tagw'>通关</span>", "w") if m["completed"] else ("<span class='tagd'>未通关</span>", "d")
 
 
+def result_tag(m: dict) -> str:
+    """对局结果 → 紧凑标签（战绩卡的单行列表用）"""
+    if m.get("competitive"):
+        if not m["completed"]:
+            return "<span class='rt d'>未完成</span>"
+        return ("<span class='rt w'>胜利</span>" if m["win"] else "<span class='rt l'>失败</span>")
+    return ("<span class='rt w'>通关</span>" if m["completed"] else "<span class='rt d'>未通关</span>")
+
+
 def esc(s: str) -> str:
     """属性值转义（活动名里偶有引号会截断 HTML 属性）"""
     return str(s).replace("&", "&amp;").replace("'", "&#39;").replace('"', "&quot;").replace("<", "&lt;")
 
 
-def render_matches(matches: list[dict], limit: int = 15) -> str:
-    order = list(reversed(matches))
-    grid = "".join(
-        f"<span class='cell {match_result(m)[1]}' title='{esc(m['name'])} {esc(m.get('period_cn') or m['period'])}'></span>"
-        for m in order
-    )
+def render_matches(matches: list[dict], limit: int = 15,
+                   grid: list[dict] | None = None) -> str:
+    """最近对局：紧凑单行列表 + 可选胜点图（红绿方块，grid = 要画的对局，旧→新）"""
+    head = ""
+    if grid:
+        cells = "".join(
+            f"<span class='cell {match_result(m)[1]}' title='{esc(m['name'])} {esc(m.get('period_cn') or m['period'])}'></span>"
+            for m in reversed(grid)
+        )
+        head = f"<div class='gridwrap'><div class='gridline'>{cells}</div></div>"
     rows = ""
+    comp = any(m.get("competitive") for m in matches[:limit])
     for m in matches[:limit]:
         dur = f"{m['duration'] // 60}分{m['duration'] % 60}秒"
-        tag, _ = match_result(m)
-        mtag = f"<span class='mtag'>{m['mode_name']}</span>" if m.get("mode_name") else ""
+        mtag = f"<span class='mtag'>{esc(m['mode_name'])}</span>" if m.get("mode_name") else ""
+        num = (f"<span class='mv'><b>{m['kd']:.2f}</b></span>"
+               f"<span class='mv'>{m['kills']} / {m['deaths']} / {m['assists']}</span>") if comp else (
+              f"<span class='mv'><b>{m['kills']}</b></span>"
+              f"<span class='mv'>{m['deaths']} / {m['assists']}</span>")
         rows += (
-            f"<a class='mrow' href='/pgcr?i={m['instance']}'><img src='{m['pgcr']}'><div class='mi'>"
-            f"<b>{m['name']}</b> {tag}{mtag} <span class='dim'>{m.get('period_cn') or m['period']} · {dur} · 点击查看对局详情</span></div>"
-            f"<div class='ms'><span>击杀 <b>{m['kills']}</b></span><span>死亡 <b>{m['deaths']}</b></span>"
-            f"<span>K/D <b>{m['kd']:.2f}</b></span><span>协助 <b>{m['assists']}</b></span>"
-            + (f"<span>效率 <b>{m['eff']:.2f}</b></span>" if m.get("eff") else "")
-            + (f"<span>队伍分 <b>{m['team_score']}</b></span>" if m.get("team_score") else "")
-            + "</div></a>"
+            f"<a class='mline' href='/pgcr?i={m['instance']}' title='{esc(m['name'])} · 点击查看全场数据'>"
+            f"{result_tag(m)}<img src='{m['pgcr']}'>"
+            f"<div class='mn'><b>{esc(m['name'])}</b>{mtag}</div>"
+            f"{num}"
+            + (f"<span class='mv dim'>队伍 {m['team_score']}</span>" if m.get("team_score")
+               else "<span class='mv dim'></span>")
+            + f"<span class='md'>{esc(m.get('period_cn') or m['period'])} · {dur}</span></a>"
         )
-    return f"<h2>最近对局（点击查看全场数据）</h2><div class='gridwrap'><div class='gridline'>{grid}</div></div>{rows}"
+    if not rows:
+        return head
+    thead = ("<div class='mhead'><span>结果</span><span></span><span>对局 / 模式</span>"
+             + ("<span>K/D</span><span>击杀 / 死亡 / 协助</span>" if comp
+                else "<span>击杀</span><span>死亡 / 协助</span>")
+             + "<span>队伍分</span><span>时间</span></div>")
+    return head + thead + rows
 
 
 def render_breakdown(rep: dict) -> str:
-    """按具体玩法（试炼/铁旗/打击/地牢…）细分战绩"""
+    """按具体玩法（试炼/铁旗/打击/地牢…）细分战绩：场次带占比条，对齐武器卡的表格排版"""
     if len(rep.get("breakdown") or []) < 2:
         return ""
     comp = rep.get("competitive")
+    rows_data = [b for b in rep["breakdown"] if b["n"] >= 2][:10]
+    if not rows_data:
+        return ""
+    top = max(b["n"] for b in rows_data)
     head = ("<div class='bhead'><span>模式</span><span>场次</span>"
             + ("<span>胜率</span>" if comp else "")
-            + "<span>K/D</span><span>KDA</span><span>场均击杀</span></div>")
+            + "<span>K/D</span><span>KDA</span><span>场均</span></div>")
     rows = ""
-    for b in rep["breakdown"][:12]:
-        if b["n"] < 2:
-            continue
-        wr = f"<span class='{'wrg' if b['win_rate'] >= 50 else 'wrb'}'>{b['win_rate']:.0f}%</span>" if comp else ""
-        rows += (f"<div class='brow'><span class='bname'>{b['name']}</span><span>{b['n']}</span>{wr}"
+    for b in rows_data:
+        pct = b["n"] / top * 100
+        wr = (f"<span class='{'wrg' if b['win_rate'] >= 50 else 'wrb'}'>"
+              f"{b['win_rate']:.0f}%</span>") if comp else ""
+        rows += (f"<div class='brow'><span class='bname'>{esc(b['name'])}</span>"
+                 f"<div class='nbar'><i style='width:{pct:.1f}%'></i><span>{b['n']}</span></div>{wr}"
                  f"<span>{b['kd']:.2f}</span><span>{b['kda']:.2f}</span>"
                  f"<span>{b['avg_kills']:.1f}</span></div>")
-    if not rows:
-        return ""
     style = ("<style>"
-             f".bhead,.brow{{display:grid;grid-template-columns:1fr 56px {'64px ' if comp else ''}64px 64px 76px;"
-             f"gap:6px;align-items:center;font-size:13px}}"
-             f".bhead{{color:#9aa0a6;font-size:12px;padding:0 8px 6px;border-bottom:1px solid #2a2e33}}"
-             f".brow{{background:#16181b;border:1px solid #2a2e33;border-radius:7px;padding:7px 8px;margin:5px 0}}"
-             f".brow span{{text-align:right}}"
-             f".bname{{text-align:left!important;font-weight:bold}}"
+             f".bhead,.brow{{display:grid;grid-template-columns:minmax(0,1fr) 118px {'62px ' if comp else ''}58px 58px 56px;"
+             f"gap:7px;align-items:center;font-size:13px}}"
+             f".bhead{{color:#9aa0a6;font-size:11.5px;padding:0 10px 6px;border-bottom:1px solid #2a2e33}}"
+             f".bhead span:nth-child(n+2),.brow>span{{text-align:right}}"
+             f".brow{{background:#16181b;border:1px solid #2a2e33;border-radius:8px;padding:6px 10px;margin:4px 0}}"
+             f".brow:hover{{border-color:#35c66b}}"
+             f".bname{{text-align:left!important;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}"
              f".wrg{{color:#35c66b}}.wrb{{color:#ff8d85}}"
+             f".nbar{{position:relative;height:16px;background:#0f1113;border-radius:5px;overflow:hidden}}"
+             f".nbar i{{display:block;height:100%;background:linear-gradient(90deg,#35c66b,#d4b26a);opacity:.55}}"
+             f".nbar span{{position:absolute;inset:0;text-align:center;line-height:16px;font-size:12px}}"
              f"</style>")
-    return f"<h2>模式细分</h2>{head}{rows}{style}"
+    return f"<h2>模式细分<em>窗口内场次分布</em></h2>{head}{rows}{style}"
+
+
+def _chip(label: str, val: str, sub: str = "", cls: str = "") -> str:
+    sub_html = f"<span class='csub'>{sub}</span>" if sub else ""
+    return (f"<div class='chip {cls}'><span class='clab'>{label}</span>"
+            f"<b>{val}</b>{sub_html}</div>")
+
+
+def _career_chips(car: dict) -> tuple[str, str]:
+    """全模式生涯统计 → (chip 行, 网格类)。竞技统计胜负/胜率，PvE 统计通关"""
+    comp = car.get("competitive")
+    if comp:
+        out = (_chip("对局场次", f"{car['total']:,}", f"完成 {car['completed']:,} 局")
+               + _chip("胜率", f"{car['win_rate']:.1f}%", f"{car['wins']:,} 胜 · {car['losses']:,} 负", "ok")
+               + _chip("K/D", f"{car['kd']:.2f}", f"KDA {car['kda']:.2f}", "acc")
+               + _chip("场均击杀", f"{car['avg_kills']:.1f}", f"单场最高 {car.get('best_kills') or 0}")
+               + _chip("对局时长", f"{car['hours']:,.0f} 小时", f"场均 {car['hours'] * 3600 / max(1, car['completed']) / 60:.0f} 分钟"))
+    else:
+        out = (_chip("对局场次", f"{car['total']:,}", f"完成 {car['completed']:,} 局")
+               + _chip("通关率", f"{car['clear_rate']:.1f}%", f"{car['completed']:,} / {car['rate_base']:,}", "ok")
+               + _chip("K/D", f"{car['kd']:.2f}", f"KDA {car['kda']:.2f}", "acc")
+               + _chip("场均击杀", f"{car['avg_kills']:.1f}", f"单场最高 {car.get('best_kills') or 0}")
+               + _chip("对局时长", f"{car['hours']:,.0f} 小时"))
+    out += (_chip("击杀", f"{car['kills']:,}") + _chip("死亡", f"{car['deaths']:,}")
+            + _chip("协助", f"{car['assists']:,}")
+            + _chip("对手击杀", f"{car.get('opp') or 0:,}", "击杀 + 协助")
+            + _chip("场均效率", f"{car['eff']:.2f}"))
+    return out, "c5"
+
+
+def _gambit_chips(g: dict) -> tuple[str, str, str]:
+    """智谋生涯（官方 modes=63 跨角色求和）→ (生涯块, 荧光块, 入侵块)。
+
+    智谋不走 PvP 那套（K/D + 击杀就完事）：它的专属数据是荧光（存入 / 拾取 / 截夺 / 丢失）
+    和入侵（次数 / 入侵击杀 / 击败入侵者 / 被入侵者击败），官方生涯统计里就有，逐个列出来。"""
+    ent = g.get("activitiesEntered") or 0
+    base = (_chip("对局场次", f"{ent:,}")
+            + _chip("胜率", f"{g.get('win_rate', 0):.1f}%",
+                    f"{g.get('activitiesWon', 0):,} 胜 · {ent - g.get('activitiesWon', 0):,} 负", "ok")
+            + _chip("K/D", f"{g.get('kd', 0):.2f}", f"KDA {g.get('kda', 0):.2f}", "acc")
+            + _chip("场均击杀", f"{g.get('avg_kills', 0):.1f}",
+                    f"单场最高 {g.get('bestSingleGameKills', 0):,.0f}")
+            + _chip("生涯时长", f"{g.get('hours', 0):,.0f} 小时",
+                    f"场均 {g.get('hours', 0) * 60 / max(1, ent):.1f} 分钟"))
+    motes = (_chip("存入荧光", f"{g.get('motesDeposited', 0):,}",
+                   f"场均 {g.get('motesDeposited', 0) / max(1, ent):.1f}")
+             + _chip("拾取荧光", f"{g.get('motesPickedUp', 0):,}")
+             + _chip("截夺荧光", f"{g.get('motesDenied', 0):,}", "让对手丢的荧光")
+             + _chip("丢失荧光", f"{g.get('motesLost', 0):,}", "阵亡掉落的"))
+    inv = (_chip("入侵次数", f"{g.get('invasions', 0):,}")
+           + _chip("入侵击杀", f"{g.get('invasionKills', 0):,}", "入侵时击败守护者", "acc")
+           + _chip("击败入侵者", f"{g.get('invaderKills', 0):,}")
+           + _chip("被入侵者击败", f"{g.get('invaderDeaths', 0):,}")
+           + _chip("原始使者击杀", f"{g.get('primevalKills', 0):,}", "阻止对方首杀")
+           + _chip("高分目标击杀", f"{g.get('highValueKills', 0):,}", "高价值目标"))
+    return base, motes, inv
+
+
+def _official_chips(stats: dict, extra: tuple) -> tuple[str, str]:
+    """Bungie 官方生涯统计 → (chip 行, 网格类)。字段比历史聚合少，有几项给几项"""
+    entered = stats.get("activitiesEntered") or 0
+    won = stats.get("activitiesWon") or 0
+    out = (_chip("击杀", f"{stats['kills']:,.0f}")
+           + _chip("死亡", f"{stats['deaths']:,.0f}")
+           + _chip("K/D", f"{stats['kd']:.2f}", "击杀 ÷ 死亡", "acc")
+           + _chip("场次", f"{entered:,.0f}"))
+    if "activitiesWon" in extra and entered:
+        out += _chip("胜率", f"{won / entered * 100:.1f}%", f"{won:,.0f} 胜", "ok")
+    if stats.get("secondsPlayed"):
+        out += _chip("生涯时长", f"{stats['secondsPlayed'] / 3600:,.0f} 小时")
+    if stats.get("bestSingleGameKills"):
+        out += _chip("单场最高击杀", f"{stats['bestSingleGameKills']:,.0f}")
+    if stats.get("precisionKills"):
+        out += _chip("精准击杀", f"{stats['precisionKills']:,.0f}")
+    if stats.get("assists"):
+        out += _chip("协助", f"{stats['assists']:,.0f}")
+    return out, "c4"
+
+
+def _window_chips(rep: dict) -> str:
+    """近期窗口（跨角色最近 N 局）→ chip 行；总场次/时长写在小标题里，这里放关键项。
+
+    智谋（mode 63）换一个 chip：对局历史的 score 就是存入荧光，窗口里也带上荧光。"""
+    if rep.get("competitive"):
+        streak = ""
+        if rep.get("streak"):
+            streak = f"{rep['streak']} 场" + (" 胜" if rep["streak_win"] else " 负")
+        if rep.get("mode") == 63:
+            ent = rep["total"] or 1
+            last = _chip("存入荧光", f"{rep.get('motes') or 0:,}",
+                         f"场均 {(rep.get('motes') or 0) / ent:.1f}", "acc")
+        else:
+            last = _chip("平均效率", f"{rep['eff']:.2f}")
+        return (_chip("胜率", f"{rep['win_rate']:.1f}%", f"{rep['wins']} 胜 · {rep['losses']} 负", "ok")
+                + _chip("当前连胜/连败", streak or "—")
+                + _chip("K/D", f"{rep['kd']:.2f}", f"KDA {rep['kda']:.2f}", "acc")
+                + _chip("场均击杀", f"{rep['avg_kills']:.1f}")
+                + last
+                + _chip("总击杀", f"{rep['kills']:,}", f"死亡 {rep['deaths']:,} · 协助 {rep['assists']:,}"))
+    # PvE 没有胜负：看通关情况、产量与节奏
+    return (_chip("通关率", f"{rep['clear_rate']:.1f}%", f"{rep['completed']} / {rep['rate_base']}", "ok")
+            + _chip("场均击杀", f"{rep['avg_kills']:.1f}", f"单场最高 {rep.get('best_kills') or 0}", "acc")
+            + _chip("击杀 / 死亡", f"{rep['kills']:,} / {rep['deaths']:,}",
+                    f"协助 {rep['assists']:,}")
+            + _chip("平均效率", f"{rep['eff']:.2f}")
+            + _chip("对局时长", f"{rep['hours']:.1f} 小时",
+                    f"场均 {rep['hours'] * 60 / max(1, rep['completed']):.1f} 分钟")
+            + _chip("完成 / 未完成", f"{rep['completed']} / {rep['total'] - rep['completed']}"))
+
+
+def _pve_chips(rep: dict, lifetime: dict | None) -> tuple[str, str]:
+    """PvE 面板（对齐 raid.report 个人页）：概况 + 终局通关数
+
+    概况 = 游戏时长 / 成就分（现有 + 生涯累计）/ 总击杀 / 精准击杀（Bungie 官方 + 记录）；
+    通关 = 突袭 / 地牢 / 宗师日落 / 大师日落 / 终极征服 / 镀金征服者（对局历史聚合 + 记录）。"""
+    st = lifetime or {}
+    kills = st.get("kills") or 0
+    prec = st.get("precisionKills") or 0
+    pve_h = (st.get("secondsPlayed") or 0) / 3600        # 官方 allPvE 时长（对齐 raid.report 的 TIME PLAYED）
+    ult = rep.get("ultimate") or (0, 0)
+    top = (_chip("游戏时长", f"{pve_h:,.0f} 小时",
+                 f"含 PvP/轨道共 {rep.get('playtime_hours') or 0:,.0f} 小时")
+           + _chip("现有成就分", f"{rep.get('triumph_now') or 0:,}",
+                   f"生涯累计 {rep.get('triumph') or 0:,}", "acc")
+           + _chip("总击杀", f"{kills:,.0f}",
+                   f"单场最高 {st.get('bestSingleGameKills', 0):,.0f}")
+           + _chip("精准击杀", f"{prec:,.0f}", f"占比 {prec / kills * 100:.0f}%" if kills else ""))
+    eg = rep["endgame"]
+    clears = "".join(
+        _chip(label, f"{eg[key]:,}", "", cls)
+        for key, label, cls in (("raid", "突袭通关", "ok"), ("dungeon", "地牢通关", ""),
+                                ("gm", "宗师日落", ""), ("master_nf", "大师日落", ""))
+    ) + _chip("终极征服", f"{eg.get('ultimate', 0):,}",
+              (f"本赛季 {ult[0]}/{ult[1]}" if ult[1] else ""), "acc") \
+      + _chip("镀金征服者", f"{rep.get('gilds') or 0:,}", "称号镀金次数", "acc")
+    return top, clears
 
 
 def render_match_card(rep: dict, title: str, mode: str, lifetime: dict | None = None,
                       lifetime_extra: tuple = ()) -> str:
-    comp = rep.get("competitive")
-    rows = [f"<div class='row'><span>对局场次</span><b>{rep['total']}</b></div>"]
-    if comp:
-        rows.append(f"<div class='row hl'><span>胜率</span><b>{rep['win_rate']:.1f}%</b></div>")
-        rows.append(f"<div class='row'><span>胜 / 负</span><b>{rep['wins']} / {rep['losses']}</b></div>")
-        if rep.get("streak"):
-            lab = "当前连胜" if rep["streak_win"] else "当前连败"
-            rows.append(f"<div class='row'><span>{lab}</span><b>{rep['streak']} 场</b></div>")
-    else:
-        rows.append(f"<div class='row hl'><span>通关率</span><b>{rep['clear_rate']:.1f}%</b></div>")
-        rows.append(f"<div class='row'><span>通关场次</span><b>{rep['completed']} / {rep['rate_base']}</b></div>")
-    rows += [
-        f"<div class='row hl'><span>K/D</span><b>{rep['kd']:.2f}</b></div>",
-        f"<div class='row'><span>KDA</span><b>{rep['kda']:.2f}</b></div>",
-        f"<div class='row'><span>总击杀 / 死亡 / 协助</span><b>{rep['kills']:,} / {rep['deaths']:,} / {rep['assists']:,}</b></div>",
-        f"<div class='row'><span>场均击杀</span><b>{rep['avg_kills']:.1f}</b></div>",
-    ]
-    if rep.get("eff"):
-        rows.append(f"<div class='row'><span>平均效率</span><b>{rep['eff']:.2f}</b></div>")
-    rows.append(f"<div class='row'><span>对局时长合计</span><b>{rep['hours']:.1f} 小时</b></div>")
+    """/pvp /pve /智谋 战绩卡：顶部生涯统计 + 近期战绩 + 模式细分 + 最近对局。
 
-    life = ""
-    if lifetime:
-        life = ("<h2>生涯统计（Bungie 官方）</h2>" + stat_rows(lifetime, list(lifetime_extra)))
-    body = (f"<h1>{rep['display']}</h1>"
-            f"<div class='sub'>{title} · 数据来自 Bungie.net</div>"
-            f"{life}"
-            f"<h2>近期战绩（跨角色，每角色最近 100 场）</h2>{''.join(rows)}"
-            f"{render_breakdown(rep)}{render_matches(rep['matches'])}")
+    顶部数据块按模式分三种：PvP 走全模式对局历史聚合（rep["career"]）；PvE 走 raid.report
+    式面板（游戏时长 / 成就分 / 击杀 + 突袭 / 地牢 / 宗师·大师日落 / 终极征服 / 镀金征服者，
+    不摆「近期战绩」）；智谋走官方 gambit 桶（荧光 / 入侵等专属数据）。都没有时退回官方
+    生涯统计（lifetime）。胜点图（红绿方块）按后台配置画：智谋默认 100 场，PvP 默认不画。"""
+    car = rep.get("career")
+    eg = rep.get("endgame")
+    gmb = rep.get("gambit") or {}
+    n_win = rep.get("window") or 0
+    hero = ""
+    if rep.get("emblem_bg"):
+        # 只铺整条名片底图（474×96 原样铺满）：不再往上面压 96×96 的纹章方图，
+        # 否则方图会盖掉名片左半边
+        hero = (f"<div class='hero' style=\"background-image:url('{esc(rep['emblem_bg'])}')\">"
+                f"<div class='hveil'></div><div class='ht'><b>{esc(rep['display'])}</b>"
+                f"<span>{title} · 数据来自 Bungie.net</span></div></div>")
+    else:
+        hero = (f"<h1>{esc(rep['display'])}</h1>"
+                f"<div class='sub'>{title} · 数据来自 Bungie.net</div>")
+
+    # 顶部数据块：PvP=全模式生涯统计，PvE=raid.report 式面板，智谋=官方荧光/入侵面板
+    if car and car["total"]:
+        chips, cls = _career_chips(car)
+        em = "全模式 · 跨角色去重"
+        if car.get("capped"):
+            em += f" · 已达上限 {car['cap']:,} 场/角色"
+        life = f"<h2>生涯统计<em>{em}</em></h2><div class='chips {cls}'>{chips}</div>"
+    elif eg:
+        top, clears = _pve_chips(rep, lifetime)
+        life = (f"<h2>生涯概况<em>Bungie 官方 + 记录</em></h2><div class='chips c4'>{top}</div>"
+                f"<h2>终局通关<em>对局历史聚合 · 完成的对局</em></h2>"
+                f"<div class='chips c6'>{clears}</div>")
+    elif gmb and gmb.get("activitiesEntered"):
+        base, motes, inv = _gambit_chips(gmb)
+        life = (f"<h2>生涯统计<em>Bungie 官方 · 跨角色求和</em></h2>"
+                f"<div class='chips c5'>{base}</div>"
+                f"<h2>荧光<em>存入 / 拾取 / 截夺 / 丢失</em></h2>"
+                f"<div class='chips c4'>{motes}</div>"
+                f"<h2>入侵<em>入侵与反入侵</em></h2>"
+                f"<div class='chips c6'>{inv}</div>")
+    elif lifetime and (lifetime.get("activitiesEntered") or lifetime.get("kills")):
+        chips, cls = _official_chips(lifetime, tuple(lifetime_extra))
+        life = f"<h2>生涯统计<em>Bungie 官方</em></h2><div class='chips {cls}'>{chips}</div>"
+    else:
+        life = ""
+
+    if not rep.get("total"):
+        body = (f"{hero}{life}<div class='mnote'>没有查到对局记录："
+                f"该玩家可能没打过这个模式，或最近的对局历史被设为私密。</div>"
+                f"{_MODE_CARD_STYLE}")
+        return CARD_CSS.replace("__BODY__", body)
+
+    em2 = f"跨角色最近 {n_win} 局"
+    if rep.get("total"):
+        em2 += f" · {rep['hours']:.1f} 小时"
+    # PvE 面板不摆「近期战绩」（要看近况直接看下面的最近对局列表）；胜点图按后台配置画
+    recent_shown = not (eg and not car)
+    recent = ((f"<h2>近期战绩<em>{em2}</em></h2><div class='chips c6'>{_window_chips(rep)}</div>")
+              if recent_shown else "")
+    grid = rep.get("grid_matches") or []
+
+    # 模式细分是竞技玩法的口径（胜率/K-D 按模式比）；PvE 看这个没意义，就不放
+    breakdown = render_breakdown(rep) if rep.get("competitive") else ""
+
+    notes = []
+    if car:
+        notes.append("生涯统计 = 全模式对局历史聚合（跨角色按对局去重，含试炼 / 铁旗 / 快雀竞速等全部 "
+                     "PvP 模式）；Bungie 官方 allPvP 生涯不含 2020 年之后的试炼与铁旗，故不采用。")
+    elif eg:
+        notes.append("生涯概况 = 游戏时长（官方 PvE 时长，含 PvP/轨道共 " +
+                     f"{rep.get('playtime_hours') or 0:,.0f} 小时）+ 成就分（现有 = 游戏内当前凯旋分，"
+                     "生涯累计 = 含已过期传承分的 lifetime score）+ 官方 allPvE 击杀；"
+                     "终局通关数按对局历史里<b>完成的对局</b>统计"
+                     "（突袭 / 地牢看模式，宗师 / 大师日落与终极征服按活动名，同一局换角色重进只算一次）"
+                     "——官方统计接口没有分难度日落，也没有逐副本计数。")
+    elif gmb and gmb.get("activitiesEntered"):
+        notes.append("生涯统计 / 荧光 / 入侵 = Bungie 官方智谋桶（modes=63，跨角色求和）——"
+                     "官方 gambit 生涯是完整的（实测三角色场次与对局历史逐角色相等），"
+                     "所以这里直接用官方数，不走 PvP 那套历史聚合。")
+    elif life:
+        notes.append("生涯统计 = Bungie 官方全生涯统计（跨角色求和）。")
+    if recent_shown and n_win:
+        notes.append(f"近期战绩只统计跨角色最近 {n_win} 局（运行状态页可调）。")
+    if grid:
+        notes.append(f"胜点图 = 最近 {len(grid)} 局的胜负（绿=胜 / 红=负 / 灰=未完成），"
+                     "方框数量在运行状态页可调。")
+    if breakdown:
+        notes.append("模式细分统计的是这个窗口。")
+    if car and car.get("capped"):
+        notes.append(f"生涯统计已到上限 {car['cap']:,} 场/角色，可在运行状态页调整或设为无限制。")
+    if eg and eg.get("capped"):
+        notes.append(f"终局通关数已到上限 {eg['cap']:,} 场/角色，可在运行状态页调整或设为无限制。")
+    if not rep.get("competitive") and not eg:
+        notes.append("探索 / 巡逻类对局不计入通关率。")
+
+    body = (f"{hero}{life}{recent}"
+            f"{breakdown}"
+            f"<h2>最近对局<em>共 {rep['total']} 局 · 点击查看全场数据</em></h2>"
+            f"{render_matches(rep['matches'], limit=10, grid=grid)}"
+            f"<div class='mnote'>{''.join(notes)}</div>"
+            f"{_MODE_CARD_STYLE}")
     return CARD_CSS.replace("__BODY__", body)
+
+
+# 战绩卡自己的排版：顶部名片 + 数字 chip + 单行对局列表（配色/圆角对齐武器卡）
+_MODE_CARD_STYLE = """<style>
+h2{display:flex;align-items:baseline;gap:8px;font-size:14px;color:#7fb2e8;font-weight:700;
+   letter-spacing:.5px;border-left:3px solid #35c66b;padding-left:9px;margin:18px 0 9px}
+h2 em{font-style:normal;font-size:11.5px;font-weight:400;color:#9aa0a6;letter-spacing:0;margin-left:auto}
+.hero{position:relative;display:flex;align-items:center;gap:18px;box-sizing:border-box;
+      padding:0 24px;border:1px solid #2a2e33;border-radius:12px;overflow:hidden;
+      background-color:#1b1e22;aspect-ratio:474/96;          /* 徽章底图 474×96：整张完整显示，不裁切不拉伸 */
+      background-size:100% 100%;background-position:center;background-repeat:no-repeat}
+.hveil{position:absolute;inset:0;background:linear-gradient(90deg,rgba(10,12,14,.93) 0%,rgba(10,12,14,.5) 48%,rgba(10,12,14,.72) 100%)}
+.hero>*{position:relative;z-index:1}
+.hero .ht{display:flex;flex-direction:column;line-height:1.3;min-width:0}
+.hero .ht b{font-size:34px;color:#fff;text-shadow:0 2px 12px rgba(0,0,0,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hero .ht span{font-size:13px;color:#d3d7da;margin-top:6px;text-shadow:0 1px 6px rgba(0,0,0,.95)}
+.chips{display:grid;gap:8px;margin:0 0 4px}
+.chips.c4{grid-template-columns:repeat(4,1fr)}
+.chips.c5{grid-template-columns:repeat(5,1fr)}
+.chips.c6{grid-template-columns:repeat(6,1fr)}
+.chip{background:#16181b;border:1px solid #2a2e33;border-radius:9px;padding:8px 9px;text-align:center;
+      display:flex;flex-direction:column;line-height:1.32;min-width:0}
+.chip .clab{color:#9aa0a6;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip b{color:#e8e6e3;font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip .csub{color:#9aa0a6;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip.ok{border-color:rgba(53,198,107,.4)}.chip.ok b{color:#35c66b}
+.chip.acc{border-color:rgba(212,178,106,.45)}.chip.acc b{color:#d4b26a}
+.mhead,.mline{display:grid;grid-template-columns:50px 52px minmax(0,1fr) 80px 96px 74px 156px;gap:8px;align-items:center}
+.mhead{color:#9aa0a6;font-size:11.5px;padding:0 10px 6px;border-bottom:1px solid #2a2e33}
+.mhead span:nth-child(n+4),.mline .mv,.mline .md{text-align:right}
+.mline{background:#16181b;border:1px solid #2a2e33;border-radius:8px;
+       padding:5px 10px;margin:4px 0;text-decoration:none;color:#e8e6e3}
+.mline:hover{border-color:#35c66b}
+.mline img{width:52px;height:30px;object-fit:cover;border-radius:4px;background:#0f1113}
+.mline .mn{display:flex;align-items:center;gap:6px;min-width:0;font-size:14px}
+.mline .mn b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mline .mv{font-size:12.5px;white-space:nowrap}
+.mline .mv b{color:#d4b26a}
+.mline .mv.dim{color:#9aa0a6}
+.mline .md{font-size:11px;color:#9aa0a6;white-space:nowrap}
+.rt{display:inline-block;border-radius:5px;font-size:11.5px;line-height:20px;height:20px;text-align:center;width:50px}
+.rt.w{color:#35c66b;background:rgba(53,198,107,.15)}
+.rt.l{color:#ff8d85;background:rgba(217,72,63,.15)}
+.rt.d{color:#9aa0a6;background:rgba(154,160,166,.15)}
+.mnote{font-size:12px;color:#9aa0a6;line-height:1.7;background:#1b1e22;border-radius:8px;
+       padding:8px 11px;margin-top:12px}
+</style>"""
 
 
 CARD_CSS = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><base href="http://127.0.0.1:8900/">

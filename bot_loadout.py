@@ -1,7 +1,8 @@
 """「/队伍配装」数据采集：当前队伍各成员已装备的 超能 / 武器 / 护甲 / 模组
 
 数据源全官方，免授权（走对方库存隐私设置）：
-- 名单 = 复用 bot_fireteam.collect 的队伍发现（对局里→本场 PGCR 名单，轨道/在线→
+- 名单 = 复用 bot_fireteam.collect 的队伍发现（对局里→本场 PGCR 里**此刻仍在场**的人，
+  中途离场/被替补换下的不算——用户 2026-10-07 口径「我要的是实时数据」；轨道/在线→
   transitory 实时队伍），它在返回里带 roster: [{mid, mtype, name}]。
 - 每人一次 GetProfile components=200,205,300,305：
   200 角色（徽标横幅/职业/光等/六维）+ 205 已装备栏 + 300 实例（护甲光等）
@@ -28,14 +29,14 @@ import name_i18n
 from bot_fireteam import (_MAX_MEMBERS, _profile_ex, _retry_twice, _row_budget,
                           collect as _fireteam_collect)
 
-# 九个只关心的装备桶（hash 实测 2026-10）
+# 八个只关心的装备桶（hash 实测 2026-10）：左右两列 = 3 武器 + 5 护甲。
+# 机灵（桶 4023194814）不出卡（用户 2026-10-07 口径：左列留给三把武器的 perk 栏，
+# 好跟右列 5 件护甲等高对齐）
 _WEAPON_BUCKETS = {1498876634: "动能", 2465295065: "能量", 953998645: "威能"}
 _ARMOR_BUCKETS = {3448274439: "头盔", 3551918588: "臂铠", 14239492: "胸甲",
                   20886954: "腿甲", 1585787867: "职业披风"}
-_GHOST_BUCKET = 4023194814
 _SUBCLASS_BUCKET = 3284755031
-_WANTED_BUCKETS = set(_WEAPON_BUCKETS) | set(_ARMOR_BUCKETS) | \
-    {_GHOST_BUCKET, _SUBCLASS_BUCKET}
+_WANTED_BUCKETS = set(_WEAPON_BUCKETS) | set(_ARMOR_BUCKETS) | {_SUBCLASS_BUCKET}
 
 # 六维 hash → 中文（Edge of Fate 新属性制：Bungie 沿用旧 hash 但含义已换，
 # 上限 200+；stats.json 官方 zh 名照录，顺序按游戏内 武器/生命/职业/超能/手雷/近战）
@@ -131,7 +132,7 @@ def _weapon_chips(sockets: list[dict]) -> list[dict]:
     return chips[:7]
 
 
-def _armor_chips(sockets: list[dict], ghost: bool = False) -> list[dict]:
+def _armor_chips(sockets: list[dict]) -> list[dict]:
     chips = []
     for s in sockets:
         h = s.get("plugHash")
@@ -140,8 +141,7 @@ def _armor_chips(sockets: list[dict], ghost: bool = False) -> list[dict]:
         d = _def(h)
         itd = d.get("itd") or ""
         cat = d.get("cat") or ""
-        if (itd.endswith("护甲模组") or ".tuning.mods" in cat
-                or (ghost and itd.endswith("机灵模组"))):
+        if itd.endswith("护甲模组") or ".tuning.mods" in cat:
             chips.append({"name": _name(h), "icon": _icon(h)})
     return chips[:7]
 
@@ -232,13 +232,6 @@ async def _member_loadout(m: dict, is_self: bool) -> dict:
                 "tier": _tier(it.get("itemHash")),
                 "icon": _icon(it.get("itemHash")), "power": pw,
                 "chips": _armor_chips(so)})
-        gh = by_bucket.get(_GHOST_BUCKET)
-        if gh:
-            so = (sockets_all.get(gh.get("itemInstanceId") or "") or {}).get("sockets") or []
-            row["weapons"].append({
-                "slot": "机灵", "name": _name(gh.get("itemHash")),
-                "tier": _tier(gh.get("itemHash")), "icon": _icon(gh.get("itemHash")),
-                "power": None, "chips": _armor_chips(so, ghost=True)})
     except Exception:  # noqa: BLE001  单人失败只丢这一块
         pass
     return row
@@ -250,10 +243,11 @@ async def collect(name: str) -> dict:
     玩家不存在抛 LookupError。"""
     data = await _retry_twice(_fireteam_collect, name)
     roster = (data.get("roster") or [])[:_MAX_MEMBERS]
-    main = roster[0] if roster else None
+    # 「查询」标记认 self_mid，不认 roster[0]：名单按击杀排序，自己未必在第一位
+    self_mid = data.get("self_mid") or (roster[0] or {}).get("mid") if roster else None
     members = list(await asyncio.gather(*(
-        _row_budget(_member_loadout(r, r["mid"] == (main or {}).get("mid")),
-                    r["mid"], r["mid"] == (main or {}).get("mid"), r.get("name"))
+        _row_budget(_member_loadout(r, r["mid"] == self_mid), r["mid"], r["mid"] == self_mid,
+                    r.get("name"))
         for r in roster)))
     return {"name": data.get("name") or name, "state": data.get("state") or "",
             "mode_name": data.get("mode_name") or "", "members": members}
@@ -275,9 +269,8 @@ def _loadout_chips(plugs: list[int], kind: str) -> list[dict]:
         d = _def(h)
         itd, cat = d.get("itd") or "", d.get("cat") or ""
         ok = ((kind == "weapon" and any(k in itd for k in _WEAPON_ITD))
-              or (kind in ("armor", "ghost")
-                  and (itd.endswith("护甲模组" if kind == "armor" else "机灵模组")
-                       or ".tuning.mods" in cat)))
+              or (kind == "armor"
+                  and (itd.endswith("护甲模组") or ".tuning.mods" in cat)))
         if ok:
             chips.append({"name": nm, "icon": _icon(h)})
     return chips[:7]
@@ -361,10 +354,6 @@ async def collect_ingame(qq: str, slot: int) -> dict:
                 "icon": icon,
                 "power": (rec.get("primaryStat") or {}).get("value"),
                 "chips": _loadout_chips(plugs, "armor")})
-        elif bucket == _GHOST_BUCKET:
-            row["weapons"].append({
-                "slot": "机灵", "name": name, "tier": tier, "icon": icon,
-                "power": None, "chips": _loadout_chips(plugs, "ghost")})
     return {"name": row["name"], "slot": slot, "members": [row]}
 
 
