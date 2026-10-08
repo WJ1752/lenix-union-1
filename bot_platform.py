@@ -166,7 +166,9 @@ async def _napcat_name_maps() -> list[dict]:
     except Exception:  # noqa: BLE001
         return maps
     for bot in bots.values():
-        if "onebot" not in type(bot).__module__:
+        # 判据写 adapters.onebot：只查 "onebot" 会被 "nonebot" 这个子串误命中，
+        # 官方 QQ 通道的 bot 也会进来，然后每个群白调一次必失败的 get_group_member_list
+        if "adapters.onebot" not in type(bot).__module__:
             continue
         for gid in groups:
             try:

@@ -34,6 +34,7 @@ _lock = threading.Lock()
 _qq = ""  # 扫码登录成功后记录的 QQ 号
 _last_start = 0.0  # 上次启动时间，用于冷却，避免频繁登录触发 QQ 风控
 START_COOLDOWN = 300  # 秒：两次启动间隔小于该值直接拒绝
+_owner = {"mine": False}  # 本进程是否认领了 NapCat（见 _atexit_stop 的说明）
 
 
 def _find_qq() -> str:
@@ -139,6 +140,7 @@ def start(qq_path: str = "") -> dict:
     global _proc, _last_start
     with _lock:
         if is_running():
+            _owner["mine"] = True
             return {"started": True, "log": LOG_FILE, "webui": webui_url()}
         if login_qr_ready():  # NapCat 已在跑（如面板服务重启后）
             try:
@@ -146,6 +148,7 @@ def start(qq_path: str = "") -> dict:
             except Exception:  # noqa: BLE001
                 healthy = False
             if healthy:  # WebUI 有响应：认领，不重复拉起
+                _owner["mine"] = True
                 threading.Thread(target=_watch_login, daemon=True).start()
                 return {"started": True, "log": LOG_FILE, "webui": webui_url()}
             # WebUI 没响应＝残留僵尸 QQ 占着端口：清掉后走全新启动
@@ -190,6 +193,7 @@ def start(qq_path: str = "") -> dict:
         _proc = subprocess.Popen(
             cmd, cwd=NAPCAT_DIR, env=env, stdout=log, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW)
+        _owner["mine"] = True
         _last_start = time.time()
         threading.Thread(target=_watch_login, daemon=True).start()
         return {"started": True, "qq": qq, "log": LOG_FILE, "webui": webui_url()}
@@ -229,9 +233,16 @@ def stop():
 # 面板窗口关闭 = webview.start() 返回、解释器正常收尾 → NapCat/QQ 跟程序一起退出。
 # 部署脚本用 taskkill /F 停 exe，不走 atexit，NapCat 存活，重启 exe 后原会话直接重连免扫码。
 # 收尾阶段任何异常都不能外抛（否则退出时打一屏 traceback，还可能断在半路）
+#
+# 只有「认领过」NapCat 的进程（面板/启动器调过 start()）才带走它：本模块被 webui 导入，
+# 任何 import 过 webui 的脚本（渲染自测、临时探针）退出时都会跑到这里——早期实现不看
+# 归属直接 stop()，于是一次 python 脚本退出就把正在跑的 NapCat 连根杀掉，机器人随即
+# "离线"（实测 2026-10-07：渲染脚本 09:42:04 退出，OneBot 反连 09:42:09 断）。
 
 
 def _atexit_stop():
+    if not _owner["mine"]:
+        return
     try:
         stop()
     except Exception:  # noqa: BLE001
@@ -622,6 +633,81 @@ def status() -> dict:
         st.update(login_status())
         st["qq"] = st["uin"] or _qq
     return st
+
+
+# ---------- 看门狗：NapCat 崩了自动重新拉起 ----------
+# 实测（2026-10-07，QQ 9.9.36-53644 不在本版 NapCat 的支持表里）：NapCat 的
+# worker 进程会隔一阵崩一次，它会自己重拉；但重拉再失败时整棵进程树直接没了——
+# WebUI 端口 6099 不再响应、反向 WS 也回不来，机器人就一直"离线"到人工重启为止
+# （2026-10-07 10:07 崩掉后挂了一个多小时没人发现）。这里每分钟巡检一次：反连
+# 断了超过 WATCH_GRACE 分钟、且 NapCat 已经不在了（WebUI 无响应），就按面板存的
+# uin 快速登录重新拉起。start() 自带 300 秒启动冷却，不会打转，也不会频繁登录
+# 触发 QQ 风控。
+ONEBOT_PORT = int(ONEBOT_WS_URL.rsplit(":", 1)[1].split("/")[0])
+WATCH_SEC = 60        # 巡检间隔
+WATCH_GRACE = 3       # 连续几次（≈3 分钟）没连上才算掉线，避免误判
+_watch = {"on": False, "bad": 0}
+
+
+def onebot_connected() -> bool:
+    """8901 端口上有没有已建立的 OneBot 反向 WS（有 = 协议端正连本程序报事件）"""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                             text=True, errors="replace", timeout=15).stdout
+    except Exception:  # noqa: BLE001  查不出来就当正常，别乱动手
+        return True
+    return any(p[3] == "ESTABLISHED" and p[1].endswith(f":{ONEBOT_PORT}")
+               for p in (line.split() for line in out.splitlines()) if len(p) >= 4)
+
+
+def _watch_log(text: str) -> None:
+    print(f"[napcat] {text}")
+    try:  # 面板「任务与日志」页也能看到，省得掉线了没人知道
+        import bot_log
+        bot_log.add("out", text=f"[系统] {text}", nickname="NapCat 看门狗")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def watch_loop() -> None:
+    warned = False
+    while True:
+        time.sleep(WATCH_SEC)
+        try:
+            if onebot_connected():
+                _watch["bad"] = 0
+                warned = False
+                continue
+            _watch["bad"] += 1
+            if _watch["bad"] < WATCH_GRACE:
+                continue
+            if login_qr_ready():   # NapCat 还活着：反向 WS 会自己重连（5 秒一次），继续观察
+                if not warned:
+                    _watch_log(f"OneBot 反连未建立（已 {_watch['bad']} 分钟），NapCat 仍在运行，继续观察")
+                    warned = True
+                continue
+            if not _saved_uin():   # 从没登录过：等面板手动扫码，不自己弹二维码
+                if not warned:
+                    _watch_log("NapCat 未运行且没有登录记录（到面板扫码登录一次后才会自动重连）")
+                    warned = True
+                continue
+            _watch_log(f"NapCat 已掉线（反连断了 {_watch['bad']} 分钟），正在自动拉起…")
+            r = start()
+            _watch_log("自动拉起：" + ("已拉起" if r.get("started") else str(r)))
+            _watch["bad"] = 0
+            warned = False
+        except Exception as exc:  # noqa: BLE001  看门狗自己不能挂
+            _watch_log(f"巡检异常：{exc}")
+
+
+def start_watchdog() -> bool:
+    """开启掉线自动拉起（幂等）"""
+    with _lock:
+        if _watch["on"]:
+            return False
+        _watch["on"] = True
+    threading.Thread(target=watch_loop, daemon=True, name="napcat-watchdog").start()
+    return True
 
 
 if __name__ == "__main__":

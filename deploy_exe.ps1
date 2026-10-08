@@ -60,7 +60,8 @@ if ($skipped -gt 0) { Write-Output ("_internal 有 $skipped 个文件被占用�
 #    归档，运行时 FrozenImporter 优先 —— 这里同步的外置副本**不会生效**，只是留档；
 #    改这些模块必须 build_exe.bat 重打包（2026-10-03 实证）。
 $ext = @("bot_cards.py", "bot_platform.py", "bot_fireteam.py", "bot_loadout.py", "bot_tunnel.py", "card_render.py", "weapon_filter.py", "weapon_usage.py",
-         "raid_loot.py", "name_i18n.py", "nonebot_plugins\destiny2.py",
+         "raid_loot.py", "name_i18n.py", "bot_log.py", "bungie_status.py", "bot_scheduler.py",
+         "nonebot_plugins\destiny2.py",
          # 兜底脚本：面板「全库刷新/启动通道」会自动拉调试 Edge（weapon_usage.ensure_channel），
          # 这个 bat 只在面板起不来时手点；weapon_usage._debug_profile_dir() 还会读它里面的
          # EDGE_PROFILE= 行，不同步的话 exe 旁那份就是旧的/缺失的
@@ -68,6 +69,8 @@ $ext = @("bot_cards.py", "bot_platform.py", "bot_fireteam.py", "bot_loadout.py",
 # bot_loadout.py / bot_tunnel.py 必须同步：插件在 exe 旁按目录动态加载（bot_runtime
 # load_plugins），它 import 的这两个模块不在 spec hiddenimports 里，运行时从磁盘解析。
 # **每给插件新增一个本地 import 都要加进这个列表**，漏了=整个插件加载失败=所有指令没反应。
+# bungie_status.py 尤其要同步：插件的维护闸门 import 它（插件是外置动态加载的，
+# 单元测试之外没有静态分析兜底）。bot_log.py / bot_scheduler.py 是面板「重发图片」用的。
 foreach ($f in $ext) {
   $s = Join-Path $root $f
   $d = Join-Path $dst  $f

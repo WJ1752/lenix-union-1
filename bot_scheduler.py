@@ -21,6 +21,9 @@ from concurrent import futures
 
 import bot_log
 import bot_runtime
+import bungie_status as bst
+
+_TZ8 = datetime.timezone(datetime.timedelta(hours=8))     # 游戏复位按北京时间算
 
 TICK_SEC = 30 * 60        # 例行巡检间隔
 FIRST_DELAY_SEC = 45      # 启动后先等协议端连上再跑第一轮
@@ -29,6 +32,9 @@ PUSH_GROUP_GAP = 1.5      # 逐群推送的间隔，避免触发频控
 
 _LOOP: dict = {"loop": None}
 _WOKEN = threading.Event()
+# 维护恢复时戳一下：立刻补跑本轮（日/周缓存刷新、错过的轮换推送），不用等满 30 分钟。
+# 「维护恰好压在每天 1 点的光尘刷新上，之后一直没刷出来」就是靠这个补上的。
+_CATCHUP = threading.Event()
 _STATE: dict = {"sync_day": None}     # 绑定改名同步上次跑的日期（每天一次）
 
 
@@ -36,15 +42,27 @@ def attach_loop(loop) -> None:
     """把 nonebot 驱动的事件循环交给调度线程（bot_runtime._serve 的钩子里调）"""
     _LOOP["loop"] = loop
     _WOKEN.set()
+    # 维护结束 → 立刻补跑（回调可能来自任意线程/事件循环，只置个事件最安全）
+    bst.on_clear(_CATCHUP.set)
+
+
+def bot_loop():
+    """nonebot 驱动的事件循环（面板要把「发送失败的图片」补发到群里时用它提交协程）
+
+    返回 None = 协议端还没起来/循环已关，调用方据此提示「等协议端恢复再重发」。
+    """
+    loop = _LOOP["loop"]
+    return loop if loop is not None and not loop.is_closed() else None
 
 
 # ---------- 周界（轮换每周三凌晨 1 点换） ----------
 
 def rotation_week_key(now: datetime.datetime | None = None) -> str:
-    """当前轮换周期的标识：最近一个周三 01:00 的日期（ISO）。"""
-    now = now or datetime.datetime.now()
+    """当前轮换周期的标识：最近一个周三 01:00（北京时间）的日期（ISO）。"""
+    now = now or datetime.datetime.now(_TZ8)     # 全盘时钟口径：中国北京时间
     days = (now.weekday() - 2) % 7          # 周三 weekday()==2
-    b = datetime.datetime.combine(now.date(), datetime.time(1, 0)) \
+    # combine 要带上 tzinfo：now 是 aware 的，naive 的 b 一比大小就报 naive/aware 混用
+    b = datetime.datetime.combine(now.date(), datetime.time(1, 0), now.tzinfo) \
         - datetime.timedelta(days=days)
     if now < b:
         b -= datetime.timedelta(days=7)
@@ -134,8 +152,11 @@ async def _push_rotation() -> bool:
     png = await card_render.html_to_png(html)
 
     from nonebot.adapters.onebot.v11 import MessageSegment
+    # 只要 NapCat（官方通道发不了这儿的主动消息）。判据必须写 adapters.onebot：
+    # 单查 "onebot" 会被 "nonebot" 这个子串误命中，官方通道的 bot 也会被算进来，
+    # 然后每次推送都在它身上失败一遍（2026-10-08 实测到）
     bots = [b for b in bot_runtime.get_bots().values()
-            if "onebot" in type(b).__module__]      # 只要 NapCat，官方通道发不了主动消息
+            if "adapters.onebot" in type(b).__module__]
     if not bots:
         print("[sched] 轮换推送：NapCat 协议端未连接，本周期不推（重启后会补推）")
         return False
@@ -205,11 +226,19 @@ def _run() -> None:
             _tick()
         except Exception:  # noqa: BLE001  调度线程绝不能死
             traceback.print_exc()
-        time.sleep(TICK_SEC)
+        # 维护恢复会戳 _CATCHUP：立刻补跑，别让日/周刷新白等一个 tick
+        _CATCHUP.wait(timeout=TICK_SEC)
+        _CATCHUP.clear()
 
 
 def _tick() -> None:
     import bungie_auth
+    if bst.is_down():
+        # 维护期什么都不用试：token 续期/预取/推送全是必失败的请求，只会刷一屏错误，
+        # 维护结束由 bst.on_clear → _CATCHUP 立刻补跑（时间戳见 [维护] 那几行）
+        print(f"[sched] Bungie 服务器维护中，本轮预取/推送/续期全部跳过"
+              f"（恢复后会自动补跑）")
+        return
     fut = _submit(_token_job())
     if fut:
         _wait(fut, 120, "token 任务")
@@ -223,9 +252,18 @@ def _tick() -> None:
 
     fut = _submit(_prefetch_job())
     if fut:
-        for name, err in (_wait(fut, 600, "预取任务") or []):
-            if err:
-                print(f"[sched] 预取 {name} 失败：{err}")
+        errs = [(n, e) for n, e in (_wait(fut, 600, "预取任务") or []) if e]
+        for name, err in errs:
+            print(f"[sched] 预取 {name} 失败：{err}")
+        if errs:
+            # 面板日志里留一行：日/周刷新失败（维护、未授权、接口抖动）以前只打 stdout，
+            # 用户能察觉到的只是「光尘商店一整天是空的」「轮换没更新」
+            try:
+                bot_log.add("out", nickname="定时预取",
+                            text="[系统] 本轮预取失败："
+                                 + "；".join(f"{n}（{str(e)[:60]}）" for n, e in errs))
+            except Exception:  # noqa: BLE001
+                pass
 
     key = rotation_week_key()
     if bot_runtime.load_config().get("rot_push_day") == key:

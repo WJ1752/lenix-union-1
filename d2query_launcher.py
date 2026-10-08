@@ -44,12 +44,15 @@ def _serve(port):
 
 def _autostart_napcat():
     """启动时自动重连 NapCat：上次登录过就走快速登录，不用手点「启动并扫码登录」。
-    首次使用 / 手动重置过则不动（napcat_runtime.autostart 里判断）"""
+    首次使用 / 手动重置过则不动（napcat_runtime.autostart 里判断）。
+    随后挂上看门狗：NapCat 崩了（进程树整个没了、反向 WS 也回不来）自动重新拉起，
+    否则机器人会一直"离线"到人工重启为止。"""
     try:
         time.sleep(3)  # 等面板端口先起来，扫码页/状态轮询才正常
         import napcat_runtime
         r = napcat_runtime.autostart()
         print(f"[napcat] 自动重连：{'已拉起' if r.get('started') else r}")
+        napcat_runtime.start_watchdog()
     except Exception as exc:  # noqa: BLE001  自动重连失败不影响主程序
         print(f"[napcat] 自动重连失败：{exc}")
 

@@ -34,6 +34,7 @@ import time
 
 import httpx
 
+import bungie_status as bst
 from jsonio import dump_json
 
 BASE = "https://www.bungie.net"
@@ -251,6 +252,13 @@ async def _token_call(data: dict, verifier: str = "") -> dict:
                          headers={"Content-Type": "application/x-www-form-urlencoded"})
     if r.status_code >= 400:
         msg = (r.text or "").strip()[:200]
+        # 维护期实测就是这个响应（10-06 01:08）：
+        #   HTTP 400 {"error":"server_error","error_description":"DestinyThrottledByGameServer"}
+        # 以前它会被当成「换 token 失败」，日志里看不出是官方维护，用户还会被
+        # 提示去重新授权（其实授权本身没问题，等维护结束就好）
+        if hit := bst.classify_throttle_body(msg):
+            bst.trip(*hit)
+            raise bst.BungieMaintenanceError(bst.text())
         if "Confidential client must authenticate" in msg:
             raise RuntimeError(
                 "Bungie 说这个应用是「机密」类型、必须带 client_secret。"
@@ -267,9 +275,14 @@ async def _membership_for(tok: dict) -> dict:
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
         r = await c.get(BASE + "/Platform/User/GetMembershipsForCurrentUser/", headers=headers)
     try:
-        resp = r.json().get("Response") or {}
+        d = r.json()
     except Exception:  # noqa: BLE001
+        bst.note_http(r.status_code, (r.content or b"")[:4000])
         return {}
+    if hit := bst.classify_json(d):
+        bst.trip(*hit)
+        raise bst.BungieMaintenanceError(bst.text())
+    resp = d.get("Response") or {}
     des = resp.get("destinyMemberships") or []
     if not des:
         return {}
@@ -386,17 +399,31 @@ async def authorized_get(path: str, params: dict | None = None) -> dict:
     tok = await access_token()
     if not tok:
         raise RuntimeError("未授权 Bungie 账号")
+    return await _auth_get_with(tok, path, params)
+
+
+async def _auth_get_with(tok: str, path: str, params: dict | None = None,
+                         timeout: float = 20) -> dict:
+    """带 Bearer 的 GET + 维护判定（authorized_get / authorized_get_as 共用）"""
+    await bst.guard()                # 维护中不打接口：省一次必失败的往返
     headers = {"X-API-Key": _env("BUNGIE_API_KEY"), "Authorization": f"Bearer {tok}"}
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
         r = await c.get(BASE + path, params=params or {}, headers=headers)
     try:
         d = r.json()
     except ValueError:
-        # Bungie 偶发返回 HTML 错误页（维护/风控/5xx），此前这里抛 JSONDecodeError
+        # Bungie 偶发返回 HTML 错误页（维护/风控/5xx）——维护期最常见，点亮维护态
+        bst.note_http(r.status_code, (r.content or b"")[:4000])
+        if bst.is_down():
+            raise bst.BungieMaintenanceError(bst.text())
         raise RuntimeError(
             f"Bungie 返回了非 JSON 响应（HTTP {r.status_code}），多为官方临时故障，稍后再试")
+    if hit := bst.classify_json(d):
+        bst.trip(*hit)
+        raise bst.BungieMaintenanceError(bst.text())
     if d.get("ErrorCode") != 1:
         raise RuntimeError(f"Bungie: {d.get('ErrorStatus')} {d.get('Message')}")
+    bst.note_ok()
     return d.get("Response") or {}
 
 
@@ -503,16 +530,7 @@ async def user_access_token(qq: str) -> str:
 async def authorized_get_as(qq: str, path: str, params: dict | None = None) -> dict:
     """以某个 QQ 用户授权的 token 调 Bungie 接口，返回 Response 字段。"""
     tok = await user_access_token(qq)
-    headers = {"X-API-Key": _env("BUNGIE_API_KEY"), "Authorization": f"Bearer {tok}"}
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as c:
-        r = await c.get(BASE + path, params=params or {}, headers=headers)
-    try:
-        d = r.json()
-    except ValueError:
-        raise RuntimeError(f"Bungie 返回了非 JSON 响应（HTTP {r.status_code}），稍后再试")
-    if d.get("ErrorCode") != 1:
-        raise RuntimeError(f"Bungie: {d.get('ErrorStatus')} {d.get('Message')}")
-    return d.get("Response") or {}
+    return await _auth_get_with(tok, path, params, timeout=25)
 
 
 if __name__ == "__main__":

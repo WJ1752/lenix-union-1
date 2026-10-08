@@ -30,7 +30,11 @@ a = Analysis(
     pathex=[],
     binaries=pw_binaries,
     datas=[*mi_datas, *loot_datas, ('certs/localhost.pem', 'certs'), ('certs/localhost-key.pem', 'certs')] + pw_datas,
-    hiddenimports=['psutil', 'card_render', 'bot_cards', 'bot_platform', 'bot_fireteam', 'weapon_filter', 'weapon_usage', 'raid_loot', 'greenlet', 'pyee', 'qr_png', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.httpx', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11', 'nonebot.adapters.qq'] + pw_hidden,
+    hiddenimports=['psutil', 'card_render', 'bot_cards', 'bot_platform', 'bot_fireteam', 'weapon_filter', 'weapon_usage', 'raid_loot', 'greenlet', 'pyee', 'qr_png',
+                   # bungie_status：维护检测（数据层/授权层/调度器都用）；bot_scheduler：
+                   # 面板的「重发未发送图片」要往它的事件循环上投协程
+                   'bungie_status', 'bot_scheduler',
+                   'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'nonebot.drivers.fastapi', 'nonebot.drivers.httpx', 'nonebot.drivers.websockets', 'nonebot.adapters.onebot.v11', 'nonebot.adapters.qq'] + pw_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
